@@ -19,8 +19,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::atomic::AtomicBool;
@@ -114,6 +114,7 @@ fn parse_boundaries() -> Vec<f64> {
     let b = std::env::var("GW_BOUNDARY")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
+        .filter(|f| f.is_finite())
         .unwrap_or(BOUNDARY);
     vec![b]
 }
@@ -133,10 +134,20 @@ fn parse_grid2d() -> Option<(usize, usize, f64, f64)> {
         return None;
     }
     let arena = std::env::var("GW_ARENA").ok().unwrap_or_default();
-    let mut it = arena.split(',').filter_map(|s| s.trim().parse::<f64>().ok());
+    let mut it = arena
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok());
     let aw = it.next().unwrap_or(5000.0);
     let ah = it.next().unwrap_or(aw);
-    Some((cols, rows, aw / cols as f64, ah / rows as f64))
+    if !aw.is_finite() || !ah.is_finite() || aw <= 0.0 || ah <= 0.0 {
+        return None;
+    }
+    let cw = aw / cols as f64;
+    let ch = ah / rows as f64;
+    if !cw.is_finite() || !ch.is_finite() || cw <= 0.0 || ch <= 0.0 {
+        return None;
+    }
+    Some((cols, rows, cw, ch))
 }
 
 // The 2D cell name "Z<col>_<row>" for a position.
@@ -167,7 +178,14 @@ fn hysteretic_cell(p: f64, cur: i64, cell: f64, n: usize) -> i64 {
 
 // Where a unit in `current` (a "Z<cx>_<cy>" cell) moves to after reaching pos, with per-axis hysteresis.
 // If `current` is not a 2D cell name (fresh spawn / cross-broker adopt), snap to the geometric cell.
-fn region_2d_after(pos: [f64; 2], current: &str, cols: usize, rows: usize, cw: f64, ch: f64) -> String {
+fn region_2d_after(
+    pos: [f64; 2],
+    current: &str,
+    cols: usize,
+    rows: usize,
+    cw: f64,
+    ch: f64,
+) -> String {
     match parse_grid_cell(current) {
         Some((cx, cy)) => format!(
             "Z{}_{}",
@@ -247,11 +265,16 @@ fn coarse_region(region: &str) -> &str {
 // by the broker's boundary list; without it (a worker that never set GW_BOUNDAR*) only W|E count, so a plain
 // "Z3" on a single-zone broker is treated as a named region (unchanged behaviour).
 fn is_strip_region_name(region: &str, bounds: &[f64]) -> bool {
-    strip_index_of_name(region, bounds).is_some() && matches!(coarse_region(region), "W" | "E")
-        || coarse_region(region)
-            .strip_prefix('Z')
-            .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && bounds.len() >= 2)
-            .unwrap_or(false)
+    let coarse = coarse_region(region);
+    if bounds.len() <= 1 {
+        return strip_index_of_name(coarse, bounds).is_some();
+    }
+    coarse
+        .strip_prefix('Z')
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .and_then(|n| n.parse::<usize>().ok())
+        .map(|i| i <= bounds.len())
+        .unwrap_or(false)
 }
 
 fn movement_region_after(
@@ -299,6 +322,14 @@ fn spawn_region(
 //      advertises nothing AND doesn't own the target as a named zone -- e.g. nzone's "EARTH" target landing
 //      on a broker whose only owned zone is "E": there is no better label than the geometric one).
 fn receiving_region_for_adopt(state: &ServerState, pos: [f64; 2], target: Option<&str>) -> String {
+    if let Some((c, r, cw, ch)) = state.grid2d {
+        if let Some(t) = target.map(str::trim).filter(|t| !t.is_empty()) {
+            if parse_grid_cell(t).is_some() {
+                return t.to_string();
+            }
+        }
+        return region_2d(pos, c, r, cw, ch);
+    }
     if !state.my_region.is_empty() {
         return state.my_region.clone();
     }
@@ -308,6 +339,31 @@ fn receiving_region_for_adopt(state: &ServerState, pos: [f64; 2], target: Option
         }
     }
     spawn_region(pos, None, &state.boundaries, &state.splits)
+}
+
+fn existing_mesh_adopt_matches(
+    state: &ServerState,
+    eid: &str,
+    adopt_region: &str,
+    authority_epoch: Option<u64>,
+) -> bool {
+    let Some(e) = state.entities.get(eid) else {
+        return false;
+    };
+    if e.region != adopt_region {
+        return false;
+    }
+    if let Some(inbound_epoch) = authority_epoch {
+        let current_epoch = physics_island_component_names(&e.components, &e.authority)
+            .iter()
+            .map(|comp| component_authority_epoch(e, comp))
+            .max()
+            .unwrap_or_else(|| component_authority_epoch(e, "pos"));
+        if current_epoch != inbound_epoch {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_platform_reserved_component(comp: &str) -> bool {
@@ -359,6 +415,7 @@ struct ComponentAuthority {
     mode: AuthorityMode,
 }
 
+#[derive(Clone)]
 struct Entity {
     pos: [f64; 2],
     vel: [f64; 2],
@@ -392,7 +449,7 @@ struct GhostEntity {
     vel: [f64; 2],
     components: Map<String, Value>,
     owner_region: String, // the SOURCE zone (the neighbour broker's owned region) that holds authority -- for the read-only reject message + the observer tag
-    last_seen: Instant,   // refreshed on each push; a ghost not refreshed within GHOST_TTL is reaped (it left the band / its source went away)
+    last_seen: Instant, // refreshed on each push; a ghost not refreshed within GHOST_TTL is reaped (it left the band / its source went away)
 }
 
 struct WorkerHandle {
@@ -408,7 +465,7 @@ struct WorkerHandle {
     fidelity_seq: HashMap<String, u64>,
     tx: Sender<Vec<u8>>, // T1: BOUNDED (capacity CHANNEL_CAP) -- the structural hard cap on this consumer's egress RAM
     out_queue: Arc<AtomicU64>, // G4 egress backlog depth (enqueued-by-emit minus dequeued-by-writer) -- backpressure visibility
-    dropped: Arc<AtomicU64>,   // G4 count of degradable frames dropped under backpressure (slow consumer)
+    dropped: Arc<AtomicU64>, // G4 count of degradable frames dropped under backpressure (slow consumer)
     disconnect: Arc<AtomicBool>, // T1: set when this consumer hit the hard egress cap on a CRITICAL frame -> reap_disconnecting tears it down (it reconnects + re-checks-out, no silent loss)
     grid_cells: Vec<(i64, i64)>, // Interest: the spatial-hash cells this worker's AOI occupies (tracked for removal on re-interest / disconnect)
 }
@@ -478,7 +535,17 @@ fn is_kernel_locked_component(comp: &str) -> bool {
 fn is_spatial_component(comp: &str) -> bool {
     matches!(
         comp,
-        "pos" | "vel" | "phys" | "physics" | "rot" | "lin" | "ang" | "at_rest" | "gen" | "t_server" | "sim_time"
+        "pos"
+            | "vel"
+            | "phys"
+            | "physics"
+            | "rot"
+            | "lin"
+            | "ang"
+            | "at_rest"
+            | "gen"
+            | "t_server"
+            | "sim_time"
     ) || comp.starts_with("phys.")
         || comp.starts_with("physics.")
 }
@@ -957,7 +1024,10 @@ fn normalize_physics_clock_write(e: &Entity, comp: &str, value: Value) -> Value 
     match comp {
         "gen" => json!(next_gen_value(stored_component_u64(e, "gen"), &value)),
         "t_server" => json!(next_server_time_value(stored_component_u64(e, "t_server"))),
-        "sim_time" => json!(next_sim_time_value(stored_component_u64(e, "sim_time"), &value)),
+        "sim_time" => json!(next_sim_time_value(
+            stored_component_u64(e, "sim_time"),
+            &value
+        )),
         "physics" => {
             let Some(obj) = value.as_object() else {
                 return value;
@@ -980,7 +1050,10 @@ fn normalize_physics_clock_write(e: &Entity, comp: &str, value: Value) -> Value 
             let supplied_sim = out.get("sim_time").cloned().unwrap_or(Value::Null);
             out.insert(
                 "sim_time".to_string(),
-                json!(next_sim_time_value(stored_physics_field_u64(e, "sim_time"), &supplied_sim)),
+                json!(next_sim_time_value(
+                    stored_physics_field_u64(e, "sim_time"),
+                    &supplied_sim
+                )),
             );
             Value::Object(out)
         }
@@ -1317,9 +1390,9 @@ struct HandoffIntent {
 // NEVER freezes the broker (Step 0 measured 2.3s @ 20k in one pass). should_still_move re-checks each mover.
 struct RebalanceJob {
     eids: Vec<String>, // candidate eids to RE-ROUTE (snapshotted at enqueue); the drain recomputes each
-                       // entity's correct region NOW (movement_region_after) + hands it off if it changed,
-                       // so the job is idempotent with the move-path and a shifted boundary. BOTH maybe_split
-                       // and rebalance feed this one queue, so neither does an unbudgeted O(N) handoff loop.
+    // entity's correct region NOW (movement_region_after) + hands it off if it changed,
+    // so the job is idempotent with the move-path and a shifted boundary. BOTH maybe_split
+    // and rebalance feed this one queue, so neither does an unbudgeted O(N) handoff loop.
     cursor: usize,
 }
 
@@ -1331,7 +1404,7 @@ struct BufferedEvent {
     eid: String,
     event: Value,
     payload: Value,
-    class: String,        // "critical" (never coalesced/dropped) | "visual" (coalesced by key) | "debug" (dropped over budget)
+    class: String, // "critical" (never coalesced/dropped) | "visual" (coalesced by key) | "debug" (dropped over budget)
     coalesce_key: String, // visual events sharing this key collapse to one (with a count)
     sim_time: Value,
     gen: Value,
@@ -1349,6 +1422,12 @@ struct ServerState {
     snapshot_seen: bool, // R0.3: a coordinated G2 SnapshotMarker was taken against THIS broker -> disable compaction (an external GW_RESTORE_OFFSET cut must stay valid; rewriting the file would invalidate it)
     wal_degraded: bool, // R0.1: a WAL write/sync failed -> fail-closed (reject persistent ops, do not publish)
     wal_fail_inject: bool, // R0.1: GW_WAL_FAIL test hook (force a WAL failure for the recovery-correctness gate)
+    durable_gen: u64, // DurableTransition watermark: observers only see transitions applied at/below this generation
+    pending_gen: u64, // highest WAL-appended-but-not-yet-fsynced transition generation
+    pending_updates: Vec<PreparedUpdate>, // staged component writes waiting for the group fsync barrier
+    pending_handoffs: Vec<PreparedHandoff>, // staged same-broker authority transfers waiting for the same durability law
+    pending_failovers: Vec<PreparedFailover>, // staged grant-only lease failovers waiting for the durable authority watermark
+    pending_block_migrations: Vec<PreparedBlockMigration>, // staged 2D rebalance block moves; one block == one atomic durable group
     zone_topology_rev: u64, // R0.2: bumped on every boundary/split change; the latest partition_config restores on recovery
     mesh_ack_drop: bool, // G2.1c test hook (GW_MESH_ACK_DROP): adopt an inbound MeshHandoff but DROP the MeshAck -> a stable in-flight state for the consistent-cut test
     mesh_adopt_drop: bool, // G2.1d test hook (GW_MESH_ADOPT_DROP): DROP an inbound MeshHandoff (no adopt, no ack) -> the wire-transit state for the resolver test
@@ -1366,7 +1445,7 @@ struct ServerState {
     entity_id_reservations: u64,               // monotonic ReserveEntityIds counter
     flags: Map<String, Value>,                 // runtime config flags (FlagUpdate)
     worker_load: HashMap<String, f64>,         // wid -> last reported load (Metrics)
-    boundary: f64,                             // DYNAMIC partition split (load balancing) -- the 1-boundary W|E line; == boundaries[0] when present
+    boundary: f64, // DYNAMIC partition split (load balancing) -- the 1-boundary W|E line; == boundaries[0] when present
     boundaries: Vec<f64>, // N-ZONE 1D-strip cut points (sorted). 0/1 elems => W|E names; >=2 => Z<i> strips. Source of truth for region-assignment (the W|E `boundary` above is the 1-element special case rebalance() still shifts).
     grid2d: Option<(usize, usize, f64, f64)>, // D1: 2D-grid partition (cols, rows, cell_w, cell_h) from GW_GRID2D; Some => square "Z<col>_<row>" zones derived from (x,y); None => the 1D-strip path above (unchanged)
     splits: HashMap<String, Vec<f64>>, // region -> sorted sub-boundaries (dynamic load-split capacity-add)
@@ -1402,15 +1481,14 @@ struct ServerState {
     pending_handoff_intent: HashMap<String, HandoffIntent>,
     threshold_ttl: Duration,
     // Hardening #1 Step 0: lock-hold instrumentation -- the max time the monitor tick held the global lock,
-    // by path, exposed via InspectorFrame. MEASURES the zone-split freeze (GPT-Pro: "first bound the work
-    // and measure; then shard only if contention remains") BEFORE the budgeted-rebalance fix.
+    // by path, exposed via InspectorFrame. Measure the zone-split freeze before applying budgeted rebalance.
     lock_max_hold_ms: f64,
     lock_max_hold_path: String,
     lock_last_hold_ms: f64,
     // ── CROSS-BROKER SEAM-INTEREST ──
     ghosts: HashMap<String, GhostEntity>, // read-only mirrors of NEIGHBOUR-broker near-seam entities (NEVER in `entities` -> structurally non-authoritative). Keyed by the SAME eid the source broker uses.
     interest_band: f64, // GW_INTEREST_BAND: the border-band half-width around each seam whose entities a broker pushes to its neighbour(s) as ghosts. 0 (default) => no push => the current behaviour, byte-for-byte.
-    ghost_seq: u64,     // monotonic counter so a ghost-push batch can be cheap to throttle (push every Nth tick is unnecessary; the monitor tick is 300ms which is already a fine ghost-refresh rate)
+    ghost_seq: u64, // monotonic counter so a ghost-push batch can be cheap to throttle (push every Nth tick is unnecessary; the monitor tick is 300ms which is already a fine ghost-refresh rate)
     // ── #3 OPS: GRACEFUL-DRAIN (rolling-deploy without kicking players) ─────────────────────────────────────
     // A broker told to DRAIN (the `Drain` op, or GW_DRAIN_ON_START for a test) (1) STOPS accepting new entity
     // CreateEntity (rejected with reason "draining" so the caller re-creates on a live broker), and (2) hands EVERY
@@ -1421,8 +1499,8 @@ struct ServerState {
     // empty IS the structural behaviour of that state. Players are uninterrupted: the neighbour adopts each entity
     // (AddEntity + the component stream) and a client re-checks-out from the neighbour (checkout_all), so no view is lost.
     draining: bool,
-    drain_exit: bool,    // when a completed drain should std::process::exit(0) (a real rolling deploy); a test can drain-without-exit to assert conservation against the still-running neighbour.
-    tick_lag_ms: f64,    // #3 metrics: how late the 300ms monitor tick actually fired vs schedule (the broker's saturation signal -- a healthy broker is ~0, a CPU-starved one lags). Measured in the monitor loop.
+    drain_exit: bool, // when a completed drain should std::process::exit(0) (a real rolling deploy); a test can drain-without-exit to assert conservation against the still-running neighbour.
+    tick_lag_ms: f64, // #3 metrics: how late the 300ms monitor tick actually fired vs schedule (the broker's saturation signal -- a healthy broker is ~0, a CPU-starved one lags). Measured in the monitor loop.
 }
 
 impl ServerState {
@@ -1442,6 +1520,12 @@ impl ServerState {
             snapshot_seen: false,
             wal_degraded: std::env::var("GW_WAL_FAIL").is_ok(), // R0.1: a configured-broken WAL starts fail-closed
             wal_fail_inject: std::env::var("GW_WAL_FAIL").is_ok(),
+            durable_gen: 0,
+            pending_gen: 0,
+            pending_updates: Vec::new(),
+            pending_handoffs: Vec::new(),
+            pending_failovers: Vec::new(),
+            pending_block_migrations: Vec::new(),
             zone_topology_rev: 0,
             mesh_ack_drop: std::env::var("GW_MESH_ACK_DROP").is_ok(),
             mesh_adopt_drop: std::env::var("GW_MESH_ADOPT_DROP").is_ok(),
@@ -1568,7 +1652,8 @@ impl ServerState {
         if let Some(f) = self.wal.as_mut() {
             let mut line = wal_v1_header_line();
             line.push('\n');
-            if f.write_all(line.as_bytes()).is_err() || f.flush().is_err() || f.sync_data().is_err() {
+            if f.write_all(line.as_bytes()).is_err() || f.flush().is_err() || f.sync_data().is_err()
+            {
                 self.wal_degraded = true;
                 return;
             }
@@ -1652,10 +1737,33 @@ impl ServerState {
             }
             bytes += buf.len() as u64;
         }
+        // Preserve permanent delete tombstones across compaction. The broker rejects a CreateEntity for any
+        // tombstoned id; dropping these records during compaction would let a restart recreate a deleted id.
+        let mut tombstones: Vec<String> = self.deleted_entities.iter().cloned().collect();
+        tombstones.sort();
+        for eid in tombstones {
+            let ev = json!({
+                "kind": "delete_tombstone",
+                "entity": eid,
+                "version": 0,
+                "writer": "wal_compaction",
+            });
+            buf.clear();
+            buf.push_str(&wal_v1_envelope_line(&ev));
+            buf.push('\n');
+            if out.write_all(buf.as_bytes()).is_err() {
+                self.wal_degraded = true;
+                return;
+            }
+            bytes += buf.len() as u64;
+        }
         // latest partition_config so the router restores the SAME placement function (do NOT bump the rev --
         // this is a faithful re-encoding of the current topology, not a new topology change).
-        let splits: Map<String, Value> =
-            self.splits.iter().map(|(r, v)| (r.clone(), json!(v))).collect();
+        let splits: Map<String, Value> = self
+            .splits
+            .iter()
+            .map(|(r, v)| (r.clone(), json!(v)))
+            .collect();
         let mesh: Vec<String> = self.mesh_regions.iter().cloned().collect();
         let pc = json!({
             "kind": "partition_config",
@@ -1679,11 +1787,15 @@ impl ServerState {
             return;
         }
         drop(out); // close the tmp handle before the rename (Windows: can't rename an open-for-write file onto target)
-        // Drop the OLD wal handle so the rename can replace the file on Windows.
+                   // Drop the OLD wal handle so the rename can replace the file on Windows.
         self.wal = None;
         if std::fs::rename(&tmp, &self.wal_path).is_err() {
             // rename failed -> the original WAL is still intact on disk; reopen it (append) and keep serving.
-            if let Ok(f) = OpenOptions::new().create(true).append(true).open(&self.wal_path) {
+            if let Ok(f) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.wal_path)
+            {
                 self.wal = Some(f);
             } else {
                 self.wal_degraded = true;
@@ -1691,7 +1803,11 @@ impl ServerState {
             return;
         }
         // reopen the freshly-compacted WAL in append mode and reset the offset to the snapshot size.
-        match OpenOptions::new().create(true).append(true).open(&self.wal_path) {
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.wal_path)
+        {
             Ok(f) => {
                 self.wal = Some(f);
                 let before = self.wal_bytes;
@@ -1719,7 +1835,7 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-// #3 OPS metric: this process's resident-set size in bytes, for the health endpoint (an operator/k8s watches RSS
+// #3 OPS metric: this process's resident-set size in bytes, for the health endpoint (a runtime prober watches RSS
 // to catch a leaking broker before OOM). Platform-native with NO new crate dependency (the Cargo.toml stays
 // tokio+serde_json only): Windows reads GetProcessMemoryInfo.WorkingSetSize via a tiny psapi FFI; Linux reads
 // /proc/self/statm (pages * page_size). Where unavailable we return 0 HONESTLY rather than fabricate a number --
@@ -1763,7 +1879,11 @@ fn process_rss_bytes() -> u64 {
 fn process_rss_bytes() -> u64 {
     // /proc/self/statm field 2 = resident pages; * the page size = RSS bytes.
     if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
-        if let Some(rss_pages) = s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()) {
+        if let Some(rss_pages) = s
+            .split_whitespace()
+            .nth(1)
+            .and_then(|p| p.parse::<u64>().ok())
+        {
             let page = 4096u64; // the near-universal default; a small skew here is irrelevant for a leak-watch metric
             return rss_pages * page;
         }
@@ -1777,7 +1897,7 @@ fn process_rss_bytes() -> u64 {
 }
 
 // #3 OPS: the live broker health/metrics snapshot, as a plain JSON object over the EXISTING length-prefixed wire
-// (no HTTP stack pulled in, no second port to secure). Carries exactly the fields Gemini's #2 blocker named --
+// (no HTTP stack pulled in, no second port to secure). Carries the runtime fields needed for liveness checks:
 // entity_count, mesh_handoffs, tick-lag, RSS, WAL size, ghost count -- plus the liveness-relevant rest. Built from
 // the SAME state.metrics the Inspector reads, so the two never diverge. Returned by the `Health` op (ungated: a
 // liveness prober holds no inspector attribute) and folded into the InspectorFrame too.
@@ -1881,7 +2001,11 @@ fn crc32_ieee(bytes: &[u8]) -> u32 {
             let mut c = i as u32;
             let mut k = 0;
             while k < 8 {
-                c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB88320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
                 k += 1;
             }
             t[i] = c;
@@ -1912,8 +2036,8 @@ fn wal_v1_header_line() -> String {
 // Per-line decode result: a v1 envelope that PASSED its CRC, a legacy v0 bare event, or CORRUPT (failed CRC
 // or a v1-mode line that isn't a valid envelope). The header line is reported separately by the caller.
 enum WalLine {
-    Ok(Value),    // a usable event (v1 verified, or v0 bare)
-    Corrupt,      // integrity failure: failed CRC, or non-envelope line while in v1 mode
+    Ok(Value), // a usable event (v1 verified, or v0 bare)
+    Corrupt,   // integrity failure: failed CRC, or non-envelope line while in v1 mode
 }
 
 // Decode a single raw line. `v1_mode` = the header declared v1 (so bare/garbled lines are corruption, not v0).
@@ -1985,6 +2109,7 @@ fn recover_from_wal_report(
     HashSet<String>,
     Option<Value>,
     HashMap<String, Value>,
+    u64,
     RecoverReport,
 ) {
     // First pass: read raw lines + classify, so we can distinguish a TAIL corrupt-run (truncate) from a
@@ -1998,7 +2123,12 @@ fn recover_from_wal_report(
                 HashSet::new(),
                 None,
                 HashMap::new(),
-                RecoverReport { wal_version: WAL_VERSION, truncated_tail_bytes: 0, error: None },
+                0,
+                RecoverReport {
+                    wal_version: WAL_VERSION,
+                    truncated_tail_bytes: 0,
+                    error: None,
+                },
             );
         }
     };
@@ -2028,7 +2158,14 @@ fn recover_from_wal_report(
                 wal_version, WAL_VERSION
             )),
         };
-        return (HashMap::new(), HashSet::new(), None, HashMap::new(), report);
+        return (
+            HashMap::new(),
+            HashSet::new(),
+            None,
+            HashMap::new(),
+            0,
+            report,
+        );
     }
     let v1_mode = wal_version >= 1;
     let header_idx = if v1_mode { first_idx } else { None };
@@ -2059,7 +2196,11 @@ fn recover_from_wal_report(
             }
             WalLine::Corrupt => None,
         };
-        recs.push(Rec { ev, bytes: span, cum_end: cumulative });
+        recs.push(Rec {
+            ev,
+            bytes: span,
+            cum_end: cumulative,
+        });
     }
 
     // TAIL vs MID corruption (v1 only). Find the longest run of corrupt records at the very END: those = the
@@ -2092,7 +2233,14 @@ fn recover_from_wal_report(
                         .to_string(),
                 ),
             };
-            return (HashMap::new(), HashSet::new(), None, HashMap::new(), report);
+            return (
+                HashMap::new(),
+                HashSet::new(),
+                None,
+                HashMap::new(),
+                0,
+                report,
+            );
         }
     }
 
@@ -2105,24 +2253,45 @@ fn recover_from_wal_report(
         })
         .filter_map(|r| r.ev.as_ref())
         .collect();
-    let (store, tombstones, last_partition, recovered_pending) = apply_wal_events(&good_events);
+    let (store, tombstones, last_partition, recovered_pending, recovered_id_hwm) =
+        apply_wal_events(&good_events);
     if truncated_tail_bytes > 0 {
         println!(
             "[rust-broker] #2 WAL: truncated {} corrupt trailing byte(s) ({} record(s)) — the in-progress write from the crash",
             truncated_tail_bytes, tail_corrupt
         );
     }
-    let report = RecoverReport { wal_version, truncated_tail_bytes, error: None };
-    (store, tombstones, last_partition, recovered_pending, report)
+    let report = RecoverReport {
+        wal_version,
+        truncated_tail_bytes,
+        error: None,
+    };
+    (
+        store,
+        tombstones,
+        last_partition,
+        recovered_pending,
+        recovered_id_hwm,
+        report,
+    )
 }
 
 // Apply already-decoded (CRC-verified) WAL events to a fresh store. Split out of recover_from_wal_report so
 // the integrity/version gate runs FIRST, then this pure replay runs on the good (CRC-passing) prefix only.
-fn apply_wal_events(events: &[&Value]) -> (HashMap<String, Entity>, HashSet<String>, Option<Value>, HashMap<String, Value>) {
+fn apply_wal_events(
+    events: &[&Value],
+) -> (
+    HashMap<String, Entity>,
+    HashSet<String>,
+    Option<Value>,
+    HashMap<String, Value>,
+    u64,
+) {
     let mut store: HashMap<String, Entity> = HashMap::new();
     let mut tombstones: HashSet<String> = HashSet::new();
     let mut last_partition: Option<Value> = None; // R0.2: the latest partition_config (boundary/splits/mesh) to restore
     let mut recovered_pending: HashMap<String, Value> = HashMap::new(); // G2.1d: mesh_out not acked by the cut -> resend on restore
+    let mut recovered_id_hwm: u64 = 0; // ReserveEntityIds high-water mark: never reissue a block after restart
     let g2d_off = std::env::var("GW_G2D_OFF").is_ok(); // G2.1d test toggle: OFF reverts to pre-resolver (proves the wire-transit LOSS)
     for ev in events.iter().copied() {
         let ev = ev.clone();
@@ -2216,6 +2385,12 @@ fn apply_wal_events(events: &[&Value]) -> (HashMap<String, Entity>, HashSet<Stri
                 }
                 if let Some(e) = store.get_mut(eid) {
                     e.region = ev["to"].as_str().unwrap_or(&e.region).to_string();
+                    if ev.get("pos").is_some() {
+                        e.pos = arr2(ev.get("pos"));
+                    }
+                    if ev.get("vel").is_some() {
+                        e.vel = arr2(ev.get("vel"));
+                    }
                     e.version = ev["version"].as_u64().unwrap_or(e.version);
                     if let Some(authority) = ev.get("authority") {
                         apply_authority_snapshot(e, authority);
@@ -2245,6 +2420,27 @@ fn apply_wal_events(events: &[&Value]) -> (HashMap<String, Entity>, HashSet<Stri
                         set_component_authority_epoch(e, comp, authority_epoch);
                     }
                     e.version = ev["version"].as_u64().unwrap_or(e.version);
+                }
+            }
+            "failover_grant" | "block_migration" => {
+                if let Some(grants) = ev.get("grants").and_then(|v| v.as_array()) {
+                    for grant in grants {
+                        let eid = grant["entity"].as_str().unwrap_or("");
+                        if tombstones.contains(eid) {
+                            continue;
+                        }
+                        if let Some(e) = store.get_mut(eid) {
+                            if let Some(authority) = grant.get("authority") {
+                                apply_authority_snapshot(e, authority);
+                            } else {
+                                let authority_epoch = grant["authority_epoch"]
+                                    .as_u64()
+                                    .unwrap_or_else(|| component_authority_epoch(e, "pos"));
+                                set_physics_island_authority_epoch(e, authority_epoch);
+                            }
+                            e.version = grant["version"].as_u64().unwrap_or(e.version);
+                        }
+                    }
                 }
             }
             "component_authority" => {
@@ -2352,6 +2548,9 @@ fn apply_wal_events(events: &[&Value]) -> (HashMap<String, Entity>, HashSet<Stri
             "partition_config" => {
                 last_partition = Some(ev.clone()); // R0.2: keep the LATEST -> restored before serving routing
             }
+            "reserve_entity_ids" => {
+                recovered_id_hwm = recovered_id_hwm.max(ev["next_id"].as_u64().unwrap_or(0));
+            }
             _ => {}
         }
     }
@@ -2367,7 +2566,13 @@ fn apply_wal_events(events: &[&Value]) -> (HashMap<String, Entity>, HashSet<Stri
             e.components.remove("threshold.tx");
         }
     }
-    (store, tombstones, last_partition, recovered_pending)
+    (
+        store,
+        tombstones,
+        last_partition,
+        recovered_pending,
+        recovered_id_hwm,
+    )
 }
 
 fn arr2(v: Option<&Value>) -> [f64; 2] {
@@ -2465,15 +2670,21 @@ fn flush_events(state: &mut ServerState) {
     let max_visual: usize = 64usize >> state.load_level;
     let buffered = std::mem::take(&mut state.event_outbox);
     // per worker -> (critical events [all], visual coalesce_key -> (representative, count))
-    let mut per_worker: HashMap<String, (Vec<Value>, HashMap<String, (Value, u64)>)> = HashMap::new();
+    let mut per_worker: HashMap<String, (Vec<Value>, HashMap<String, (Value, u64)>)> =
+        HashMap::new();
     for ev in buffered {
         let base = json!({"op":"EntityEvent","entity":ev.eid,"event":ev.event,"payload":ev.payload,
             "sim_time":ev.sim_time,"gen":ev.gen,"class":ev.class});
         for wid in &ev.target_wids {
-            let entry = per_worker.entry(wid.clone()).or_insert_with(|| (Vec::new(), HashMap::new()));
+            let entry = per_worker
+                .entry(wid.clone())
+                .or_insert_with(|| (Vec::new(), HashMap::new()));
             match ev.class.as_str() {
                 "visual" => {
-                    let v = entry.1.entry(ev.coalesce_key.clone()).or_insert_with(|| (base.clone(), 0));
+                    let v = entry
+                        .1
+                        .entry(ev.coalesce_key.clone())
+                        .or_insert_with(|| (base.clone(), 0));
                     v.0 = base.clone(); // newest representative (last buffered = latest)
                     v.1 += 1;
                 }
@@ -2676,15 +2887,40 @@ fn spawn_in_region(
     requested_region: Option<&str>,
     authority_epoch: Option<u64>,
     authority_snapshot: Option<Value>,
-) {
+) -> bool {
     if state.deleted_entities.contains(eid) {
-        return;
+        return false;
     }
     let region = match state.grid2d {
         // D1: 2D-grid mode derives the cell from (x,y); single-broker so requested_region is moot here
         Some((c, r, cw, ch)) => region_2d(pos, c, r, cw, ch),
         None => spawn_region(pos, requested_region, &state.boundaries, &state.splits),
     };
+    spawn_committed_region(
+        state,
+        eid,
+        pos,
+        vel,
+        comps,
+        region,
+        authority_epoch,
+        authority_snapshot,
+    )
+}
+
+fn spawn_committed_region(
+    state: &mut ServerState,
+    eid: &str,
+    pos: [f64; 2],
+    vel: [f64; 2],
+    comps: Map<String, Value>,
+    region: String,
+    authority_epoch: Option<u64>,
+    authority_snapshot: Option<Value>,
+) -> bool {
+    if state.deleted_entities.contains(eid) {
+        return false;
+    }
     let epoch = authority_epoch.unwrap_or(1);
     state.entities.insert(
         eid.to_string(),
@@ -2713,12 +2949,12 @@ fn spawn_in_region(
         .wal_append(&json!({
             "kind":"register","entity":eid,"version":1,"authority_epoch":epoch,
             "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
-            "components":Value::Object(comps),"region":region,"authority":authority
+            "components":Value::Object(comps),"region":region.clone(),"authority":authority
         }))
         .is_err()
     {
         state.entities.remove(eid); // not persisted -> not live; never announce it
-        return;
+        return false;
     }
     let wids: Vec<String> = state.workers.keys().cloned().collect();
     for wid in wids {
@@ -2732,6 +2968,7 @@ fn spawn_in_region(
             grant_region_physics_island_authority(state, &wid, eid);
         }
     }
+    true
 }
 
 // CROSS-BROKER MESH: hand an entity across the PROCESS seam to the neighbour broker owning `target`.
@@ -2795,44 +3032,68 @@ fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
     // fence a stale incarnation (a returned-from-partition old owner carries its OLD, lower epoch).
     let src_region = state.my_region.clone();
     let src_lease_epoch = state.region_lease_epoch.get(&src_region).copied();
+    let source_gen = state.pending_gen.saturating_add(1);
     let handoff = json!({"op":"MeshHandoff","entity":eid,"target":target,
         "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
         "authority_epoch":authority_epoch,
         "authority":authority.clone(),
         "src_region":src_region,
         "lease_epoch":src_lease_epoch,
+        "source_durable_gen":source_gen,
         "components":Value::Object(comps)});
-    let delivered = match state.mesh.get(target) {
-        Some(tx) => tx.send(frame(&handoff)).is_ok(),
-        None => false,
+    let tx = match state.mesh.get(target).cloned() {
+        Some(tx) => tx,
+        None => {
+            // the link is down RIGHT NOW -- keep the entity LOCAL (do not park+remove into a dead seam). A
+            // stalled body at the boundary beats a vanished one; the next move re-handoffs when the link returns.
+            eprintln!("[mesh] link to {target} down -- keeping {eid} local (not vanishing it into a dead seam)");
+            return;
+        }
     };
-    if !delivered {
-        // the link is down RIGHT NOW -- keep the entity LOCAL (do not park+remove into a dead seam). A
-        // stalled body at the boundary beats a vanished one; the next move re-handoffs when the link returns.
-        eprintln!("[mesh] link to {target} down -- keeping {eid} local (not vanishing it into a dead seam)");
+    let mesh_out = json!({"kind":"mesh_out","entity":eid,"target":target,
+        "authority_epoch":authority_epoch,"authority":authority,
+        "src_region":src_region,
+        "lease_epoch":src_lease_epoch,
+        "source_durable_gen":source_gen,
+        "gen":source_gen,
+        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
+        "components":handoff.get("components").cloned().unwrap_or(Value::Null)});
+    // WAL + fsync the cross-seam departure BEFORE a neighbour can observe/adopt the handoff. The durable
+    // watermark is the source-side visibility gate: crash before it -> source keeps the entity; crash after
+    // it -> recovery rebuilds pending_mesh and resends. Sending above source durable_gen would let the
+    // neighbour adopt a transition this broker could not reproduce.
+    if state.wal_append_nosync(&mesh_out).is_err() {
+        eprintln!("[mesh] WAL failed before forwarding {eid} -> {target}; keeping entity local and failing closed");
         return;
     }
-    // WAL the cross-seam departure after a live link accepted the handoff frame. Recovery treats this as
-    // the source-side linearization point: source must not resurrect the entity if it crashes before MeshAck.
-    // G2.1d: mesh_out_full -- carry the COMPLETE handoff payload (incl. components) so a restore that cuts
-    // through an in-flight handoff can recreate pending_mesh from the WAL and resend it (the resolver).
-    let _ = state.wal_append(&json!({"kind":"mesh_out","entity":eid,"target":target,
-        "authority_epoch":authority_epoch,"authority":authority,
-        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
-        "components":handoff.get("components").cloned().unwrap_or(Value::Null)}));
+    state.pending_gen = source_gen;
+    if state.wal_sync().is_err() {
+        eprintln!(
+            "[mesh] WAL sync failed before forwarding {eid} -> {target}; keeping entity local and failing closed"
+        );
+        return;
+    }
+    state.durable_gen = state.durable_gen.max(source_gen);
+    // Park it pending the neighbour's MeshAck BEFORE attempting the send; if this process crashes after the WAL
+    // but before/while sending, recovery reconstructs the same pending handoff from mesh_out.
+    state.pending_mesh.insert(
+        eid.to_string(),
+        (handoff.clone(), Instant::now(), target.to_string()),
+    );
+    state.entities.remove(eid);
+    let delivered = tx.send(frame(&handoff)).is_ok();
+    if !delivered {
+        // the link is down RIGHT NOW -- keep the entity LOCAL (do not park+remove into a dead seam). A
+        // WAL already linearized the departure, so do NOT resurrect locally; pending_mesh will resend once
+        // the mesh task reconnects.
+        eprintln!("[mesh] link to {target} dropped after WAL -- parked {eid} pending resend");
+    }
     // CROSS-BROKER handoff counted HERE -- the delivered-departure linearization point (a live link accepted
     // the frame + the mesh_out is WAL'd). The mirror of `handoffs += 1` in the LOCAL handoff() path, but a
     // DISTINCT metric so the Inspector sees same-broker vs cross-server handoffs separately. Counted on the
     // SENDING broker (the one initiating the authority transfer across the seam); a dropped/re-sent frame goes
     // through resend_pending_mesh (a different path), so this fires exactly once per logical cross-broker move.
     state.metrics.mesh_handoffs += 1;
-    // park it pending the neighbour's MeshAck, THEN remove from the local set -- the entity is never in
-    // NEITHER place (the old path removed it before any confirmation, so a dropped handoff vanished it).
-    state.pending_mesh.insert(
-        eid.to_string(),
-        (handoff, Instant::now(), target.to_string()),
-    );
-    state.entities.remove(eid);
     let wids: Vec<String> = state.workers.keys().cloned().collect();
     for wid in wids {
         if state.workers[&wid].view.contains(eid) {
@@ -3002,7 +3263,11 @@ fn propagate_ghost(state: &mut ServerState, eid: &str, first_time: bool) {
         let has = state.workers[&wid].view.contains(eid);
         if inside && !has {
             // first appearance to THIS worker: the full checkout stream (so it renders + becomes targetable).
-            emit(state, &wid, json!({"op":"CriticalSection","phase":"begin","entity":eid}));
+            emit(
+                state,
+                &wid,
+                json!({"op":"CriticalSection","phase":"begin","entity":eid}),
+            );
             emit(state, &wid, json!({"op":"AddEntity","entity":eid}));
             // The read-only marker goes FIRST (right after AddEntity), BEFORE the components -- so the receiver
             // migrates the entity into its read-only ghost store before any `kind` arrives. Otherwise a ghost of
@@ -3010,14 +3275,38 @@ fn propagate_ghost(state: &mut ServerState, eid: &str, first_time: bool) {
             // shell. A ghost NEVER gets an AuthorityChange(true) (the worker's adopt path keys on that), so it
             // is held read-only forever -- exactly the intent. `owner_region` rides alongside (the zone that
             // holds authority over it) so a client can label the cross-seam mirror.
-            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"ghost","value":true}));
-            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"owner_region","value":owner_region}));
-            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"pos","value":[pos[0],pos[1]]}));
-            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"vel","value":[vel[0],vel[1]]}));
+            emit(
+                state,
+                &wid,
+                json!({"op":"ComponentUpdate","entity":eid,"comp":"ghost","value":true}),
+            );
+            emit(
+                state,
+                &wid,
+                json!({"op":"ComponentUpdate","entity":eid,"comp":"owner_region","value":owner_region}),
+            );
+            emit(
+                state,
+                &wid,
+                json!({"op":"ComponentUpdate","entity":eid,"comp":"pos","value":[pos[0],pos[1]]}),
+            );
+            emit(
+                state,
+                &wid,
+                json!({"op":"ComponentUpdate","entity":eid,"comp":"vel","value":[vel[0],vel[1]]}),
+            );
             for (k, val) in comps.iter() {
-                emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":k,"value":val}));
+                emit(
+                    state,
+                    &wid,
+                    json!({"op":"ComponentUpdate","entity":eid,"comp":k,"value":val}),
+                );
             }
-            emit(state, &wid, json!({"op":"CriticalSection","phase":"end","entity":eid}));
+            emit(
+                state,
+                &wid,
+                json!({"op":"CriticalSection","phase":"end","entity":eid}),
+            );
             if let Some(w) = state.workers.get_mut(&wid) {
                 w.view.insert(eid.to_string());
             }
@@ -3028,8 +3317,16 @@ fn propagate_ghost(state: &mut ServerState, eid: &str, first_time: bool) {
             }
         } else if inside && !first_time {
             // a refresh: just the moving fields (pos/vel) -> keep the aim-point + render fresh.
-            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"pos","value":[pos[0],pos[1]]}));
-            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"vel","value":[vel[0],vel[1]]}));
+            emit(
+                state,
+                &wid,
+                json!({"op":"ComponentUpdate","entity":eid,"comp":"pos","value":[pos[0],pos[1]]}),
+            );
+            emit(
+                state,
+                &wid,
+                json!({"op":"ComponentUpdate","entity":eid,"comp":"vel","value":[vel[0],vel[1]]}),
+            );
         }
     }
 }
@@ -3066,20 +3363,37 @@ fn gc_threshold_timeouts(state: &mut ServerState) {
         .collect();
 
     for (eid, tx_id, from, to) in stale {
-        let version = if let Some(e) = state.entities.get_mut(&eid) {
-            if e.components.remove("threshold.tx").is_none() {
+        let version = if let Some(e) = state.entities.get(&eid) {
+            if !e.components.contains_key("threshold.tx") {
                 continue;
             }
-            e.version += 1;
-            e.version
+            e.version.saturating_add(1)
         } else {
             continue;
         };
-        let _ = state.wal_append(&json!({
+        if state
+            .wal_append(&json!({
             "kind":"threshold_abort","entity":&eid,"version":version,
             "writer":"threshold-gc","tx_id":tx_id,"from":from,"to":to,
             "reason":"preload timeout"
-        }));
+            }))
+            .is_err()
+        {
+            state.rejected.push(json!({
+                "entity":eid,
+                "comp":"threshold.tx",
+                "reason":"wal_persist_failed: threshold timeout abort not durably recorded"
+            }));
+            continue;
+        }
+        if let Some(e) = state.entities.get_mut(&eid) {
+            if e.components.remove("threshold.tx").is_none() {
+                continue;
+            }
+            e.version = version;
+        } else {
+            continue;
+        }
         let wids: Vec<String> = state.workers.keys().cloned().collect();
         for wid in wids {
             if state.workers[&wid].view.contains(&eid) {
@@ -3094,56 +3408,97 @@ fn gc_threshold_timeouts(state: &mut ServerState) {
 }
 
 fn handoff(state: &mut ServerState, eid: &str, old: &str, new: &str) {
-    // if `new` is a REMOTE zone on a NEIGHBOUR BROKER (no local worker + a configured mesh link), forward
-    // across the process seam to that broker (N-neighbour: ANY meshed region, not just an east seam).
+    let _ = handoff_with_position(state, eid, old, new, None);
+}
+
+fn handoff_with_position(
+    state: &mut ServerState,
+    eid: &str,
+    old: &str,
+    new: &str,
+    pos_override: Option<[f64; 2]>,
+) -> bool {
+    // Remote process seam: keep the existing mesh path, which already WALs mesh_out before send.
     if state.mesh_regions.contains(new) && !state.region_worker.contains_key(new) {
-        mesh_forward(state, eid, new); // keeps the entity LOCAL if the link is momentarily down -> the next move retries
-        return;
+        mesh_forward(state, eid, new);
+        return true;
+    }
+
+    queue_local_handoff(state, eid, old, new, pos_override, "handoff")
+}
+
+fn queue_local_handoff(
+    state: &mut ServerState,
+    eid: &str,
+    old: &str,
+    new: &str,
+    pos_override: Option<[f64; 2]>,
+    reason: &str,
+) -> bool {
+    if state.pending_handoffs.iter().any(|h| h.eid == eid) {
+        return true;
     }
     let old_wid = state.region_worker.get(old).cloned();
     let new_wid = state.region_worker.get(new).cloned();
-    let (ver, authority_epoch, x, moved_comps, authority) =
-        if let Some(e) = state.entities.get_mut(eid) {
-            e.region = new.to_string();
-            e.version += 1;
-            let (authority_epoch, moved_comps) =
-                advance_physics_island_authority(e, old_wid.as_deref(), new_wid.as_deref());
-            (
-                e.version,
-                authority_epoch,
-                e.pos[0],
-                moved_comps,
-                authority_to_json(&e.authority),
-            )
-        } else {
-            return;
+    let (ver, authority_epoch, pos, vel, moved_comps, authority) = {
+        let Some(e) = state.entities.get(eid) else {
+            return false;
         };
-    state.metrics.handoffs += 1;
-    let _ = state.wal_append(&json!({
-        "kind":"transfer","entity":eid,"version":ver,
-        "authority_epoch":authority_epoch,"authority":authority,
-        "components":moved_comps.clone(),"from":old,"to":new,"x":x
-    }));
-    if let Some(ow) = old_wid {
-        if state.workers.contains_key(&ow) {
-            for comp in &moved_comps {
-                revoke_authority(state, &ow, eid, comp);
-            }
+        let mut next = e.clone();
+        if let Some(pos) = pos_override {
+            next.pos = pos;
+            next.last_broadcast_cell = Some(interest_cell_of(pos));
         }
+        next.region = new.to_string();
+        let pending_entity_handoffs = state
+            .pending_handoffs
+            .iter()
+            .filter(|h| h.eid == eid)
+            .count() as u64;
+        next.version = next
+            .version
+            .saturating_add(pending_entity_handoffs)
+            .saturating_add(1);
+        let (authority_epoch, moved_comps) =
+            advance_physics_island_authority(&mut next, old_wid.as_deref(), new_wid.as_deref());
+        (
+            next.version,
+            authority_epoch,
+            next.pos,
+            next.vel,
+            moved_comps,
+            authority_to_json(&next.authority),
+        )
+    };
+    let gen = state.pending_gen.saturating_add(1);
+    let lease_epoch = state.region_lease_epoch.get(old).copied();
+    let prepared = PreparedHandoff {
+        gen,
+        eid: eid.to_string(),
+        from: old.to_string(),
+        to: new.to_string(),
+        pos,
+        vel,
+        version: ver,
+        authority_epoch,
+        authority,
+        moved_comps,
+        old_wid,
+        new_wid,
+        lease_epoch,
+        reason: reason.to_string(),
+    };
+    if state
+        .wal_append_nosync(&prepared_handoff_wal_event(&prepared))
+        .is_err()
+    {
+        return false;
     }
-    if let Some(nw) = new_wid {
-        if state.workers.contains_key(&nw) {
-            if !state.workers[&nw].view.contains(eid) {
-                send_full(state, &nw, eid);
-            }
-            for comp in &moved_comps {
-                grant_authority(state, &nw, eid, comp);
-            }
-        }
-    }
-    // ── ASSEMBLY handoff: an entity's children (components["parent"] == eid) migrate WITH the root as
-    // ONE atomic unit -- same new region, this same lock-held dispatch -- so a multi-part ship/vehicle
-    // never tears across a seam. Recurses for nested assemblies; children never self-zone (pos handler).
+    state.pending_gen = gen;
+    state.pending_handoffs.push(prepared);
+
+    // Assembly handoff: queue children into the SAME pending handoff group so the root and parts cross
+    // the same durable barrier. They apply together after wal_sync, not as a visible parent/child tear.
     let children: Vec<String> = state
         .entities
         .iter()
@@ -3155,17 +3510,46 @@ fn handoff(state: &mut ServerState, eid: &str, old: &str, new: &str) {
     for child in children {
         if let Some(co) = state.entities.get(&child).map(|e| e.region.clone()) {
             if co != new {
-                handoff(state, &child, &co, new);
+                queue_local_handoff(state, &child, &co, new, None, "assembly");
+            }
+        }
+    }
+    true
+}
+
+fn apply_prepared_handoff(state: &mut ServerState, h: &PreparedHandoff) {
+    if let Some(e) = state.entities.get_mut(&h.eid) {
+        e.pos = h.pos;
+        e.vel = h.vel;
+        e.region = h.to.clone();
+        e.version = h.version;
+        apply_authority_snapshot(e, &h.authority);
+        e.last_broadcast_cell = Some(interest_cell_of(h.pos));
+    } else {
+        return;
+    }
+    state.metrics.handoffs += 1;
+
+    if let Some(ow) = h.old_wid.clone() {
+        if state.workers.contains_key(&ow) {
+            for comp in &h.moved_comps {
+                revoke_authority(state, &ow, &h.eid, comp);
+            }
+        }
+    }
+    if let Some(nw) = h.new_wid.clone() {
+        if state.workers.contains_key(&nw) {
+            if !state.workers[&nw].view.contains(&h.eid) {
+                send_full(state, &nw, &h.eid);
+            }
+            for comp in &h.moved_comps {
+                grant_authority(state, &nw, &h.eid, comp);
             }
         }
     }
 }
 
-// ── C2: pre-handoff AUTHORITY_LOSS_IMMINENT (the overlay's I:<target>) ──
-// In the hysteresis overlap band the entity is approaching the next strip but region_after still returns
-// `current` (no commit yet). Warn the current owner so the overlay can show I:<target>. N-zone: the entity
-// may be approaching EITHER the upper-edge (-> the next strip up) or the lower-edge (-> the strip down) of
-// its current strip; report whichever edge it has entered (within H but before the +/-H commit).
+// C2: pre-handoff AUTHORITY_LOSS_IMMINENT (the overlay's I:<target>).
 fn seam_intent_target(x: f64, current: &str, bounds: &[f64]) -> Option<String> {
     let cur_idx = strip_index_of_name(coarse_region(current), bounds)?;
     // entered the UPPER-edge band [bounds[cur_idx], bounds[cur_idx]+H) -> intends the next strip up
@@ -3188,8 +3572,17 @@ fn handoff_intent_to_json(i: &HandoffIntent) -> Value {
 }
 
 // Emit LOSS_IMMINENT to the current owner, once per (entity,target,epoch); dedup via pending_handoff_intent.
-fn maybe_emit_loss_imminent(state: &mut ServerState, eid: &str, source_region: &str, target_region: &str) {
-    let source_worker = match state.entities.get(eid).and_then(|e| component_authority_owner(e, "pos")) {
+fn maybe_emit_loss_imminent(
+    state: &mut ServerState,
+    eid: &str,
+    source_region: &str,
+    target_region: &str,
+) {
+    let source_worker = match state
+        .entities
+        .get(eid)
+        .and_then(|e| component_authority_owner(e, "pos"))
+    {
         Some(w) => w,
         None => return,
     };
@@ -3197,7 +3590,11 @@ fn maybe_emit_loss_imminent(state: &mut ServerState, eid: &str, source_region: &
         Some(w) => w,
         None => return,
     };
-    let epoch = state.entities.get(eid).map(|e| component_authority_epoch(e, "pos")).unwrap_or(0);
+    let epoch = state
+        .entities
+        .get(eid)
+        .map(|e| component_authority_epoch(e, "pos"))
+        .unwrap_or(0);
     let already = state
         .pending_handoff_intent
         .get(eid)
@@ -3413,9 +3810,9 @@ fn rebalance(state: &mut ServerState) {
     }
     state.boundaries[0] = state.boundary; // keep the 1-element strip list in lockstep with the slid W|E line
     wal_partition_config(state); // R0.2: persist the new boundary BEFORE re-routing entities across it
-    // Hardening #1: ENQUEUE the crossers as a budgeted job (re-routed incrementally) instead of handing off
-    // ALL of them in this one locked pass -- the same O(N) freeze maybe_split had (Step 0: 2.3s @ 20k; the
-    // freeze MOVED here once a split set splits[region]). The drain re-routes each via movement_region_after.
+                                 // Hardening #1: ENQUEUE the crossers as a budgeted job (re-routed incrementally) instead of handing off
+                                 // ALL of them in this one locked pass -- the same O(N) freeze maybe_split had (Step 0: 2.3s @ 20k; the
+                                 // freeze MOVED here once a split set splits[region]). The drain re-routes each via movement_region_after.
     let bounds = &state.boundaries;
     let splits = &state.splits;
     let crossers: Vec<String> = state
@@ -3428,7 +3825,10 @@ fn rebalance(state: &mut ServerState) {
         .map(|(k, _)| k.clone())
         .collect();
     if !crossers.is_empty() {
-        state.rebalance_jobs.push(RebalanceJob { eids: crossers, cursor: 0 });
+        state.rebalance_jobs.push(RebalanceJob {
+            eids: crossers,
+            cursor: 0,
+        });
     }
 }
 
@@ -3439,7 +3839,11 @@ fn wal_partition_config(state: &mut ServerState) {
     let version = state.zone_topology_rev;
     let boundary = state.boundary;
     let boundaries = state.boundaries.clone();
-    let splits: Map<String, Value> = state.splits.iter().map(|(r, v)| (r.clone(), json!(v))).collect();
+    let splits: Map<String, Value> = state
+        .splits
+        .iter()
+        .map(|(r, v)| (r.clone(), json!(v)))
+        .collect();
     let mesh: Vec<String> = state.mesh_regions.iter().cloned().collect();
     let _ = state.wal_append(&json!({
         "kind": "partition_config", "version": version, "boundary": boundary,
@@ -3514,7 +3918,10 @@ fn maybe_split(state: &mut ServerState) {
     // this one locked pass (Step 0 measured 2.3s @ 20k). process_rebalance_jobs drains it a small batch per
     // monitor tick, re-routing each via movement_region_after (the split boundary is persisted above).
     let _ = new_region; // the drain recomputes the target region per entity from the persisted split
-    state.rebalance_jobs.push(RebalanceJob { eids: movers, cursor: 0 });
+    state.rebalance_jobs.push(RebalanceJob {
+        eids: movers,
+        cursor: 0,
+    });
 }
 
 // Hardening #1: RE-ROUTE one candidate -> compute its correct region NOW (movement_region_after with the
@@ -3605,7 +4012,10 @@ fn update_load_governor(state: &mut ServerState) {
         state.load_level.min(1) // 1/4..1/2 band: hold (don't flap), never above 1
     };
     if new_level != state.load_level {
-        eprintln!("[L3] load_level {} -> {new_level} (max out_queue {max_oq})", state.load_level);
+        eprintln!(
+            "[L3] load_level {} -> {new_level} (max out_queue {max_oq})",
+            state.load_level
+        );
         state.load_level = new_level;
     }
 }
@@ -3633,8 +4043,16 @@ fn rebalance_2d(state: &mut ServerState) {
     if load.len() < 2 {
         return;
     }
-    let (hot, hot_n) = load.iter().max_by_key(|(_, n)| **n).map(|(w, n)| (w.clone(), *n)).unwrap();
-    let (cold, cold_n) = load.iter().min_by_key(|(_, n)| **n).map(|(w, n)| (w.clone(), *n)).unwrap();
+    let (hot, hot_n) = load
+        .iter()
+        .max_by_key(|(_, n)| **n)
+        .map(|(w, n)| (w.clone(), *n))
+        .unwrap();
+    let (cold, cold_n) = load
+        .iter()
+        .min_by_key(|(_, n)| **n)
+        .map(|(w, n)| (w.clone(), *n))
+        .unwrap();
     if hot == cold || (hot_n as f64) < (cold_n as f64) * 1.5 + 4.0 {
         return; // hysteresis: only shed on a real imbalance
     }
@@ -3663,33 +4081,17 @@ fn rebalance_2d(state: &mut ServerState) {
         .min_by_key(|(_, n)| (**n - target).abs())
         .map(|(b, _)| b.clone())
         .unwrap();
-    // reassign the block hot->cold + re-authority its entities (the check_leases pattern, load-triggered)
-    state.region_worker.insert(block.clone(), cold.clone());
-    if let Some(w) = state.workers.get_mut(&cold) {
-        w.region = block.clone();
-    }
-    eprintln!("[rust-broker] REBALANCE-2D block {block} {hot}->{cold} (hot_load={hot_n} cold_load={cold_n})");
-    let eids: Vec<String> = state
-        .entities
-        .iter()
-        .filter(|(_, e)| e.region == block)
-        .map(|(k, _)| k.clone())
-        .collect();
-    let old = Some(hot);
-    for eid in eids {
-        if !state.workers.get(&cold).map(|w| w.view.contains(&eid)).unwrap_or(false) {
-            send_full(state, &cold, &eid);
-        }
-        let moved_comps = if let Some(e) = state.entities.get_mut(&eid) {
-            e.version += 1;
-            let (_ep, mc) = advance_physics_island_authority(e, old.as_deref(), Some(&cold));
-            mc
-        } else {
-            continue;
-        };
-        for comp in &moved_comps {
-            grant_authority(state, &cold, &eid, comp);
-        }
+    // Stage the WHOLE block as one durable transition. A block is a partition unit, so moving its
+    // entities one-by-one creates a recoverable-but-wrong split block after a crash.
+    if queue_block_migration(state, &block, &hot, &cold) {
+        eprintln!("[rust-broker] REBALANCE-2D queued block {block} {hot}->{cold} (hot_load={hot_n} cold_load={cold_n})");
+    } else {
+        state.rejected.push(json!({
+            "block":block,
+            "old_owner":hot,
+            "new_owner":cold,
+            "reason":"wal_persist_failed: block migration not durably staged"
+        }));
     }
 }
 
@@ -3704,6 +4106,9 @@ fn check_leases(state: &mut ServerState) {
         if !expired {
             continue;
         }
+        if state.pending_failovers.iter().any(|f| f.region == region) {
+            continue;
+        }
         if state.standbys.is_empty() {
             if !state.orphaned_regions.contains(&region) {
                 state.orphaned_regions.push(region.clone());
@@ -3713,57 +4118,13 @@ fn check_leases(state: &mut ServerState) {
         }
         let old_wid = state.region_worker.get(&region).cloned();
         let new_wid = state.standbys.remove(0);
-        state.region_worker.insert(region.clone(), new_wid.clone());
-        state.region_expires.insert(
-            region.clone(),
-            now + Duration::from_secs_f64(state.lease_ttl),
-        );
-        state.metrics.failovers += 1;
-        eprintln!(
-            "[rust-broker] FAILOVER region {region} -> {new_wid} (failovers={})",
-            state.metrics.failovers
-        );
-        if state.workers.contains_key(&new_wid) {
-            if let Some(w) = state.workers.get_mut(&new_wid) {
-                w.region = region.clone(); // the spare now leases this region (interest follows)
-            }
-            let eids: Vec<String> = state
-                .entities
-                .iter()
-                .filter(|(_, e)| e.region == region)
-                .map(|(k, _)| k.clone())
-                .collect();
-            for eid in eids {
-                if !state.workers[&new_wid].view.contains(&eid) {
-                    send_full(state, &new_wid, &eid);
-                }
-                let (version, authority_epoch, moved_comps, authority) =
-                    if let Some(e) = state.entities.get_mut(&eid) {
-                        e.version += 1;
-                        let (authority_epoch, moved_comps) =
-                            advance_physics_island_authority(e, old_wid.as_deref(), Some(&new_wid));
-                        (
-                            e.version,
-                            authority_epoch,
-                            moved_comps,
-                            authority_to_json(&e.authority),
-                        )
-                    } else {
-                        continue;
-                    };
-                if !moved_comps.is_empty() {
-                    let _ = state.wal_append(&json!({
-                        "kind":"authority_epoch","entity":&eid,
-                        "version":version,"comp":"physics_island",
-                        "authority_epoch":authority_epoch,"authority":authority,
-                        "components":moved_comps.clone(),
-                        "reason":"failover","region":&region
-                    }));
-                    for comp in &moved_comps {
-                        grant_authority(state, &new_wid, &eid, comp);
-                    }
-                }
-            }
+        let until = now + Duration::from_secs_f64(state.lease_ttl);
+        if queue_failover_grant(state, &region, old_wid, &new_wid, until) {
+            eprintln!(
+                "[rust-broker] FAILOVER queued region {region} -> {new_wid} (grant-only, pending durable watermark)"
+            );
+        } else {
+            state.standbys.insert(0, new_wid);
         }
     }
 }
@@ -3772,32 +4133,179 @@ fn check_leases(state: &mut ServerState) {
 fn is_persistent_op(op: &str) -> bool {
     matches!(
         op,
-        "CreateEntity" | "DeleteEntity" | "AddComponent" | "RemoveComponent" | "UpdateComponent"
+        "CreateEntity"
+            | "DeleteEntity"
+            | "AddComponent"
+            | "RemoveComponent"
+            | "UpdateComponent"
             | "BatchUpdate"
-            | "SetComponentAuthority" | "MeshHandoff" | "ThresholdTx" | "Fold" | "SnapshotMarker"
+            | "SetComponentAuthority"
+            | "MeshHandoff"
+            | "ThresholdTx"
+            | "Fold"
+            | "SnapshotMarker"
     )
 }
 
-// THE component-write CORE (validate + apply + WAL-WRITE, NO fsync, NO zoning, NO propagate). Validates
-// (authority / ACL / acl-admin / kernel-reserved / epoch-fence / sparse-envelope / contact-risk) -> applies
-// the value in-memory + version++ -> appends the durable WAL line via wal_append_NOSYNC. Returns Some(value)
-// = the normalized value that MUST be fsync'd-then-published by the caller; None = rejected (the caller need
-// not branch -- a rejected entry already emitted its UpdateRejected to `wid`).
-//
-// Two callers share this ONE validation+apply path (no second, divergeable copy; the batch CANNOT bypass a
-// gate -- it is literally the same function):
-//   - apply_one_update          (single UpdateComponent): nosync-write -> wal_sync (1 fsync) -> zone+propagate.
-//   - the BatchUpdate arm        : nosync-write per entry -> wal_sync ONCE for the whole batch -> zone+propagate
-//     each. That collapses N fsyncs into 1 (the per-tick durability wall at scale) while keeping the SAME
-//     durable-before-publish invariant: every line is written AND fsync'd before ANY entry is propagated.
-fn validate_and_apply_nosync(
+#[derive(Clone)]
+struct PreparedUpdate {
+    gen: u64,
+    eid: String,
+    comp: String,
+    value: Value,
+    version: u64,
+    writer: String,
+}
+
+#[derive(Clone)]
+struct PreparedHandoff {
+    gen: u64,
+    eid: String,
+    from: String,
+    to: String,
+    pos: [f64; 2],
+    vel: [f64; 2],
+    version: u64,
+    authority_epoch: u64,
+    authority: Value,
+    moved_comps: Vec<String>,
+    old_wid: Option<String>,
+    new_wid: Option<String>,
+    lease_epoch: Option<u64>,
+    reason: String,
+}
+
+#[derive(Clone)]
+struct PreparedFailoverGrant {
+    eid: String,
+    version: u64,
+    authority_epoch: u64,
+    authority: Value,
+    moved_comps: Vec<String>,
+}
+
+#[derive(Clone)]
+struct PreparedFailover {
+    gen: u64,
+    region: String,
+    old_wid: Option<String>,
+    new_wid: String,
+    until: Instant,
+    grants: Vec<PreparedFailoverGrant>,
+}
+
+#[derive(Clone)]
+struct PreparedBlockMigration {
+    gen: u64,
+    block: String,
+    old_wid: String,
+    new_wid: String,
+    grants: Vec<PreparedFailoverGrant>,
+}
+
+fn prepared_update_wal_event(u: &PreparedUpdate) -> Value {
+    json!({
+        "kind":"write","entity":u.eid,"version":u.version,
+        "writer":u.writer,"comp":u.comp,"value":u.value,
+        "gen":u.gen
+    })
+}
+
+fn prepared_handoff_wal_event(h: &PreparedHandoff) -> Value {
+    json!({
+        "kind":"transfer","entity":h.eid,"version":h.version,
+        "authority_epoch":h.authority_epoch,
+        "authority":h.authority,
+        "authority_snapshot":h.authority,
+        "components":h.moved_comps,
+        "from":h.from,"to":h.to,
+        "source":h.from,"target":h.to,
+        "x":h.pos[0],
+        "pos":[h.pos[0],h.pos[1]],"vel":[h.vel[0],h.vel[1]],
+        "lease_epoch":h.lease_epoch,
+        "reason":h.reason,
+        "gen":h.gen
+    })
+}
+
+fn prepared_failover_wal_event(f: &PreparedFailover) -> Value {
+    let grants: Vec<Value> = f
+        .grants
+        .iter()
+        .map(|g| {
+            json!({
+                "entity":g.eid,
+                "version":g.version,
+                "authority_epoch":g.authority_epoch,
+                "authority":g.authority,
+                "components":g.moved_comps,
+            })
+        })
+        .collect();
+    json!({
+        "kind":"failover_grant",
+        "region":f.region,
+        "old_owner":f.old_wid.clone(),
+        "new_owner":f.new_wid.clone(),
+        "grants":grants,
+        "gen":f.gen,
+        "reason":"lease expired"
+    })
+}
+
+fn prepared_block_migration_wal_event(m: &PreparedBlockMigration) -> Value {
+    let grants: Vec<Value> = m
+        .grants
+        .iter()
+        .map(|g| {
+            json!({
+                "entity":g.eid,
+                "version":g.version,
+                "authority_epoch":g.authority_epoch,
+                "authority":g.authority,
+                "components":g.moved_comps,
+            })
+        })
+        .collect();
+    json!({
+        "kind":"block_migration",
+        "block":m.block,
+        "old_owner":m.old_wid,
+        "new_owner":m.new_wid,
+        "grants":grants,
+        "gen":m.gen,
+        "reason":"rebalance_2d"
+    })
+}
+
+fn apply_prepared_update(state: &mut ServerState, u: &PreparedUpdate) {
+    let Some(e) = state.entities.get_mut(&u.eid) else {
+        return;
+    };
+    ensure_component_authority(e, &u.comp);
+    if u.comp == "pos" {
+        e.pos = arr2(Some(&u.value));
+    } else if u.comp == "vel" {
+        e.vel = arr2(Some(&u.value));
+    } else {
+        e.components.insert(u.comp.clone(), u.value.clone());
+    }
+    e.version = u.version;
+    state.metrics.applies += 1;
+}
+
+// THE component-write CORE (validate + prepare durable event, NO canonical RAM mutation).
+// This is the first DurableTransition spine:
+// validate -> WAL append/sync -> apply RAM -> publish. If WAL fails, no later Interest/query/reconnect can
+// observe a value recovery cannot reproduce.
+fn prepare_update(
     state: &mut ServerState,
     wid: &str,
     eid: &str,
     comp: &str,
     raw_value: Value,
     supplied_epoch: Option<u64>,
-) -> Option<Value> {
+) -> Option<PreparedUpdate> {
     if !state.entities.contains_key(eid) {
         // SEAM-INTEREST read-only enforcement: a ghost is a non-authoritative mirror of a NEIGHBOUR broker's
         // entity. It is NOT in `entities`, so it can never be leased or granted authority -- and a WRITE to it
@@ -3892,29 +4400,35 @@ fn validate_and_apply_nosync(
     if reject_and_escalate_contact_risk(state, wid, eid, comp, &value) {
         return None;
     }
-    let ver = {
-        let e = state.entities.get_mut(eid).unwrap();
-        ensure_component_authority(e, comp);
-        if comp == "pos" {
-            e.pos = arr2(Some(&value));
-        } else if comp == "vel" {
-            e.vel = arr2(Some(&value));
-        } else {
-            e.components.insert(comp.to_string(), value.clone());
-        }
-        e.version += 1;
-        e.version
+    let pending_entity_writes = state
+        .pending_updates
+        .iter()
+        .filter(|u| u.eid == eid)
+        .count() as u64;
+    let version = state
+        .entities
+        .get(eid)
+        .map(|e| {
+            e.version
+                .saturating_add(pending_entity_writes)
+                .saturating_add(1)
+        })
+        .unwrap_or(1);
+    let gen = state.pending_gen.saturating_add(1);
+    let prepared = PreparedUpdate {
+        gen,
+        eid: eid.to_string(),
+        comp: comp.to_string(),
+        value,
+        version,
+        writer: wid.to_string(),
     };
-    state.metrics.applies += 1;
-    renew(state, wid); // an actively-writing owner is alive -> renew its lease
     // #2 WAL-THEN-PUBLISH: persist the line durably (write now, fsync by the caller) BEFORE broadcasting. If
     // the WAL WRITE fails (disk full / fail-closed) the write did NOT persist -> reject it + do NOT publish.
     // (The fsync barrier is the caller's wal_sync; on a single write that's apply_one_update, on a batch it's
     // one wal_sync for the whole group -- either way every published value is on disk + fsync'd first.)
     if state
-        .wal_append_nosync(&json!({
-            "kind":"write","entity":eid,"version":ver,"writer":wid,"comp":comp,"value":value
-        }))
+        .wal_append_nosync(&prepared_update_wal_event(&prepared))
         .is_err()
     {
         emit(
@@ -3925,7 +4439,8 @@ fn validate_and_apply_nosync(
         );
         return None;
     }
-    Some(value)
+    state.pending_gen = gen;
+    Some(prepared)
 }
 
 // pos-zoning (seam handoff / loss-imminent / intent-clear) for a just-applied pos write, THEN propagate the
@@ -3971,8 +4486,315 @@ fn zone_and_propagate(state: &mut ServerState, eid: &str, comp: &str, value: &Va
     propagate(state, eid, comp, value);
 }
 
-// Single-write path (UpdateComponent): validate+apply+nosync-write -> ONE fsync -> zone+propagate. Behaviour
-// identical to before the group-commit split (one fsync per single write). Returns true if applied+published.
+fn queue_prepared_update(state: &mut ServerState, u: PreparedUpdate) {
+    state.pending_updates.push(u);
+}
+
+fn flush_pending_handoffs(state: &mut ServerState) {
+    if state.pending_handoffs.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut state.pending_handoffs);
+    let max_gen = pending
+        .iter()
+        .map(|h| h.gen)
+        .max()
+        .unwrap_or(state.durable_gen);
+    if state.wal_sync().is_err() {
+        for h in &pending {
+            state.rejected.push(json!({
+                "entity":h.eid,
+                "from":h.from,
+                "to":h.to,
+                "reason":"wal_sync_failed: staged handoff did not cross durable watermark; authority not transferred"
+            }));
+        }
+        return;
+    }
+    state.durable_gen = state.durable_gen.max(max_gen);
+    for h in &pending {
+        apply_prepared_handoff(state, h);
+    }
+}
+
+fn queue_failover_grant(
+    state: &mut ServerState,
+    region: &str,
+    old_wid: Option<String>,
+    new_wid: &str,
+    until: Instant,
+) -> bool {
+    if state.pending_failovers.iter().any(|f| f.region == region) {
+        return true;
+    }
+    let eids: Vec<String> = state
+        .entities
+        .iter()
+        .filter(|(_, e)| e.region == region)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut grants = Vec::new();
+    for eid in eids {
+        let Some(e) = state.entities.get(&eid) else {
+            continue;
+        };
+        let mut next = e.clone();
+        let (authority_epoch, moved_comps) =
+            advance_physics_island_authority(&mut next, old_wid.as_deref(), Some(new_wid));
+        if moved_comps.is_empty() {
+            continue;
+        }
+        next.version = next.version.saturating_add(1);
+        grants.push(PreparedFailoverGrant {
+            eid,
+            version: next.version,
+            authority_epoch,
+            authority: authority_to_json(&next.authority),
+            moved_comps,
+        });
+    }
+    let gen = state.pending_gen.saturating_add(1);
+    let prepared = PreparedFailover {
+        gen,
+        region: region.to_string(),
+        old_wid,
+        new_wid: new_wid.to_string(),
+        until,
+        grants,
+    };
+    if state
+        .wal_append_nosync(&prepared_failover_wal_event(&prepared))
+        .is_err()
+    {
+        return false;
+    }
+    state.pending_gen = gen;
+    state.pending_failovers.push(prepared);
+    true
+}
+
+fn apply_prepared_failover(state: &mut ServerState, f: &PreparedFailover) {
+    state
+        .region_worker
+        .insert(f.region.clone(), f.new_wid.clone());
+    state.region_expires.insert(f.region.clone(), f.until);
+    state.metrics.failovers += 1;
+    if let Some(w) = state.workers.get_mut(&f.new_wid) {
+        w.region = f.region.clone();
+    }
+    for grant in &f.grants {
+        if let Some(e) = state.entities.get_mut(&grant.eid) {
+            e.version = grant.version;
+            apply_authority_snapshot(e, &grant.authority);
+        } else {
+            continue;
+        }
+        if state.workers.contains_key(&f.new_wid) {
+            if !state.workers[&f.new_wid].view.contains(&grant.eid) {
+                send_full(state, &f.new_wid, &grant.eid);
+            }
+            for comp in &grant.moved_comps {
+                grant_authority(state, &f.new_wid, &grant.eid, comp);
+            }
+        }
+    }
+}
+
+fn flush_pending_failovers(state: &mut ServerState) {
+    if state.pending_failovers.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut state.pending_failovers);
+    let max_gen = pending
+        .iter()
+        .map(|f| f.gen)
+        .max()
+        .unwrap_or(state.durable_gen);
+    if state.wal_sync().is_err() {
+        for f in &pending {
+            state.rejected.push(json!({
+                "region":f.region,
+                "new_owner":f.new_wid,
+                "reason":"wal_sync_failed: staged failover grant did not cross durable watermark"
+            }));
+        }
+        return;
+    }
+    state.durable_gen = state.durable_gen.max(max_gen);
+    for f in &pending {
+        apply_prepared_failover(state, f);
+    }
+}
+
+fn queue_block_migration(
+    state: &mut ServerState,
+    block: &str,
+    old_wid: &str,
+    new_wid: &str,
+) -> bool {
+    if state
+        .pending_block_migrations
+        .iter()
+        .any(|m| m.block == block)
+    {
+        return true;
+    }
+    let eids: Vec<String> = state
+        .entities
+        .iter()
+        .filter(|(_, e)| e.region == block)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut grants = Vec::new();
+    for eid in eids {
+        let Some(e) = state.entities.get(&eid) else {
+            continue;
+        };
+        let mut next = e.clone();
+        let (authority_epoch, moved_comps) =
+            advance_physics_island_authority(&mut next, Some(old_wid), Some(new_wid));
+        if moved_comps.is_empty() {
+            continue;
+        }
+        next.version = next.version.saturating_add(1);
+        grants.push(PreparedFailoverGrant {
+            eid,
+            version: next.version,
+            authority_epoch,
+            authority: authority_to_json(&next.authority),
+            moved_comps,
+        });
+    }
+    let gen = state.pending_gen.saturating_add(1);
+    let prepared = PreparedBlockMigration {
+        gen,
+        block: block.to_string(),
+        old_wid: old_wid.to_string(),
+        new_wid: new_wid.to_string(),
+        grants,
+    };
+    if state
+        .wal_append_nosync(&prepared_block_migration_wal_event(&prepared))
+        .is_err()
+    {
+        return false;
+    }
+    state.pending_gen = gen;
+    state.pending_block_migrations.push(prepared);
+    true
+}
+
+fn apply_prepared_block_migration(state: &mut ServerState, m: &PreparedBlockMigration) {
+    state
+        .region_worker
+        .insert(m.block.clone(), m.new_wid.clone());
+    if let Some(w) = state.workers.get_mut(&m.new_wid) {
+        w.region = m.block.clone();
+    }
+    for grant in &m.grants {
+        if let Some(e) = state.entities.get_mut(&grant.eid) {
+            e.version = grant.version;
+            apply_authority_snapshot(e, &grant.authority);
+        } else {
+            continue;
+        }
+        for comp in &grant.moved_comps {
+            revoke_authority(state, &m.old_wid, &grant.eid, comp);
+        }
+        if state.workers.contains_key(&m.new_wid) {
+            if !state.workers[&m.new_wid].view.contains(&grant.eid) {
+                send_full(state, &m.new_wid, &grant.eid);
+            }
+            for comp in &grant.moved_comps {
+                grant_authority(state, &m.new_wid, &grant.eid, comp);
+            }
+        }
+    }
+}
+
+fn flush_pending_block_migrations(state: &mut ServerState) {
+    if state.pending_block_migrations.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut state.pending_block_migrations);
+    let max_gen = pending
+        .iter()
+        .map(|m| m.gen)
+        .max()
+        .unwrap_or(state.durable_gen);
+    if state.wal_sync().is_err() {
+        for m in &pending {
+            state.rejected.push(json!({
+                "block":m.block,
+                "old_owner":m.old_wid,
+                "new_owner":m.new_wid,
+                "reason":"wal_sync_failed: staged block migration did not cross durable watermark"
+            }));
+        }
+        return;
+    }
+    state.durable_gen = state.durable_gen.max(max_gen);
+    for m in &pending {
+        apply_prepared_block_migration(state, m);
+    }
+}
+
+// DurableTransition group barrier. Component writes are WAL-appended nosync and staged, then this
+// fsyncs the whole group and advances durable_gen. Only after that do we mutate canonical RAM and
+// publish, so every existing read/projection path is naturally clamped to <= durable_gen.
+fn flush_pending_updates(state: &mut ServerState) {
+    if state.pending_updates.is_empty() {
+        flush_pending_handoffs(state);
+        flush_pending_failovers(state);
+        flush_pending_block_migrations(state);
+        return;
+    }
+    let pending = std::mem::take(&mut state.pending_updates);
+    let max_gen = pending
+        .iter()
+        .map(|u| u.gen)
+        .max()
+        .unwrap_or(state.durable_gen);
+    if state.wal_sync().is_err() {
+        for u in &pending {
+            emit(
+                state,
+                &u.writer,
+                json!({"op":"UpdateRejected","entity":u.eid,"comp":u.comp,
+                "reason":"wal_sync_failed: staged write did not cross durable watermark; not published"}),
+            );
+        }
+        return;
+    }
+    state.durable_gen = state.durable_gen.max(max_gen);
+    for u in &pending {
+        apply_prepared_update(state, u);
+        renew(state, &u.writer);
+        zone_and_propagate(state, &u.eid, &u.comp, &u.value);
+    }
+    flush_pending_handoffs(state);
+    flush_pending_failovers(state);
+    flush_pending_block_migrations(state);
+}
+
+fn record_mesh_ack(state: &mut ServerState, eid: &str) -> bool {
+    if state
+        .wal_append(&json!({"kind":"mesh_acked","entity":eid}))
+        .is_ok()
+    {
+        state.pending_mesh.remove(eid);
+        true
+    } else {
+        state.rejected.push(json!({
+            "entity":eid,
+            "reason":"wal_persist_failed: mesh ack not durably recorded; keeping pending handoff for resend"
+        }));
+        false
+    }
+}
+
+// Single-write path (UpdateComponent): validate+WAL-write(no fsync) -> queue. A durability tick performs
+// the group fsync and publishes. Returns true if accepted into the pending durable generation.
 fn apply_one_update(
     state: &mut ServerState,
     wid: &str,
@@ -3981,21 +4803,11 @@ fn apply_one_update(
     raw_value: Value,
     supplied_epoch: Option<u64>,
 ) -> bool {
-    let value = match validate_and_apply_nosync(state, wid, eid, comp, raw_value, supplied_epoch) {
-        Some(v) => v,
+    let prepared = match prepare_update(state, wid, eid, comp, raw_value, supplied_epoch) {
+        Some(u) => u,
         None => return false,
     };
-    // durable barrier for this one write. If the fsync fails the value is NOT on disk -> do NOT publish.
-    if state.wal_sync().is_err() {
-        emit(
-            state,
-            wid,
-            json!({"op":"UpdateRejected","entity":eid,"comp":comp,
-            "reason":"wal_sync_failed: write not durably persisted (disk full / WAL degraded) — not published"}),
-        );
-        return false;
-    }
-    zone_and_propagate(state, eid, comp, &value);
+    queue_prepared_update(state, prepared);
     true
 }
 
@@ -4014,8 +4826,12 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
     // nothing is published-as-success that recovery cannot reproduce; transient ops (events/metrics/queries) pass.
     if state.wal_degraded && is_persistent_op(op) {
         let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
-        emit(state, wid, json!({"op":"UpdateRejected","request_id":req_id,
-            "reason":"broker WAL-degraded (fail-closed): persistent op rejected"}));
+        emit(
+            state,
+            wid,
+            json!({"op":"UpdateRejected","request_id":req_id,
+            "reason":"broker WAL-degraded (fail-closed): persistent op rejected"}),
+        );
         return;
     }
     match op {
@@ -4081,33 +4897,19 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     items.push((eid.clone(), val.clone(), shared_ep));
                 }
             }
-            // GROUP-COMMIT: validate+apply each entry in memory + WAL-WRITE (no fsync); collect the applied
-            // ones; ONE wal_sync for the whole batch (N fsyncs -> 1, the per-tick durability wall at scale);
-            // THEN zone+propagate each applied value (publish-after-durable). A rejected entry already emitted
-            // its UpdateRejected and is simply not in `applied` -- the rest of the batch still commits.
-            let mut applied: Vec<(String, Value)> = Vec::with_capacity(items.len());
+            // WATERMARK-COMMIT: validate+prepare each entry + WAL-WRITE (no fsync); queue all accepted
+            // entries into the broker-wide durable generation. The durability tick performs ONE wal_sync
+            // for every pending single/batch write and only then publishes.
+            // A rejected entry already emitted its UpdateRejected and is simply not in `prepared`.
+            let mut accepted = 0usize;
             for (eid, val, ep) in items {
-                if let Some(v) = validate_and_apply_nosync(state, wid, &eid, &comp, val, ep) {
-                    applied.push((eid, v));
+                if let Some(u) = prepare_update(state, wid, &eid, &comp, val, ep) {
+                    queue_prepared_update(state, u);
+                    accepted += 1;
                 }
             }
-            if applied.is_empty() {
+            if accepted == 0 {
                 return; // nothing applied (all rejected / unknown) -> no fsync, no publish
-            }
-            // ONE durability barrier for the whole batch. If it fails, NONE of the group is durable -> publish
-            // nothing + reject the batch (the in-memory writes stand but the broker is now fail-closed, exactly
-            // as a single write's wal failure leaves it; no value is broadcast as committed without being on disk).
-            if state.wal_sync().is_err() {
-                emit(
-                    state,
-                    wid,
-                    json!({"op":"UpdateRejected","comp":comp,
-                    "reason":"wal_sync_failed (batch): writes not durably persisted (disk full / WAL degraded) — not published"}),
-                );
-                return;
-            }
-            for (eid, v) in &applied {
-                zone_and_propagate(state, eid, &comp, v);
             }
         }
         "Fold" => {
@@ -4141,19 +4943,21 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             if target.is_empty() || target == cur {
                 return;
             }
-            // reposition at the fold destination, then hand authority cur -> target
-            if let Some(p) = f.get("pos").cloned() {
-                if let Some(e) = state.entities.get_mut(&eid) {
-                    e.pos = arr2(Some(&p));
-                }
+            // The fold destination is part of the handoff transaction: WAL first, then pos+region+authority.
+            let pos = f.get("pos").map(|p| arr2(Some(p)));
+            if !handoff_with_position(state, &eid, &cur, &target, pos) {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","entity":eid,"comp":"fold",
+                    "reason":"fold handoff failed before durable commit"}),
+                );
+                return;
             }
-            handoff(state, &eid, &cur, &target); // proven path: WAL transfer + AuthorityChange(old/new)
-            let np = state
-                .entities
-                .get(&eid)
-                .map(|e| e.pos)
-                .unwrap_or([0.0, 0.0]);
-            propagate(state, &eid, "pos", &json!(np));
+            flush_pending_handoffs(state);
+            if let Some(np) = state.entities.get(&eid).map(|e| e.pos) {
+                propagate(state, &eid, "pos", &json!(np));
+            }
         }
         "Heartbeat" => {
             renew(state, wid); // liveness with no writes (idle owner stays alive)
@@ -4223,7 +5027,11 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
         // the entity's authoritative owner may fire its events. Mirrors WA's "events ride the update
         // channel" without turning events into state.
         "EntityEvent" => {
-            let eid = f.get("entity").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let eid = f
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if let Err(reason) = authoritative_entity_owner(state, wid, &eid) {
                 emit(
                     state,
@@ -4234,7 +5042,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             }
             let event = f.get("event").cloned().unwrap_or(Value::Null);
             let payload = f.get("payload").cloned().unwrap_or(Value::Null);
-            // Gemini blind-spot fix (cross-seam event ORDERING): stamp the event with the entity's CURRENT
+            // Cross-seam event ordering: stamp the event with the entity's CURRENT
             // sim_time + gen so the client orders it in the SAME SimTimeInterpBuffer as the state stream --
             // the event renders at the moment it belongs to (e.g. TakeDamage AFTER the bullet reaches the
             // target by sim_time), not whenever the packet happens to arrive. Falls back to null (arrival
@@ -4253,7 +5061,11 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             // L1 event-storm: CLASSIFY (default "critical" -- a creator that doesn't classify is never
             // silently dropped/coalesced) + a coalesce_key (default eid:event so same-name visual events from
             // one entity collapse).
-            let class = f.get("class").and_then(|v| v.as_str()).unwrap_or("critical").to_string();
+            let class = f
+                .get("class")
+                .and_then(|v| v.as_str())
+                .unwrap_or("critical")
+                .to_string();
             let coalesce_key = f
                 .get("coalesce_key")
                 .and_then(|v| v.as_str())
@@ -4262,7 +5074,13 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             let target_wids: Vec<String> = state
                 .workers
                 .iter()
-                .filter(|(_, w)| state.entities.get(&eid).map(|e| visible(w, e)).unwrap_or(false))
+                .filter(|(_, w)| {
+                    state
+                        .entities
+                        .get(&eid)
+                        .map(|e| visible(w, e))
+                        .unwrap_or(false)
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             // CRITICAL events deliver INLINE (in THIS lock-hold), NOT via the buffered 20Hz flush tick.
@@ -4308,11 +5126,19 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             // The hand-off of EXISTING entities (mesh_forward) continues; only NEW arrivals are refused.
             if state.draining {
                 if let Some(req) = f.get("request_id") {
-                    emit(state, wid, json!({"op":"CreateEntityResponse","request_id":req,
-                        "entity":eid,"success":false,"reason":"draining"}));
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"CreateEntityResponse","request_id":req,
+                        "entity":eid,"success":false,"reason":"draining"}),
+                    );
                 } else {
-                    emit(state, wid, json!({"op":"UpdateRejected","entity":eid,"comp":"create",
-                        "reason":"draining"}));
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":"create",
+                        "reason":"draining"}),
+                    );
                 }
                 return;
             }
@@ -4400,7 +5226,25 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             let created = !state.entities.contains_key(&eid);
             if created {
                 let requested_region = f.get("region").and_then(|v| v.as_str());
-                spawn_in_region(state, &eid, pos2, vel2, comps, requested_region, None, None);
+                if !spawn_in_region(state, &eid, pos2, vel2, comps, requested_region, None, None) {
+                    if let Some(req) = f.get("request_id") {
+                        emit(
+                            state,
+                            wid,
+                            json!({"op":"CreateEntityResponse","request_id":req,
+                            "entity":eid,"success":false,
+                            "reason":"wal_persist_failed: create not durably persisted"}),
+                        );
+                    } else {
+                        emit(
+                            state,
+                            wid,
+                            json!({"op":"UpdateRejected","entity":eid,"comp":"create",
+                            "reason":"wal_persist_failed: create not durably persisted"}),
+                        );
+                    }
+                    return;
+                }
             }
             if let Some(req) = f.get("request_id") {
                 emit(
@@ -4453,9 +5297,29 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .get(&eid)
                 .map(|e| e.version.saturating_add(1))
                 .unwrap_or(0);
-            let _ = state.wal_append(&json!({
-                "kind":"delete_tombstone","entity":&eid,"version":delete_version,"writer":wid
-            }));
+            if state
+                .wal_append(&json!({
+                    "kind":"delete_tombstone","entity":&eid,"version":delete_version,"writer":wid
+                }))
+                .is_err()
+            {
+                if let Some(req) = request_id {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"DeleteEntityResponse","request_id":req,
+                        "entity":eid,"success":false,"reason":"wal_persist_failed: tombstone not durable"}),
+                    );
+                } else {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":"delete",
+                        "reason":"wal_persist_failed: tombstone not durable"}),
+                    );
+                }
+                return;
+            }
             state.deleted_entities.insert(eid.clone());
             let removed = state.entities.remove(&eid).is_some();
             if removed {
@@ -4557,8 +5421,14 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 Some(w) => w,
                 None => return,
             };
-            let want_intent = f.get("include_handoff_intent").and_then(|v| v.as_bool()).unwrap_or(false);
-            let debug_ok = worker.attributes.iter().any(|a| a == "observer" || a == "debug");
+            let want_intent = f
+                .get("include_handoff_intent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let debug_ok = worker
+                .attributes
+                .iter()
+                .any(|a| a == "observer" || a == "debug");
             for (eid, e) in state.entities.iter() {
                 if matches_query(e, &q) && visible(worker, e) {
                     let mut row = json!({"entity":eid,"pos":[e.pos[0],e.pos[1]],
@@ -4592,45 +5462,73 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 "count":hits.len(),"entities":hits}),
             );
         }
-        // ── InspectorQuery: read-only whole-cluster TRUTH frame (Inspector-0, GPT-Pro spec). Gated by the
+        // ── InspectorQuery: read-only whole-cluster truth frame. Gated by the
         // "inspector" attr; POLLED (the Godot inspector polls at rate_hz). Reuses authority_to_json +
         // handoff_intent_to_json; sources zones/workers/metrics/pending from live state. Entities capped so
         // the Inspector never becomes the fan-out killer. ──
         "InspectorQuery" => {
-            let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let worker = match state.workers.get(wid) { Some(w) => w, None => return };
+            let req_id = f
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let worker = match state.workers.get(wid) {
+                Some(w) => w,
+                None => return,
+            };
             if !worker.attributes.iter().any(|a| a == "inspector") {
-                emit(state, wid, json!({"op":"UpdateRejected","request_id":req_id,
-                    "reason":"InspectorQuery requires the inspector attribute"}));
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","request_id":req_id,
+                    "reason":"InspectorQuery requires the inspector attribute"}),
+                );
                 return;
             }
-            let cap = f.get("max_entities").and_then(|v| v.as_u64()).unwrap_or(1000) as usize;
+            let cap = f
+                .get("max_entities")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1000) as usize;
             // zones: region -> owning worker + last-reported load + dynamic split sub-boundaries
-            let zones: Vec<Value> = state.region_worker.iter().map(|(region, w)| {
-                json!({"region": region, "worker": w,
+            let zones: Vec<Value> = state
+                .region_worker
+                .iter()
+                .map(|(region, w)| {
+                    json!({"region": region, "worker": w,
                     "load": state.worker_load.get(w).copied().unwrap_or(0.0),
                     "splits": state.splits.get(region)})
-            }).collect();
+                })
+                .collect();
             // workers: id -> region, view_count (interest-set size), attributes, load, out_queue.
             // G4 backpressure: out_queue = the per-worker egress backlog depth (enqueued-by-emit minus
             // dequeued-by-the-writer). The channel is still UNBOUNDED -- this makes the backlog VISIBLE
             // (the next step bounds it: a bounded channel + drop-on-full once a real slow-consumer is seen).
-            let workers: Vec<Value> = state.workers.iter().map(|(id, w)| {
-                json!({"worker_id": id, "region": w.region, "view_count": w.view.len(),
+            let workers: Vec<Value> = state
+                .workers
+                .iter()
+                .map(|(id, w)| {
+                    json!({"worker_id": id, "region": w.region, "view_count": w.view.len(),
                     "attributes": w.attributes.iter().cloned().collect::<Vec<String>>(),
                     "load": state.worker_load.get(id).copied().unwrap_or(0.0),
                     "out_queue": w.out_queue.load(Ordering::Relaxed),
                     "dropped": w.dropped.load(Ordering::Relaxed),
                     "slow_consumer": w.out_queue.load(Ordering::Relaxed) > EGRESS_SOFT_CAP})
-            }).collect();
+                })
+                .collect();
             // entities: capped, each with per-component authority + handoff intent + the gen clock
             let mut ents: Vec<Value> = Vec::new();
             for (eid, e) in state.entities.iter() {
-                if ents.len() >= cap { break; }
+                if ents.len() >= cap {
+                    break;
+                }
                 let mut row = json!({"entity": eid, "region": e.region,
                     "pos": [e.pos[0], e.pos[1]], "authority": authority_to_json(&e.authority)});
-                if let Some(g) = e.components.get("gen") { row["gen"] = g.clone(); }
-                if let Some(st) = e.components.get("sim_time") { row["sim_time"] = st.clone(); }
+                if let Some(g) = e.components.get("gen") {
+                    row["gen"] = g.clone();
+                }
+                if let Some(st) = e.components.get("sim_time") {
+                    row["sim_time"] = st.clone();
+                }
                 if let Some(i) = state.pending_handoff_intent.get(eid) {
                     row["handoff_intent"] = handoff_intent_to_json(i);
                 }
@@ -4640,7 +5538,9 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             // a broker is holding. They carry `ghost:true` + `owner_region` and an EMPTY authority map (a ghost
             // owns nothing) -- visibly distinct from an authoritative entity in the same frame.
             for (eid, g) in state.ghosts.iter() {
-                if ents.len() >= cap { break; }
+                if ents.len() >= cap {
+                    break;
+                }
                 ents.push(json!({"entity": eid, "region": g.owner_region,
                     "pos": [g.pos[0], g.pos[1]], "authority": json!({}),
                     "ghost": true, "owner_region": g.owner_region}));
@@ -4692,13 +5592,17 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             });
             emit(state, wid, frame);
         }
-        // ── #3 OPS: HEALTH/METRICS endpoint (Gemini's #2 blocker -- a scrapable live-metrics surface). UNGATED:
-        // a liveness/readiness prober (k8s, a load-balancer, an operator's curl-equivalent) holds NO inspector
+        // ── #3 OPS: HEALTH/METRICS endpoint (a scrapable live-metrics surface). UNGATED:
+        // a liveness/readiness prober (k8s, load-balancer, or curl-equivalent) holds NO inspector
         // attribute, so health must be readable by any connected worker. Returns ONE HealthFrame over the existing
         // length-prefixed-JSON wire -- no HTTP dep, no second port. The fields are the live state.metrics + RSS +
         // tick-lag + WAL/ghost/pending sizes (health_snapshot), so this never diverges from the Inspector view. ──
         "Health" => {
-            let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let req_id = f
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let mut snap = health_snapshot(state);
             snap["op"] = json!("HealthFrame");
             snap["request_id"] = json!(req_id);
@@ -4712,13 +5616,21 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
         // drain_exit -- exits 0 (a clean deploy shutdown). GATED to an admin attribute (drain is a control action):
         // kernel_admin OR inspector OR a worker carrying "ops". `exit` field overrides drain_exit per-call. ──
         "Drain" => {
-            let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let req_id = f
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if !worker_has_attr(state, wid, "kernel_admin")
                 && !worker_has_attr(state, wid, "inspector")
                 && !worker_has_attr(state, wid, "ops")
             {
-                emit(state, wid, json!({"op":"UpdateRejected","request_id":req_id,
-                    "reason":"Drain requires the kernel_admin/inspector/ops attribute"}));
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","request_id":req_id,
+                    "reason":"Drain requires the kernel_admin/inspector/ops attribute"}),
+                );
                 return;
             }
             if let Some(ex) = f.get("exit").and_then(|v| v.as_bool()) {
@@ -4730,33 +5642,68 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             let no_neighbour = state.mesh.is_empty();
             eprintln!("[drain] DRAIN requested -- draining=true, dispatched {dispatched} entit(y/ies) to neighbour(s), {remaining} still local, pending_mesh={}{}",
                 state.pending_mesh.len(), if no_neighbour { " (NO mesh neighbour -- cannot drain, dead-end)" } else { "" });
-            emit(state, wid, json!({"op":"DrainAck","request_id":req_id,
+            emit(
+                state,
+                wid,
+                json!({"op":"DrainAck","request_id":req_id,
                 "draining": true, "dispatched": dispatched, "remaining_local": remaining,
                 "pending_mesh": state.pending_mesh.len(), "drain_exit": state.drain_exit,
-                "no_neighbour": no_neighbour}));
+                "no_neighbour": no_neighbour}),
+            );
         }
         // ── G2 SnapshotMarker: a coordinator records a consistent point-in-time cut (WAL offset + manifest) ──
         "SnapshotMarker" => {
-            let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let snapshot_id = f.get("snapshot_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let req_id = f
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let snapshot_id = f
+                .get("snapshot_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             // gate: a snapshot reads the whole world -- require the snapshot/inspector/kernel_admin attribute
             {
                 let worker = match state.workers.get(wid) {
                     Some(w) => w,
                     None => return,
                 };
-                if !worker.attributes.iter().any(|a| a == "snapshot" || a == "inspector" || a == "kernel_admin") {
-                    emit(state, wid, json!({"op":"UpdateRejected","request_id":req_id,
-                        "reason":"SnapshotMarker requires the snapshot/inspector/kernel_admin attribute"}));
+                if !worker
+                    .attributes
+                    .iter()
+                    .any(|a| a == "snapshot" || a == "inspector" || a == "kernel_admin")
+                {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","request_id":req_id,
+                        "reason":"SnapshotMarker requires the snapshot/inspector/kernel_admin attribute"}),
+                    );
                     return;
                 }
+            }
+            // Record the marker in the WAL FIRST -> the restore replays UP TO this offset (the consistent cut).
+            // If the marker is not durable, do not disable compaction or return a manifest for a cut recovery
+            // cannot name.
+            if state
+                .wal_append(
+                    &json!({"kind":"snapshot_marker","snapshot_id":snapshot_id,"t":now_millis()}),
+                )
+                .is_err()
+            {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","request_id":req_id,
+                    "reason":"wal_persist_failed: snapshot marker not durably recorded"}),
+                );
+                return;
             }
             // R0.3: a coordinated point-in-time snapshot was taken -> disable WAL compaction for this broker's
             // lifetime, so a later GW_RESTORE_OFFSET cut against this WAL stays byte-valid (compaction would
             // rewrite the file and invalidate the offset). The disk-fill scenario uses no SnapshotMarker.
             state.snapshot_seen = true;
-            // record the marker in the WAL FIRST -> the restore replays UP TO this offset (the consistent cut)
-            let _ = state.wal_append(&json!({"kind":"snapshot_marker","snapshot_id":snapshot_id,"t":now_millis()}));
             let wal_offset = state.wal_bytes;
             let mut ids: Vec<String> = state.entities.keys().cloned().collect();
             ids.sort();
@@ -4771,7 +5718,8 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                         authority_hash = authority_hash.wrapping_add(ca.epoch);
                         if let Some(o) = &ca.owner {
                             for b in o.bytes() {
-                                authority_hash = (authority_hash ^ b as u64).wrapping_mul(0x100000001b3);
+                                authority_hash =
+                                    (authority_hash ^ b as u64).wrapping_mul(0x100000001b3);
                             }
                         }
                     }
@@ -4783,12 +5731,16 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .map(|(eid, (_frame, _when, target))| json!({"entity": eid, "target": target, "type": "MeshHandoff"}))
                 .collect();
             let broker_id = std::env::var("GW_BROKER_ID").unwrap_or_else(|_| "broker".to_string());
-            emit(state, wid, json!({
-                "op": "SnapshotManifest", "request_id": req_id, "snapshot_id": snapshot_id,
-                "broker_id": broker_id, "wal_offset": wal_offset, "entity_count": state.entities.len(),
-                "authority_hash": authority_hash.to_string(), "pending_mesh": state.pending_mesh.len(),
-                "in_flight": in_flight, "t_server": now_millis()
-            }));
+            emit(
+                state,
+                wid,
+                json!({
+                    "op": "SnapshotManifest", "request_id": req_id, "snapshot_id": snapshot_id,
+                    "broker_id": broker_id, "wal_offset": wal_offset, "entity_count": state.entities.len(),
+                    "authority_hash": authority_hash.to_string(), "pending_mesh": state.pending_mesh.len(),
+                    "in_flight": in_flight, "t_server": now_millis()
+                }),
+            );
         }
         // ── ReserveEntityIds: atomic id block ──
         "ReserveEntityIds" => {
@@ -4799,7 +5751,22 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .to_string();
             let n = f.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
             let first = state.entity_id_reservations;
-            state.entity_id_reservations += n;
+            let next = state.entity_id_reservations.saturating_add(n);
+            if state
+                .wal_append(
+                    &json!({"kind":"reserve_entity_ids","first_id":first,"count":n,"next_id":next}),
+                )
+                .is_err()
+            {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","request_id":req_id,
+                    "reason":"wal_persist_failed: id reservation not durably recorded"}),
+                );
+                return;
+            }
+            state.entity_id_reservations = next;
             emit(
                 state,
                 wid,
@@ -4848,25 +5815,66 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .and_then(|v| v.as_str())
                 .and_then(AuthorityMode::from_str);
             let requested_epoch = frame_authority_epoch(f);
-            let (version, authority_epoch, mode_s) = if let Some(e) = state.entities.get_mut(&eid) {
+            let old_owner = state
+                .entities
+                .get(&eid)
+                .and_then(|e| component_authority_owner(e, &comp));
+            let (version, authority_epoch, mode_s) = if let Some(e) = state.entities.get(&eid) {
+                let mut next = e.clone();
+                ensure_component_authority(&mut next, &comp);
+                let ca = next.authority.get_mut(&comp).unwrap();
+                if let Some(mode) = mode.clone() {
+                    ca.mode = mode;
+                }
+                ca.owner = owner.clone();
+                ca.epoch = requested_epoch.unwrap_or_else(|| ca.epoch.saturating_add(1));
+                next.version = next.version.saturating_add(1);
+                (next.version, ca.epoch, ca.mode.as_str().to_string())
+            } else {
+                return;
+            };
+            if state
+                .wal_append(&json!({
+                "kind":"component_authority","entity":&eid,"version":version,
+                "writer":wid,"comp":&comp,"owner":owner.clone(),
+                "authority_epoch":authority_epoch,"mode":mode_s.clone()
+                }))
+                .is_err()
+            {
+                let reason = "wal_persist_failed: component authority change not durably recorded";
+                if let Some(req) = request_id.clone() {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"SetComponentAuthorityResponse","request_id":req,
+                        "entity":eid,"comp":comp,"success":false,"reason":reason}),
+                    );
+                } else {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":comp,"reason":reason}),
+                    );
+                }
+                return;
+            }
+            if let Some(e) = state.entities.get_mut(&eid) {
                 ensure_component_authority(e, &comp);
                 let ca = e.authority.get_mut(&comp).unwrap();
                 if let Some(mode) = mode {
                     ca.mode = mode;
                 }
                 ca.owner = owner.clone();
-                ca.epoch = requested_epoch.unwrap_or_else(|| ca.epoch.saturating_add(1));
-                let mode_s = ca.mode.as_str();
-                e.version += 1;
-                (e.version, ca.epoch, mode_s)
+                ca.epoch = authority_epoch;
+                e.version = version;
             } else {
                 return;
-            };
-            let _ = state.wal_append(&json!({
-                "kind":"component_authority","entity":&eid,"version":version,
-                "writer":wid,"comp":&comp,"owner":owner.clone(),
-                "authority_epoch":authority_epoch,"mode":mode_s
-            }));
+            }
+            if let Some(old_wid) = old_owner.as_deref() {
+                if Some(old_wid.to_string()) != owner && state.workers.contains_key(old_wid) {
+                    revoke_authority(state, old_wid, &eid, &comp);
+                }
+            }
             if let Some(owner_wid) = owner.as_deref() {
                 if state.workers.contains_key(owner_wid) {
                     grant_authority(state, owner_wid, &eid, &comp);
@@ -4934,25 +5942,40 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .map(|e| !e.components.contains_key(&comp))
                 .unwrap_or(false);
             if exists {
-                let version = if let Some(e) = state.entities.get_mut(&eid) {
-                    e.components.insert(comp.clone(), value.clone());
-                    ensure_component_authority(e, &comp);
-                    e.version += 1;
-                    e.version
-                } else {
-                    return;
-                };
-                let _ = state.wal_append(&json!({
+                let version = state
+                    .entities
+                    .get(&eid)
+                    .map(|e| e.version.saturating_add(1))
+                    .unwrap_or(1);
+                if state
+                    .wal_append(&json!({
                     "kind":"component_add","entity":&eid,"version":version,
                     "writer":wid,"comp":&comp,"value":value.clone()
-                }));
+                    }))
+                    .is_err()
+                {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                        "reason":"wal_persist_failed: component add not durably recorded"}),
+                    );
+                    return;
+                }
+                if let Some(e) = state.entities.get_mut(&eid) {
+                    e.components.insert(comp.clone(), value.clone());
+                    ensure_component_authority(e, &comp);
+                    e.version = version;
+                } else {
+                    return;
+                }
                 let wids: Vec<String> = state.workers.keys().cloned().collect();
                 for w2 in wids {
                     if state.workers[&w2].view.contains(&eid) {
                         emit(
                             state,
                             &w2,
-                            json!({"op":"AddComponent","entity":eid,"comp":comp,"value":value}),
+                            json!({"op":"AddComponent","entity":eid,"comp":comp,"value":value.clone()}),
                         );
                     }
                 }
@@ -5008,17 +6031,32 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .map(|e| e.components.contains_key(&comp))
                 .unwrap_or(false);
             if had {
-                let version = if let Some(e) = state.entities.get_mut(&eid) {
-                    e.components.remove(&comp);
-                    e.version += 1;
-                    e.version
-                } else {
-                    return;
-                };
-                let _ = state.wal_append(&json!({
+                let version = state
+                    .entities
+                    .get(&eid)
+                    .map(|e| e.version.saturating_add(1))
+                    .unwrap_or(1);
+                if state
+                    .wal_append(&json!({
                     "kind":"component_remove","entity":&eid,"version":version,
                     "writer":wid,"comp":&comp
-                }));
+                    }))
+                    .is_err()
+                {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                        "reason":"wal_persist_failed: component remove not durably recorded"}),
+                    );
+                    return;
+                }
+                if let Some(e) = state.entities.get_mut(&eid) {
+                    e.components.remove(&comp);
+                    e.version = version;
+                } else {
+                    return;
+                }
                 let wids: Vec<String> = state.workers.keys().cloned().collect();
                 for w2 in wids {
                     if state.workers[&w2].view.contains(&eid) {
@@ -5127,53 +6165,93 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .as_deref()
                 .and_then(|region| state.region_worker.get(region).cloned());
             let (version, existed, authority_epoch, old_region, new_region, moved_comps, authority) =
-                if let Some(e) = state.entities.get_mut(&eid) {
-                    let existed = e.components.contains_key("threshold.tx");
-                    let old_region = e.region.clone();
+                if let Some(e) = state.entities.get(&eid) {
+                    let mut next = e.clone();
+                    let existed = next.components.contains_key("threshold.tx");
+                    let old_region = next.region.clone();
                     if final_phase {
-                        e.components.remove("threshold.tx");
+                        next.components.remove("threshold.tx");
                     } else {
-                        e.components
+                        next.components
                             .insert("threshold.tx".to_string(), tx_value.clone());
                     }
                     if commit_phase {
                         if let Some(to) = to_value.as_str().filter(|s| !s.is_empty()) {
-                            e.region = to.to_string();
+                            next.region = to.to_string();
                         }
                     }
                     let (authority_epoch, moved_comps) = if commit_phase {
                         advance_physics_island_authority(
-                            e,
+                            &mut next,
                             old_owner.as_deref(),
                             new_owner.as_deref(),
                         )
                     } else {
-                        (component_authority_epoch(e, "pos"), Vec::new())
+                        (component_authority_epoch(&next, "pos"), Vec::new())
                     };
-                    let new_region = e.region.clone();
-                    e.version += 1;
+                    let new_region = next.region.clone();
+                    next.version = next.version.saturating_add(1);
                     (
-                        e.version,
+                        next.version,
                         existed,
                         authority_epoch,
                         old_region,
                         new_region,
                         moved_comps,
-                        authority_to_json(&e.authority),
+                        authority_to_json(&next.authority),
                     )
                 } else {
                     return;
                 };
-            let _ = state.wal_append(&json!({
+            if state
+                .wal_append(&json!({
                 "kind":format!("threshold_{}", phase),
                 "entity":&eid,"version":version,"writer":wid,
                 "tx_id":&tx_id,"authority_epoch":authority_epoch,
-                "authority":authority,
+                "authority":authority.clone(),
                 "components":moved_comps.clone(),
-                "from": from_value,
-                "to": to_value,
+                "from": from_value.clone(),
+                "to": to_value.clone(),
                 "ts_ms": ts_ms
-            }));
+                }))
+                .is_err()
+            {
+                if let Some(req) = request_id.clone() {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"ThresholdTxResponse","request_id":req,
+                        "entity":eid,"tx_id":tx_id,"phase":phase,
+                        "success":false,
+                        "reason":"wal_persist_failed: threshold transaction not durably recorded"}),
+                    );
+                } else {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":"threshold.tx",
+                        "reason":"wal_persist_failed: threshold transaction not durably recorded"}),
+                    );
+                }
+                return;
+            }
+            if let Some(e) = state.entities.get_mut(&eid) {
+                if final_phase {
+                    e.components.remove("threshold.tx");
+                } else {
+                    e.components
+                        .insert("threshold.tx".to_string(), tx_value.clone());
+                }
+                if commit_phase {
+                    if let Some(to) = to_value.as_str().filter(|s| !s.is_empty()) {
+                        e.region = to.to_string();
+                    }
+                    apply_authority_snapshot(e, &authority);
+                }
+                e.version = version;
+            } else {
+                return;
+            }
             if commit_phase && old_region != new_region {
                 let old_wid = state.region_worker.get(&old_region).cloned();
                 let new_wid = state.region_worker.get(&new_region).cloned();
@@ -5309,10 +6387,12 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             }
             // adopt it if NEW; if we already have it this is a RE-SEND (our earlier MeshAck was lost) --
             // don't double-spawn, but DO re-ACK below so the sender can release it. ACK in BOTH cases.
+            let pos = arr2(f.get("pos"));
+            let authority_epoch = f.get("authority_epoch").and_then(|v| v.as_u64());
+            let target = f.get("target").and_then(|v| v.as_str());
+            let adopt_region = receiving_region_for_adopt(state, pos, target);
             if !state.entities.contains_key(&eid) {
-                let pos = arr2(f.get("pos"));
                 let vel = arr2(f.get("vel")); // adopt the inbound velocity (hardcoded [0,0] -> C1 seam break)
-                let authority_epoch = f.get("authority_epoch").and_then(|v| v.as_u64());
                 let authority_snapshot = f.get("authority").cloned();
                 let comps: Map<String, Value> = f
                     .get("components")
@@ -5321,27 +6401,34 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     .unwrap_or_default();
                 // the zone this adopted entity now BELONGS to = one of THIS broker's owned regions (NOT a
                 // position-derive against our local W|E boundary, which mislabeled a Fold-into-ZB as "W").
-                let target = f.get("target").and_then(|v| v.as_str());
-                let adopt_region = receiving_region_for_adopt(state, pos, target);
-                spawn_in_region(
+                if !spawn_committed_region(
                     state,
                     &eid,
                     pos,
                     vel,
                     comps,
-                    Some(adopt_region.as_str()),  // FIX: pass the receiving zone so the WORKER grant-loop inside
-                    authority_epoch,      // spawn_in_region uses the correct region (Z_i_j), not a pos-derived
-                    authority_snapshot,   // W/E. Without this the cross-broker-adopted bot was orphaned
-                );                        // (broker owned it, no worker simulated it) -> frozen at the seam.
-                // OVERRIDE the region spawn_in_region derived from position with the receiving zone's region
-                // (spawn_region re-derives W|E from x for the LOCAL create/split path; an inbound mesh adopt
-                // is the one case where the region is dictated by WHICH broker owns the entity now, not by x).
-                if let Some(e) = state.entities.get_mut(&eid) {
-                    if e.region != adopt_region {
-                        e.region = adopt_region.clone();
-                    }
+                    adopt_region.clone(),
+                    authority_epoch,
+                    authority_snapshot,
+                ) {
+                    // (broker owned it, no worker simulated it) -> frozen at the seam.
+                    return;
                 }
-                eprintln!("[mesh] adopted {eid} (region '{adopt_region}'; vel {vel:?} carried; now ours)");
+                eprintln!(
+                    "[mesh] adopted {eid} (region '{adopt_region}'; vel {vel:?} carried; now ours)"
+                );
+            } else if !existing_mesh_adopt_matches(state, &eid, &adopt_region, authority_epoch) {
+                state.rejected.push(json!({
+                    "reason":"mesh handoff existing-entity mismatch",
+                    "entity":eid,
+                    "adopt_region":adopt_region,
+                    "authority_epoch":authority_epoch
+                }));
+                if state.rejected.len() > 256 {
+                    let drop = state.rejected.len() - 256;
+                    state.rejected.drain(0..drop);
+                }
+                return;
             }
             // confirm receipt to the sender (the mesh-link worker that delivered this) so it releases the
             // parked entity from pending_mesh. Idempotent: re-sends are re-ACK'd, never double-adopted.
@@ -5654,9 +6741,10 @@ fn registry_read(reg_dir: &str) -> Map<String, Value> {
         for ent in rd.flatten() {
             let p = ent.path();
             if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let (Some(region), Ok(txt)) =
-                    (p.file_stem().and_then(|s| s.to_str()), std::fs::read_to_string(&p))
-                {
+                if let (Some(region), Ok(txt)) = (
+                    p.file_stem().and_then(|s| s.to_str()),
+                    std::fs::read_to_string(&p),
+                ) {
                     if let Ok(v) = serde_json::from_str::<Value>(&txt) {
                         out.insert(region.to_string(), v);
                     }
@@ -5672,7 +6760,7 @@ fn registry_read(reg_dir: &str) -> Map<String, Value> {
 // by a strictly higher epoch under a different addr). lease_epoch is additive: an old record without it reads
 // as None on the peer side -> legacy-accepted.
 //
-// REPLACE-IF-NEWER (GPT-5 Pro: "Registry writes are atomic replace-if-newer, not blind overwrite"): when two
+// REPLACE-IF-NEWER: when two
 // incarnations both own region E (the split-brain window), a STALE incarnation's heartbeat must NOT clobber a
 // newer one's registry record. Only write if our lease_epoch is >= the epoch currently recorded -- so old-B@10
 // can never overwrite B'@11, and the highest-epoch holder wins the registry. A legacy record without an epoch
@@ -5713,19 +6801,22 @@ fn spawn_mesh_link_dynamic(st: Arc<Mutex<ServerState>>, region: String, reg_dir:
                 if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
                     stream.set_nodelay(true).ok();
                     let (mut rd, mut wr) = stream.into_split();
-                    let hs = frame(&json!({"op":"WorkerConnect","worker_id":format!("mesh-link-{region}"),"region":"MESH","proto":PROTOCOL_VERSION}));
+                    let hs = frame(
+                        &json!({"op":"WorkerConnect","worker_id":format!("mesh-link-{region}"),"region":"MESH","proto":PROTOCOL_VERSION}),
+                    );
                     if wr.write_all(&hs).await.is_ok() {
                         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
                         st.lock().await.mesh.insert(region.clone(), tx);
-                        println!("[mesh] DISCOVERED + linked region {region} @ {addr} (from registry)");
+                        println!(
+                            "[mesh] DISCOVERED + linked region {region} @ {addr} (from registry)"
+                        );
                         let st_ack = st.clone();
                         tokio::spawn(async move {
                             while let Some(f) = read_frame(&mut rd).await {
                                 if f.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
                                     if let Some(eid) = f.get("entity").and_then(|v| v.as_str()) {
                                         let mut s = st_ack.lock().await;
-                                        s.pending_mesh.remove(eid);
-                                        let _ = s.wal_append(&json!({"kind":"mesh_acked","entity":eid}));
+                                        record_mesh_ack(&mut s, eid);
                                     }
                                 }
                             }
@@ -5742,6 +6833,1381 @@ fn spawn_mesh_link_dynamic(st: Arc<Mutex<ServerState>>, region: String, reg_dir:
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap()
+    }
+
+    fn test_entity(pos: [f64; 2], region: &str) -> Entity {
+        let components = Map::new();
+        Entity {
+            pos,
+            vel: [1.0, 0.0],
+            authority: initial_authority_map(&components, 1),
+            components,
+            region: region.to_string(),
+            version: 1,
+            last_broadcast_cell: Some(interest_cell_of(pos)),
+        }
+    }
+
+    fn add_test_worker(state: &mut ServerState, wid: &str, region: &str) {
+        let (tx, _rx) = mpsc::channel(CHANNEL_CAP);
+        state.workers.insert(
+            wid.to_string(),
+            WorkerHandle {
+                region: region.to_string(),
+                attributes: HashSet::new(),
+                view: HashSet::new(),
+                authority_epochs: HashMap::new(),
+                aoi_center: None,
+                aoi_radius: None,
+                fidelity_full_radius: None,
+                fidelity_coarse_rate: 1,
+                fidelity_coarse_grid: 0.0,
+                fidelity_seq: HashMap::new(),
+                tx,
+                out_queue: Arc::new(AtomicU64::new(0)),
+                dropped: Arc::new(AtomicU64::new(0)),
+                disconnect: Arc::new(AtomicBool::new(false)),
+                grid_cells: Vec::new(),
+            },
+        );
+        state
+            .region_worker
+            .insert(region.to_string(), wid.to_string());
+    }
+
+    fn add_test_worker_with_rx(
+        state: &mut ServerState,
+        wid: &str,
+        region: &str,
+    ) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+        state.workers.insert(
+            wid.to_string(),
+            WorkerHandle {
+                region: region.to_string(),
+                attributes: HashSet::new(),
+                view: HashSet::new(),
+                authority_epochs: HashMap::new(),
+                aoi_center: None,
+                aoi_radius: None,
+                fidelity_full_radius: None,
+                fidelity_coarse_rate: 1,
+                fidelity_coarse_grid: 0.0,
+                fidelity_seq: HashMap::new(),
+                tx,
+                out_queue: Arc::new(AtomicU64::new(0)),
+                dropped: Arc::new(AtomicU64::new(0)),
+                disconnect: Arc::new(AtomicBool::new(false)),
+                grid_cells: Vec::new(),
+            },
+        );
+        state
+            .region_worker
+            .insert(region.to_string(), wid.to_string());
+        rx
+    }
+
+    fn seed_2d_rebalance_state(state: &mut ServerState) -> Vec<String> {
+        state.grid2d = Some((2, 2, 10.0, 10.0));
+        add_test_worker(state, "hot", "Z0_0");
+        add_test_worker(state, "cold", "Z1_0");
+        state
+            .region_worker
+            .insert("Z0_1".to_string(), "hot".to_string());
+
+        let mut eids = Vec::new();
+        for i in 0..4 {
+            let eid = format!("a{i}");
+            assert!(spawn_in_region(
+                state,
+                &eid,
+                [1.0, 1.0 + i as f64],
+                [0.0, 0.0],
+                Map::new(),
+                None,
+                None,
+                None,
+            ));
+            grant_region_physics_island_authority(state, "hot", &eid);
+            eids.push(eid);
+        }
+        for i in 0..4 {
+            let eid = format!("b{i}");
+            assert!(spawn_in_region(
+                state,
+                &eid,
+                [1.0, 11.0 + i as f64],
+                [0.0, 0.0],
+                Map::new(),
+                None,
+                None,
+                None,
+            ));
+            grant_region_physics_island_authority(state, "hot", &eid);
+            eids.push(eid);
+        }
+        eids
+    }
+
+    #[test]
+    fn grid2d_rejects_non_positive_or_nan_arena() {
+        let _guard = env_guard();
+        std::env::set_var("GW_GRID2D", "2x2");
+
+        std::env::set_var("GW_ARENA", "0,100");
+        assert!(parse_grid2d().is_none());
+
+        std::env::set_var("GW_ARENA", "NaN,100");
+        assert!(parse_grid2d().is_none());
+
+        std::env::set_var("GW_ARENA", "200,100");
+        assert_eq!(parse_grid2d(), Some((2, 2, 100.0, 50.0)));
+
+        std::env::remove_var("GW_ARENA");
+        std::env::remove_var("GW_GRID2D");
+    }
+
+    #[test]
+    fn n_zone_strip_names_do_not_accept_legacy_we_labels() {
+        assert!(is_strip_region_name("W", &[0.0]));
+        assert!(is_strip_region_name("E", &[0.0]));
+        assert!(!is_strip_region_name("W", &[0.0, 10.0]));
+        assert!(!is_strip_region_name("E", &[0.0, 10.0]));
+        assert!(is_strip_region_name("Z2", &[0.0, 10.0]));
+        assert!(!is_strip_region_name("Z2_0", &[0.0, 10.0]));
+    }
+
+    #[test]
+    fn spawn_in_region_reports_failure_when_wal_fails() {
+        let mut state = ServerState::new(30.0);
+        state.wal_fail_inject = true;
+        state.wal_degraded = false;
+
+        let ok = spawn_in_region(
+            &mut state,
+            "e-spawn",
+            [1.0, 2.0],
+            [0.0, 0.0],
+            Map::new(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(!ok);
+        assert!(!state.entities.contains_key("e-spawn"));
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn mesh_forward_does_not_send_or_remove_when_mesh_out_wal_fails() {
+        let mut state = ServerState::new(30.0);
+        state.wal_fail_inject = true;
+        state.wal_degraded = false;
+        state.my_region = "W".to_string();
+        state.region_lease_epoch.insert("W".to_string(), 7);
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([1.0, 0.0], "W"));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.mesh.insert("E".to_string(), tx);
+
+        mesh_forward(&mut state, "ship", "E");
+
+        assert!(state.entities.contains_key("ship"));
+        assert!(state.pending_mesh.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(state.wal_degraded);
+    }
+
+    fn decode_test_frame(buf: &[u8]) -> Value {
+        let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        serde_json::from_slice(&buf[4..4 + n]).unwrap()
+    }
+
+    #[test]
+    fn cross_broker_adopt_not_visible_above_source_durable_gen() {
+        let mut state = ServerState::new(30.0);
+        state.my_region = "W".to_string();
+        state.region_lease_epoch.insert("W".to_string(), 7);
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([1.0, 0.0], "W"));
+        let before = state.durable_gen;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.mesh.insert("E".to_string(), tx);
+
+        mesh_forward(&mut state, "ship", "E");
+
+        let fr = rx
+            .try_recv()
+            .expect("mesh frame must be sent only after source durable watermark covers it");
+        let handoff = decode_test_frame(&fr);
+        let source_gen = handoff
+            .get("source_durable_gen")
+            .and_then(|v| v.as_u64())
+            .expect("MeshHandoff must carry the source durable generation it is covered by");
+
+        assert!(source_gen > before);
+        assert!(
+            source_gen <= state.durable_gen,
+            "neighbour saw MeshHandoff gen {source_gen} above source durable_gen {}",
+            state.durable_gen
+        );
+        assert!(!state.entities.contains_key("ship"));
+        assert!(state.pending_mesh.contains_key("ship"));
+    }
+
+    #[test]
+    fn mesh_adopt_persists_committed_region_for_strip_target() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_mesh_adopt_region_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        add_test_worker(&mut state, "east-worker", "E");
+
+        dispatch_inner(
+            &mut state,
+            "mesh-link",
+            &json!({
+                "op":"MeshHandoff",
+                "entity":"ship",
+                "source_region":"W",
+                "target":"E",
+                "source_durable_gen":7,
+                "lease_epoch":1,
+                "authority_epoch":9,
+                "pos":[-5.0,0.0],
+                "vel":[0.0,0.0],
+                "components":{"pos":[-5.0,0.0],"vel":[0.0,0.0]}
+            }),
+        );
+
+        assert_eq!(state.entities["ship"].region, "E");
+        drop(state.wal.take());
+        let (store, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(store["ship"].region, "E");
+    }
+
+    #[test]
+    fn mesh_adopt_commits_grid_cell_before_advertised_strip_region() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_mesh_adopt_grid_region_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.grid2d = Some((4, 4, 30.0, 30.0));
+        state.my_region = "E".to_string();
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        add_test_worker(&mut state, "cell-worker", "Z2_3");
+
+        dispatch_inner(
+            &mut state,
+            "mesh-link",
+            &json!({
+                "op":"MeshHandoff",
+                "entity":"ship",
+                "source_region":"Z2_2",
+                "target":"Z2_3",
+                "source_durable_gen":7,
+                "lease_epoch":1,
+                "authority_epoch":9,
+                "pos":[75.0,105.0],
+                "vel":[0.0,0.0],
+                "components":{"pos":[75.0,105.0],"vel":[0.0,0.0]}
+            }),
+        );
+
+        assert_eq!(state.entities["ship"].region, "Z2_3");
+        assert_eq!(
+            state.region_worker.get(&state.entities["ship"].region),
+            Some(&"cell-worker".to_string())
+        );
+        drop(state.wal.take());
+        let (store, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(store["ship"].region, "Z2_3");
+    }
+
+    #[test]
+    fn mesh_adopt_grid_target_overrides_geometric_cell() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_mesh_adopt_grid_target_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.grid2d = Some((4, 4, 30.0, 30.0));
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        add_test_worker(&mut state, "cell-worker", "Z2_3");
+
+        dispatch_inner(
+            &mut state,
+            "mesh-link",
+            &json!({
+                "op":"MeshHandoff",
+                "entity":"ship",
+                "source_region":"Z2_2",
+                "target":"Z2_3",
+                "source_durable_gen":7,
+                "lease_epoch":1,
+                "authority_epoch":9,
+                "pos":[15.0,15.0],
+                "vel":[0.0,0.0],
+                "components":{"pos":[15.0,15.0],"vel":[0.0,0.0]}
+            }),
+        );
+
+        assert_eq!(region_2d([15.0, 15.0], 4, 4, 30.0, 30.0), "Z0_0");
+        assert_eq!(state.entities["ship"].region, "Z2_3");
+        assert_eq!(
+            state.region_worker.get(&state.entities["ship"].region),
+            Some(&"cell-worker".to_string())
+        );
+        drop(state.wal.take());
+        let (store, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(store["ship"].region, "Z2_3");
+    }
+
+    #[test]
+    fn mesh_handoff_existing_entity_exact_duplicate_is_reacked() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "east-worker", "E");
+        let mut rx = add_test_worker_with_rx(&mut state, "mesh-link", "MESH");
+        let mut ship = test_entity([5.0, 0.0], "E");
+        set_component_authority_epoch(&mut ship, "pos", 9);
+        set_component_authority_epoch(&mut ship, "vel", 9);
+        state.entities.insert("ship".to_string(), ship);
+
+        dispatch_inner(
+            &mut state,
+            "mesh-link",
+            &json!({
+                "op":"MeshHandoff",
+                "entity":"ship",
+                "source_region":"W",
+                "target":"E",
+                "source_durable_gen":7,
+                "lease_epoch":1,
+                "authority_epoch":9,
+                "pos":[-5.0,0.0],
+                "vel":[0.0,0.0],
+                "components":{"pos":[-5.0,0.0],"vel":[0.0,0.0]}
+            }),
+        );
+
+        let ack = decode_test_frame(&rx.try_recv().expect("exact duplicate should be re-ACKed"));
+        assert_eq!(ack.get("op").and_then(|v| v.as_str()), Some("MeshAck"));
+        assert_eq!(ack.get("entity").and_then(|v| v.as_str()), Some("ship"));
+        assert!(state.rejected.is_empty());
+    }
+
+    #[test]
+    fn mesh_handoff_existing_entity_mismatch_must_not_ack_as_idempotent() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "east-worker", "E");
+        let mut rx = add_test_worker_with_rx(&mut state, "mesh-link", "MESH");
+        let mut ship = test_entity([5.0, 0.0], "E");
+        set_component_authority_epoch(&mut ship, "pos", 3);
+        set_component_authority_epoch(&mut ship, "vel", 3);
+        state.entities.insert("ship".to_string(), ship);
+
+        dispatch_inner(
+            &mut state,
+            "mesh-link",
+            &json!({
+                "op":"MeshHandoff",
+                "entity":"ship",
+                "source_region":"W",
+                "target":"E",
+                "source_durable_gen":7,
+                "lease_epoch":1,
+                "authority_epoch":9,
+                "pos":[-5.0,0.0],
+                "vel":[0.0,0.0],
+                "components":{"pos":[-5.0,0.0],"vel":[0.0,0.0]}
+            }),
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "mismatched existing entity must not be ACKed"
+        );
+        assert!(state.rejected.iter().any(|r| {
+            r.get("reason").and_then(|v| v.as_str())
+                == Some("mesh handoff existing-entity mismatch")
+        }));
+        assert_eq!(component_authority_epoch(&state.entities["ship"], "pos"), 3);
+    }
+
+    #[test]
+    fn update_component_wal_fail_does_not_advance_ram() {
+        let mut state = ServerState::new(30.0);
+        state.wal_fail_inject = true;
+        state.wal_degraded = false;
+        add_test_worker(&mut state, "w1", "W");
+        state
+            .entities
+            .insert("avatar".to_string(), test_entity([-1.0, 2.0], "W"));
+
+        let ok = apply_one_update(
+            &mut state,
+            "w1",
+            "avatar",
+            "pos",
+            json!([-3.0, 100.0]),
+            None,
+        );
+
+        assert!(!ok);
+        let e = state.entities.get("avatar").unwrap();
+        assert_eq!(e.pos, [-1.0, 2.0]);
+        assert_eq!(e.version, 1);
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn batch_update_wal_fail_does_not_advance_ram() {
+        let mut state = ServerState::new(30.0);
+        state.wal_fail_inject = true;
+        state.wal_degraded = false;
+        add_test_worker(&mut state, "w1", "W");
+        state
+            .entities
+            .insert("a".to_string(), test_entity([-1.0, 0.0], "W"));
+        state
+            .entities
+            .insert("b".to_string(), test_entity([-2.0, 0.0], "W"));
+
+        dispatch(
+            &mut state,
+            "w1",
+            &json!({"op":"BatchUpdate","comp":"pos","updates":[["a",[10.0,0.0]],["b",[11.0,0.0]]]}),
+        );
+
+        assert_eq!(state.entities["a"].pos, [-1.0, 0.0]);
+        assert_eq!(state.entities["b"].pos, [-2.0, 0.0]);
+        assert_eq!(state.entities["a"].version, 1);
+        assert_eq!(state.entities["b"].version, 1);
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn update_component_waits_for_durable_watermark_flush() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        state
+            .entities
+            .insert("avatar".to_string(), test_entity([-1.0, 2.0], "W"));
+
+        let ok = apply_one_update(
+            &mut state,
+            "w1",
+            "avatar",
+            "pos",
+            json!([-3.0, 100.0]),
+            None,
+        );
+
+        assert!(ok);
+        assert_eq!(state.pending_updates.len(), 1);
+        assert_eq!(state.pending_gen, 1);
+        assert_eq!(state.durable_gen, 0);
+        assert_eq!(state.entities["avatar"].pos, [-1.0, 2.0]);
+        assert_eq!(state.entities["avatar"].version, 1);
+
+        flush_pending_updates(&mut state);
+
+        assert!(state.pending_updates.is_empty());
+        assert_eq!(state.durable_gen, 1);
+        assert_eq!(state.entities["avatar"].pos, [-3.0, 100.0]);
+        assert_eq!(state.entities["avatar"].version, 2);
+    }
+
+    #[test]
+    fn single_updates_group_until_one_watermark_flush() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        state
+            .entities
+            .insert("avatar".to_string(), test_entity([-1.0, 2.0], "W"));
+
+        assert!(apply_one_update(
+            &mut state,
+            "w1",
+            "avatar",
+            "pos",
+            json!([-3.0, 20.0]),
+            None,
+        ));
+        assert!(apply_one_update(
+            &mut state,
+            "w1",
+            "avatar",
+            "pos",
+            json!([-4.0, 40.0]),
+            None,
+        ));
+
+        assert_eq!(state.pending_updates.len(), 2);
+        assert_eq!(state.pending_gen, 2);
+        assert_eq!(state.durable_gen, 0);
+        assert_eq!(state.entities["avatar"].pos, [-1.0, 2.0]);
+
+        flush_pending_updates(&mut state);
+
+        assert_eq!(state.entities["avatar"].pos, [-4.0, 40.0]);
+        assert_eq!(state.entities["avatar"].version, 3);
+        assert_eq!(state.durable_gen, 2);
+    }
+
+    #[test]
+    fn watermark_sync_fail_does_not_advance_ram() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        state
+            .entities
+            .insert("avatar".to_string(), test_entity([-1.0, 2.0], "W"));
+
+        assert!(apply_one_update(
+            &mut state,
+            "w1",
+            "avatar",
+            "pos",
+            json!([-3.0, 100.0]),
+            None,
+        ));
+        state.wal_fail_inject = true;
+
+        flush_pending_updates(&mut state);
+
+        assert!(state.pending_updates.is_empty());
+        assert_eq!(state.durable_gen, 0);
+        assert_eq!(state.entities["avatar"].pos, [-1.0, 2.0]);
+        assert_eq!(state.entities["avatar"].version, 1);
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn delete_entity_wal_fail_does_not_tombstone_or_remove() {
+        let mut state = ServerState::new(30.0);
+        state.wal_fail_inject = true;
+        state.wal_degraded = false;
+        add_test_worker(&mut state, "w1", "W");
+        state
+            .entities
+            .insert("victim".to_string(), test_entity([-1.0, 0.0], "W"));
+
+        dispatch(
+            &mut state,
+            "w1",
+            &json!({"op":"DeleteEntity","entity":"victim"}),
+        );
+
+        assert!(state.entities.contains_key("victim"));
+        assert!(!state.deleted_entities.contains("victim"));
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn handoff_atomic_under_watermark() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+
+        assert_eq!(state.pending_handoffs.len(), 1);
+        assert_eq!(state.durable_gen, 0);
+        assert_eq!(state.entities["ship"].region, "W");
+        assert_eq!(state.entities["ship"].pos, [-1.0, 0.0]);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w1".to_string())
+        );
+
+        flush_pending_handoffs(&mut state);
+
+        assert!(state.pending_handoffs.is_empty());
+        assert_eq!(state.durable_gen, 1);
+        assert_eq!(state.entities["ship"].region, "E");
+        assert_eq!(state.entities["ship"].pos, [2.0, 0.0]);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w2".to_string())
+        );
+        assert!(!state.workers["w1"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "pos")));
+        assert!(state.workers["w2"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "pos")));
+    }
+
+    #[test]
+    fn handoff_sync_fail_keeps_old_owner() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+        state.wal_fail_inject = true;
+        flush_pending_handoffs(&mut state);
+
+        assert!(state.pending_handoffs.is_empty());
+        assert_eq!(state.durable_gen, 0);
+        assert_eq!(state.entities["ship"].region, "W");
+        assert_eq!(state.entities["ship"].pos, [-1.0, 0.0]);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w1".to_string())
+        );
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn stale_old_owner_write_rejected_by_epoch_after_recovered_handoff() {
+        let dir = std::env::temp_dir().join(format!("gw_handoff_epoch_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        assert!(spawn_in_region(
+            &mut state,
+            "ship",
+            [-1.0, 0.0],
+            [1.0, 0.0],
+            Map::new(),
+            Some("W"),
+            None,
+            None,
+        ));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+        let old_epoch = component_authority_epoch(&state.entities["ship"], "pos");
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+        flush_pending_handoffs(&mut state);
+        let new_epoch = component_authority_epoch(&state.entities["ship"], "pos");
+        assert!(new_epoch > old_epoch);
+        drop(state.wal.take());
+
+        let (entities, _deleted, _cfg, _pending, _id_hwm, report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(
+            report.error.is_none(),
+            "recovery must not error: {:?}",
+            report.error
+        );
+
+        let mut recovered = ServerState::new(30.0);
+        recovered.entities = entities;
+        add_test_worker(&mut recovered, "w1", "W");
+        add_test_worker(&mut recovered, "w2", "E");
+
+        assert!(!apply_one_update(
+            &mut recovered,
+            "w1",
+            "ship",
+            "pos",
+            json!([9.0, 0.0]),
+            Some(old_epoch),
+        ));
+        assert_eq!(recovered.entities["ship"].pos, [2.0, 0.0]);
+
+        assert!(apply_one_update(
+            &mut recovered,
+            "w2",
+            "ship",
+            "pos",
+            json!([3.0, 0.0]),
+            Some(new_epoch),
+        ));
+        flush_pending_updates(&mut recovered);
+        assert_eq!(recovered.entities["ship"].pos, [3.0, 0.0]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failover_grant_only_bumps_epoch_and_old_owner_rejected_on_reconnect() {
+        let dir = std::env::temp_dir().join(format!("gw_failover_epoch_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "SPARE");
+        state.standbys.push("w2".to_string());
+        assert!(spawn_in_region(
+            &mut state,
+            "ship",
+            [-1.0, 0.0],
+            [1.0, 0.0],
+            Map::new(),
+            Some("W"),
+            None,
+            None,
+        ));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+        let old_epoch = component_authority_epoch(&state.entities["ship"], "pos");
+        state
+            .region_expires
+            .insert("W".to_string(), Instant::now() - Duration::from_millis(1));
+
+        check_leases(&mut state);
+
+        assert_eq!(state.pending_failovers.len(), 1);
+        assert_eq!(state.region_worker.get("W").map(|s| s.as_str()), Some("w1"));
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w1".to_string())
+        );
+        assert_eq!(state.metrics.failovers, 0);
+
+        flush_pending_failovers(&mut state);
+
+        assert!(state.pending_failovers.is_empty());
+        assert_eq!(state.region_worker.get("W").map(|s| s.as_str()), Some("w2"));
+        assert_eq!(state.workers["w2"].region, "W");
+        assert_eq!(state.metrics.failovers, 1);
+        let new_epoch = component_authority_epoch(&state.entities["ship"], "pos");
+        assert!(new_epoch > old_epoch);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w2".to_string())
+        );
+        drop(state.wal.take());
+
+        let (entities, _deleted, _cfg, _pending, _id_hwm, report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(
+            report.error.is_none(),
+            "recovery must not error: {:?}",
+            report.error
+        );
+        let recovered_ship = entities.get("ship").unwrap();
+        assert_eq!(component_authority_epoch(recovered_ship, "pos"), new_epoch);
+        assert_eq!(
+            component_authority_owner(recovered_ship, "pos"),
+            Some("w2".to_string())
+        );
+
+        let mut state = ServerState::new(30.0);
+        state.entities = entities;
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "SPARE");
+
+        assert!(!apply_one_update(
+            &mut state,
+            "w1",
+            "ship",
+            "pos",
+            json!([9.0, 0.0]),
+            Some(old_epoch),
+        ));
+        assert_eq!(state.entities["ship"].pos, [-1.0, 0.0]);
+
+        assert!(apply_one_update(
+            &mut state,
+            "w2",
+            "ship",
+            "pos",
+            json!([3.0, 0.0]),
+            Some(new_epoch),
+        ));
+        flush_pending_updates(&mut state);
+        assert_eq!(state.entities["ship"].pos, [3.0, 0.0]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rebalance_2d_block_migration_atomic_all_or_nothing() {
+        let mut failed = ServerState::new(30.0);
+        let _ = seed_2d_rebalance_state(&mut failed);
+        rebalance_2d(&mut failed);
+        assert_eq!(failed.pending_block_migrations.len(), 1);
+        let fail_block = failed.pending_block_migrations[0].block.clone();
+        let fail_eids: Vec<String> = failed
+            .entities
+            .iter()
+            .filter(|(_, e)| e.region == fail_block)
+            .map(|(eid, _)| eid.clone())
+            .collect();
+        assert_eq!(fail_eids.len(), 4);
+        failed.wal_fail_inject = true;
+        flush_pending_block_migrations(&mut failed);
+
+        assert!(failed.pending_block_migrations.is_empty());
+        assert_eq!(failed.durable_gen, 0);
+        assert_eq!(
+            failed.region_worker.get(&fail_block).map(|s| s.as_str()),
+            Some("hot")
+        );
+        for eid in &fail_eids {
+            assert_eq!(
+                component_authority_owner(&failed.entities[eid], "pos"),
+                Some("hot".to_string())
+            );
+        }
+        assert!(failed.wal_degraded);
+
+        let dir = std::env::temp_dir().join(format!("gw_rebalance_block_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        let _ = seed_2d_rebalance_state(&mut state);
+
+        rebalance_2d(&mut state);
+
+        assert_eq!(state.pending_block_migrations.len(), 1);
+        assert_eq!(state.durable_gen, 0);
+        let block = state.pending_block_migrations[0].block.clone();
+        let block_eids: Vec<String> = state
+            .entities
+            .iter()
+            .filter(|(_, e)| e.region == block)
+            .map(|(eid, _)| eid.clone())
+            .collect();
+        assert_eq!(block_eids.len(), 4);
+        assert_eq!(
+            state.region_worker.get(&block).map(|s| s.as_str()),
+            Some("hot")
+        );
+        let old_epochs: HashMap<String, u64> = block_eids
+            .iter()
+            .map(|eid| {
+                (
+                    eid.clone(),
+                    component_authority_epoch(&state.entities[eid], "pos"),
+                )
+            })
+            .collect();
+        for eid in &block_eids {
+            assert_eq!(
+                component_authority_owner(&state.entities[eid], "pos"),
+                Some("hot".to_string())
+            );
+        }
+
+        flush_pending_block_migrations(&mut state);
+
+        assert!(state.pending_block_migrations.is_empty());
+        assert_eq!(state.durable_gen, 1);
+        assert_eq!(
+            state.region_worker.get(&block).map(|s| s.as_str()),
+            Some("cold")
+        );
+        assert_eq!(state.workers["cold"].region, block);
+        let new_epochs: HashMap<String, u64> = block_eids
+            .iter()
+            .map(|eid| {
+                let epoch = component_authority_epoch(&state.entities[eid], "pos");
+                assert!(epoch > old_epochs[eid]);
+                assert_eq!(
+                    component_authority_owner(&state.entities[eid], "pos"),
+                    Some("cold".to_string())
+                );
+                assert!(!state.workers["hot"]
+                    .authority_epochs
+                    .contains_key(&authority_key(eid, "pos")));
+                assert!(state.workers["cold"]
+                    .authority_epochs
+                    .contains_key(&authority_key(eid, "pos")));
+                (eid.clone(), epoch)
+            })
+            .collect();
+        drop(state.wal.take());
+
+        let (entities, _deleted, _cfg, _pending, _id_hwm, report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(
+            report.error.is_none(),
+            "recovery must not error: {:?}",
+            report.error
+        );
+        for eid in &block_eids {
+            let recovered = entities.get(eid).unwrap();
+            assert_eq!(recovered.region, block);
+            assert_eq!(component_authority_epoch(recovered, "pos"), new_epochs[eid]);
+            assert_eq!(
+                component_authority_owner(recovered, "pos"),
+                Some("cold".to_string())
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserve_entity_ids_persists_high_watermark_before_response() {
+        let dir = std::env::temp_dir().join(format!("gw_reserve_ids_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        add_test_worker(&mut state, "w1", "W");
+
+        dispatch(
+            &mut state,
+            "w1",
+            &json!({"op":"ReserveEntityIds","request_id":"r1","count":7}),
+        );
+        assert_eq!(state.entity_id_reservations, 7);
+        drop(state.wal.take());
+
+        let (_entities, _deleted, _cfg, _pending, id_hwm, report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(report.error.is_none());
+        assert_eq!(id_hwm, 7);
+
+        let mut failed = ServerState::new(30.0);
+        failed.wal_fail_inject = true;
+        failed.wal_degraded = false;
+        add_test_worker(&mut failed, "w1", "W");
+        dispatch(
+            &mut failed,
+            "w1",
+            &json!({"op":"ReserveEntityIds","request_id":"r1","count":7}),
+        );
+        assert_eq!(failed.entity_id_reservations, 0);
+        assert!(failed.wal_degraded);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_marker_wal_fail_does_not_disable_compaction_or_emit_cut() {
+        let mut state = ServerState::new(30.0);
+        state.wal_fail_inject = true;
+        state.wal_degraded = false;
+        add_test_worker(&mut state, "snap", "OBS");
+        state
+            .workers
+            .get_mut("snap")
+            .unwrap()
+            .attributes
+            .insert("snapshot".to_string());
+
+        dispatch(
+            &mut state,
+            "snap",
+            &json!({"op":"SnapshotMarker","request_id":"s1","snapshot_id":"cut-1"}),
+        );
+
+        assert!(!state.snapshot_seen);
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn component_add_remove_wal_fail_does_not_mutate_ram() {
+        let mut add_state = ServerState::new(30.0);
+        add_state.wal_fail_inject = true;
+        add_state.wal_degraded = false;
+        add_test_worker(&mut add_state, "w1", "W");
+        add_state
+            .entities
+            .insert("crate".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut add_state, "w1", "crate");
+
+        dispatch(
+            &mut add_state,
+            "w1",
+            &json!({"op":"AddComponent","entity":"crate","comp":"loot","value":3}),
+        );
+
+        assert!(!add_state.entities["crate"].components.contains_key("loot"));
+        assert_eq!(add_state.entities["crate"].version, 1);
+        assert!(add_state.wal_degraded);
+
+        let mut remove_state = ServerState::new(30.0);
+        remove_state.wal_fail_inject = true;
+        remove_state.wal_degraded = false;
+        add_test_worker(&mut remove_state, "w1", "W");
+        remove_state
+            .entities
+            .insert("crate".to_string(), test_entity([-1.0, 0.0], "W"));
+        remove_state
+            .entities
+            .get_mut("crate")
+            .unwrap()
+            .components
+            .insert("loot".to_string(), json!(3));
+        ensure_component_authority(remove_state.entities.get_mut("crate").unwrap(), "loot");
+
+        dispatch(
+            &mut remove_state,
+            "w1",
+            &json!({"op":"RemoveComponent","entity":"crate","comp":"loot"}),
+        );
+
+        assert!(remove_state.entities["crate"]
+            .components
+            .contains_key("loot"));
+        assert_eq!(remove_state.entities["crate"].version, 1);
+        assert!(remove_state.wal_degraded);
+    }
+
+    #[test]
+    fn set_component_authority_is_durable_and_revokes_old_cache() {
+        let mut failed = ServerState::new(30.0);
+        failed.wal_fail_inject = true;
+        failed.wal_degraded = false;
+        add_test_worker(&mut failed, "w1", "W");
+        add_test_worker(&mut failed, "w2", "E");
+        add_test_worker(&mut failed, "admin", "OBS");
+        failed
+            .workers
+            .get_mut("admin")
+            .unwrap()
+            .attributes
+            .insert("kernel_admin".to_string());
+        failed
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut failed, "w1", "ship");
+
+        dispatch(
+            &mut failed,
+            "admin",
+            &json!({"op":"SetComponentAuthority","entity":"ship","comp":"pos","owner":"w2"}),
+        );
+
+        assert_eq!(
+            component_authority_owner(&failed.entities["ship"], "pos"),
+            Some("w1".to_string())
+        );
+        assert!(failed.workers["w1"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "pos")));
+        assert!(!failed.workers["w2"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "pos")));
+
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        add_test_worker(&mut state, "admin", "OBS");
+        state
+            .workers
+            .get_mut("admin")
+            .unwrap()
+            .attributes
+            .insert("kernel_admin".to_string());
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        dispatch(
+            &mut state,
+            "admin",
+            &json!({"op":"SetComponentAuthority","entity":"ship","comp":"pos","owner":"w2"}),
+        );
+
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w2".to_string())
+        );
+        assert!(!state.workers["w1"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "pos")));
+        assert!(state.workers["w2"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "pos")));
+    }
+
+    #[test]
+    fn threshold_commit_wal_fail_does_not_move_or_fence() {
+        let mut state = ServerState::new(30.0);
+        state.wal_fail_inject = true;
+        state.wal_degraded = false;
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+        let old_epoch = component_authority_epoch(&state.entities["ship"], "pos");
+
+        dispatch(
+            &mut state,
+            "w1",
+            &json!({"op":"ThresholdTx","entity":"ship","tx_id":"tx1","phase":"commit","from":"W","to":"E"}),
+        );
+
+        assert_eq!(state.entities["ship"].region, "W");
+        assert!(!state.entities["ship"]
+            .components
+            .contains_key("threshold.tx"));
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w1".to_string())
+        );
+        assert_eq!(
+            component_authority_epoch(&state.entities["ship"], "pos"),
+            old_epoch
+        );
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn mesh_ack_wal_fail_keeps_pending_handoff() {
+        let mut failed = ServerState::new(30.0);
+        failed.wal_fail_inject = true;
+        failed.wal_degraded = false;
+        failed.pending_mesh.insert(
+            "ship".to_string(),
+            (
+                json!({"op":"MeshHandoff","entity":"ship"}),
+                Instant::now(),
+                "E".to_string(),
+            ),
+        );
+
+        assert!(!record_mesh_ack(&mut failed, "ship"));
+        assert!(failed.pending_mesh.contains_key("ship"));
+        assert!(failed.wal_degraded);
+
+        let mut state = ServerState::new(30.0);
+        state.pending_mesh.insert(
+            "ship".to_string(),
+            (
+                json!({"op":"MeshHandoff","entity":"ship"}),
+                Instant::now(),
+                "E".to_string(),
+            ),
+        );
+
+        assert!(record_mesh_ack(&mut state, "ship"));
+        assert!(!state.pending_mesh.contains_key("ship"));
+    }
+
+    #[test]
+    fn fold_transfer_recovery_preserves_position() {
+        let dir = std::env::temp_dir().join(format!("gw_fold_recover_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "m1", "MARS");
+        assert!(spawn_in_region(
+            &mut state,
+            "foldy",
+            [-1.0, 2.0],
+            [0.5, 0.0],
+            Map::new(),
+            Some("W"),
+            None,
+            None,
+        ));
+
+        assert!(handoff_with_position(
+            &mut state,
+            "foldy",
+            "W",
+            "MARS",
+            Some([100.0, 200.0])
+        ));
+        assert_eq!(state.entities["foldy"].region, "W");
+        assert_eq!(state.pending_handoffs.len(), 1);
+        flush_pending_handoffs(&mut state);
+        assert_eq!(state.entities["foldy"].region, "MARS");
+        assert_eq!(state.entities["foldy"].pos, [100.0, 200.0]);
+        drop(state.wal.take());
+
+        let (entities, _deleted, _cfg, _pending, _id_hwm, report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(
+            report.error.is_none(),
+            "recovery must not error: {:?}",
+            report.error
+        );
+        let recovered = entities.get("foldy").unwrap();
+        assert_eq!(recovered.region, "MARS");
+        assert_eq!(recovered.pos, [100.0, 200.0]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_preserves_delete_tombstones() {
+        // Regression for the P1: WAL compaction dropped delete tombstones, so compact+restart could
+        // recreate a deleted id. Round-trip through the REAL recovery path: the tombstone must survive.
+        let dir = std::env::temp_dir().join(format!("gw_compact_tomb_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        state.wal_degraded = false;
+        state.snapshot_seen = false; // compaction stays off under coordinated snapshots; this is the disk-fill case
+        state.wal_compact_bytes = 1; // tiny threshold so the compaction gate fires
+        state.wal_bytes = 4096; // > threshold
+        state
+            .entities
+            .insert("alive-1".to_string(), test_entity([1.0, 0.0], "W"));
+        state.deleted_entities.insert("ghost-1".to_string());
+
+        state.maybe_compact_wal();
+        assert!(!state.wal_degraded, "compaction must succeed");
+
+        // Replay the compacted WAL exactly as a restart would.
+        let (entities, deleted, _cfg, _comp, _id_hwm, report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(
+            report.error.is_none(),
+            "recovery must not error: {:?}",
+            report.error
+        );
+        assert!(
+            deleted.contains("ghost-1"),
+            "delete tombstone must survive WAL compaction (else a restart recreates the deleted id)"
+        );
+        assert!(
+            entities.contains_key("alive-1"),
+            "live entity must survive compaction"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[tokio::main]
@@ -5765,12 +8231,14 @@ async fn main() {
     // durability: recover the EXACT pre-crash store from the WAL alone, then continue logging
     if let Ok(path) = std::env::var("GW_WAL") {
         // G2: GW_RESTORE_OFFSET=<bytes> rolls the world back to a snapshot cut (else full recovery)
-        let restore_offset = std::env::var("GW_RESTORE_OFFSET").ok().and_then(|s| s.parse::<u64>().ok());
-        let (store, tombstones, topology, recovered_pending, report) =
+        let restore_offset = std::env::var("GW_RESTORE_OFFSET")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        let (store, tombstones, topology, recovered_pending, recovered_id_hwm, report) =
             recover_from_wal_report(&path, restore_offset);
 
         // #2 RESTORE DRY-RUN: GW_RESTORE_DRYRUN=1 validates a WAL (version / corrupt-tail / content hash /
-        // entity_count) and EXITS WITHOUT serving, so an operator can vet a WAL before booting the broker on it.
+        // entity_count) and EXITS WITHOUT serving, so automation can vet a WAL before booting the broker on it.
         if std::env::var("GW_RESTORE_DRYRUN").is_ok() {
             let dry = json!({
                 "dry_run": true,
@@ -5794,6 +8262,7 @@ async fn main() {
         let n = store.len();
         state.entities = store;
         state.deleted_entities = tombstones;
+        state.entity_id_reservations = recovered_id_hwm;
         // R0.2: restore the partition topology (boundary/splits/mesh) so the router matches recovered placement.
         if let Some(pc) = topology {
             if let Some(b) = pc.get("boundary").and_then(|v| v.as_f64()) {
@@ -5820,7 +8289,10 @@ async fn main() {
                     .collect();
             }
             if let Some(mesh) = pc.get("mesh_regions").and_then(|v| v.as_array()) {
-                state.mesh_regions = mesh.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                state.mesh_regions = mesh
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
             }
             state.zone_topology_rev = pc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
             println!("[rust-broker] R0.2: restored partition_config boundary={} boundaries={:?} splits={} mesh={}",
@@ -5830,14 +8302,22 @@ async fn main() {
         // pending_mesh from the full mesh_out payload so startup/link-ready resends it and the target adopts
         // it exactly once (the receiver adopt is idempotent). Closes the wire-transit snapshot-loss window.
         for (eid, payload) in recovered_pending {
-            let target = payload.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let target = payload
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let handoff = json!({"op":"MeshHandoff","entity":eid.clone(),"target":target.clone(),
                 "pos":payload.get("pos").cloned().unwrap_or(Value::Null),
                 "vel":payload.get("vel").cloned().unwrap_or(Value::Null),
                 "authority_epoch":payload.get("authority_epoch").cloned().unwrap_or(Value::Null),
                 "authority":payload.get("authority").cloned().unwrap_or(Value::Null),
+                "src_region":payload.get("src_region").cloned().unwrap_or(Value::Null),
+                "lease_epoch":payload.get("lease_epoch").cloned().unwrap_or(Value::Null),
                 "components":payload.get("components").cloned().unwrap_or(Value::Null)});
-            state.pending_mesh.insert(eid, (handoff, Instant::now(), target));
+            state
+                .pending_mesh
+                .insert(eid, (handoff, Instant::now(), target));
         }
         if !state.pending_mesh.is_empty() {
             println!("[rust-broker] G2.1d: restored {} in-flight handoff(s) to pending_mesh -> will resend",
@@ -5880,6 +8360,29 @@ async fn main() {
 
     let state = Arc::new(Mutex::new(state));
 
+    // DurableTransition watermark tick: all single/batch component writes append WAL lines without fsync,
+    // then this one barrier advances durable_gen and publishes the group. This is the general law behind
+    // BatchUpdate's old special-case group commit, without per-op disk stalls under game-rate writes.
+    {
+        let st = state.clone();
+        let flush_ms = std::env::var("GW_DURABLE_FLUSH_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(16);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(flush_ms));
+            loop {
+                tick.tick().await;
+                let mut s = st.lock().await;
+                let _t = Instant::now();
+                flush_pending_updates(&mut s);
+                record_lock_hold(&mut s, "durable_flush", _t.elapsed());
+                reap_disconnecting(&mut s);
+            }
+        });
+    }
+
     // liveness monitor (failover) + dynamic load-balancing monitor on the broker's clock
     {
         let st = state.clone();
@@ -5896,21 +8399,31 @@ async fn main() {
                 let lag = elapsed.as_secs_f64() * 1000.0 - nominal.as_secs_f64() * 1000.0;
                 let mut s = st.lock().await;
                 s.tick_lag_ms = if lag > 0.0 { lag } else { 0.0 };
-                let _t = Instant::now(); check_leases(&mut s); record_lock_hold(&mut s, "check_leases", _t.elapsed());
-                let _t = Instant::now(); rebalance(&mut s); record_lock_hold(&mut s, "rebalance", _t.elapsed());
-                let _t = Instant::now(); rebalance_2d(&mut s); record_lock_hold(&mut s, "rebalance_2d", _t.elapsed());
-                let _t = Instant::now(); maybe_split(&mut s); record_lock_hold(&mut s, "maybe_split", _t.elapsed());
-                let _t = Instant::now(); process_rebalance_jobs(&mut s); record_lock_hold(&mut s, "rebalance_jobs", _t.elapsed());
+                let _t = Instant::now();
+                check_leases(&mut s);
+                record_lock_hold(&mut s, "check_leases", _t.elapsed());
+                let _t = Instant::now();
+                rebalance(&mut s);
+                record_lock_hold(&mut s, "rebalance", _t.elapsed());
+                let _t = Instant::now();
+                rebalance_2d(&mut s);
+                record_lock_hold(&mut s, "rebalance_2d", _t.elapsed());
+                let _t = Instant::now();
+                maybe_split(&mut s);
+                record_lock_hold(&mut s, "maybe_split", _t.elapsed());
+                let _t = Instant::now();
+                process_rebalance_jobs(&mut s);
+                record_lock_hold(&mut s, "rebalance_jobs", _t.elapsed());
                 resend_pending_mesh(&mut s); // re-deliver any cross-broker handoff the neighbour hasn't ACK'd
-                push_border_ghosts(&mut s);  // CROSS-BROKER SEAM-INTEREST: project this broker's near-seam entities to the meshed neighbour(s) as read-only ghosts
-                reap_stale_ghosts(&mut s);   // drop ghosts whose source stopped refreshing (left the band / link dropped)
+                push_border_ghosts(&mut s); // CROSS-BROKER SEAM-INTEREST: project this broker's near-seam entities to the meshed neighbour(s) as read-only ghosts
+                reap_stale_ghosts(&mut s); // drop ghosts whose source stopped refreshing (left the band / link dropped)
                 gc_threshold_timeouts(&mut s);
                 update_load_governor(&mut s); // L3: derive load_level from the egress backlog -> degradation keys off it
-                // #3 GRACEFUL-DRAIN progress: while draining, keep handing owned entities to neighbours (a body that
-                // arrived/was-created-pre-drain or whose first hand-off raced a momentarily-down link gets swept up
-                // here). When BOTH entities and pending_mesh are empty, every owned entity has been ACK'd onto a
-                // neighbour (conservation-exact via the mesh path) -> the drain is COMPLETE; exit 0 if drain_exit so a
-                // rolling deploy proceeds. drain_exit=false (a test) leaves it alive to be asserted against.
+                                              // #3 GRACEFUL-DRAIN progress: while draining, keep handing owned entities to neighbours (a body that
+                                              // arrived/was-created-pre-drain or whose first hand-off raced a momentarily-down link gets swept up
+                                              // here). When BOTH entities and pending_mesh are empty, every owned entity has been ACK'd onto a
+                                              // neighbour (conservation-exact via the mesh path) -> the drain is COMPLETE; exit 0 if drain_exit so a
+                                              // rolling deploy proceeds. drain_exit=false (a test) leaves it alive to be asserted against.
                 if s.draining {
                     if !s.entities.is_empty() {
                         let _ = drain_handoff_owned(&mut s);
@@ -5924,7 +8437,9 @@ async fn main() {
                 }
                 // R0.3: bound the WAL on disk. Runs under THIS lock (no concurrent writer -> no torn-write race);
                 // a no-op until wal_bytes exceeds the threshold, so the per-tick cost is one comparison.
-                let _t = Instant::now(); s.maybe_compact_wal(); record_lock_hold(&mut s, "wal_compact", _t.elapsed());
+                let _t = Instant::now();
+                s.maybe_compact_wal();
+                record_lock_hold(&mut s, "wal_compact", _t.elapsed());
             }
         });
     }
@@ -6006,10 +8521,9 @@ async fn main() {
                                 if f.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
                                     if let Some(eid) = f.get("entity").and_then(|v| v.as_str()) {
                                         let mut s = st_ack.lock().await;
-                                        s.pending_mesh.remove(eid);
                                         // B2 recovery: record the confirmed departure so a crash-restart
                                         // does not resurrect an entity that already landed on the neighbour.
-                                        let _ = s.wal_append(&json!({"kind":"mesh_acked","entity":eid}));
+                                        record_mesh_ack(&mut s, eid);
                                     }
                                 }
                             }
@@ -6060,7 +8574,11 @@ async fn main() {
         let my_epoch = if my_region.is_empty() {
             0
         } else {
-            explicit_epoch.unwrap_or_else(|| registry_lease_epoch(&reg_dir, &my_region).map(|e| e + 1).unwrap_or(1))
+            explicit_epoch.unwrap_or_else(|| {
+                registry_lease_epoch(&reg_dir, &my_region)
+                    .map(|e| e + 1)
+                    .unwrap_or(1)
+            })
         };
         if !my_region.is_empty() {
             let mut s = state.lock().await;
@@ -6078,19 +8596,24 @@ async fn main() {
                 }
                 let now = now_millis();
                 if !my_region.is_empty() && !my_addr.is_empty() {
-                    registry_heartbeat(&reg_dir, &my_region, &my_addr, now, my_epoch); // heartbeat self + own epoch
+                    registry_heartbeat(&reg_dir, &my_region, &my_addr, now, my_epoch);
+                    // heartbeat self + own epoch
                 }
                 for (region, entry) in registry_read(&reg_dir) {
                     let hb = entry.get("hb_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                     let entry_epoch = entry.get("lease_epoch").and_then(|v| v.as_u64());
-                    let entry_addr = entry.get("addr").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let entry_addr = entry
+                        .get("addr")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     if region == my_region {
                         // L6 SELF-FENCE: a STRICTLY HIGHER epoch for MY region held by a DIFFERENT addr means a
                         // newer incarnation took over -> I am the stale owner. Mark superseded so mesh_forward
                         // stops emitting ownership traffic for it. (Same addr at a higher epoch = me restarted,
                         // not a supersession.)
                         if let Some(ep) = entry_epoch {
-                            let other_addr = entry_addr.as_deref().map(|a| a != my_addr).unwrap_or(false);
+                            let other_addr =
+                                entry_addr.as_deref().map(|a| a != my_addr).unwrap_or(false);
                             if ep > my_epoch && other_addr {
                                 let mut s = st.lock().await;
                                 if s.superseded_regions.insert(my_region.clone()) {

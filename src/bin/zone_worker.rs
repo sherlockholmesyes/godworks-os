@@ -90,7 +90,10 @@ fn env_u64(k: &str, d: u64) -> u64 {
     env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
 }
 fn env_str(k: &str, d: &str) -> String {
-    env::var(k).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| d.to_string())
+    env::var(k)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| d.to_string())
 }
 // parse "x0,x1,y0,y1" -> [f32;4]
 fn parse_box(s: &str) -> Option<[f32; 4]> {
@@ -150,11 +153,16 @@ async fn main() {
     let radius = env_f32("GW_ZW_RADIUS", 0.5);
     let rest = env_f32("GW_ZW_REST", 0.9);
     let interest = env_f32("GW_ZW_INTEREST", 1.0e6);
-    let duration = env::var("GW_ZW_DURATION").ok().and_then(|s| s.parse::<f64>().ok());
+    let duration = env::var("GW_ZW_DURATION")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok());
     let seed = env_u64("GW_ZW_SEED", 0);
     let world = env::var("GW_ZW_WORLD").ok().and_then(|s| parse_box(&s));
     let cell = env::var("GW_ZW_CELL").ok().and_then(|s| parse_box(&s));
-    let neighbors = env::var("GW_ZW_NEIGHBORS").ok().map(|s| parse_neighbors(&s)).unwrap_or_default();
+    let neighbors = env::var("GW_ZW_NEIGHBORS")
+        .ok()
+        .map(|s| parse_neighbors(&s))
+        .unwrap_or_default();
     // FOLD mode is selected by the PRESENCE of a cell + neighbour geometry (a topology config, like the
     // broker's GW_BOUNDARIES selecting strip mode) — not a behaviour flag. No cell => pure AUTO (blind).
     let fold_mode = cell.is_some() && !neighbors.is_empty();
@@ -163,7 +171,9 @@ async fn main() {
         // distinct per region+pid so independent workers don't spawn identically
         0x9E3779B97F4A7C15u64
             ^ (std::process::id() as u64).wrapping_mul(0x100000001B3)
-            ^ region.bytes().fold(1469598103934665603u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001B3))
+            ^ region.bytes().fold(1469598103934665603u64, |h, b| {
+                (h ^ b as u64).wrapping_mul(0x100000001B3)
+            })
     } else {
         seed
     });
@@ -187,14 +197,18 @@ async fn main() {
         }
     });
 
-    wr.write_all(&frame(&json!({"op":"WorkerConnect","worker_id":wid,"region":region})))
-        .await
-        .ok();
+    wr.write_all(&frame(
+        &json!({"op":"WorkerConnect","worker_id":wid,"region":region}),
+    ))
+    .await
+    .ok();
     // a WIDE interest so we (a) are granted authority over entities we create in our region, and
     // (b) see neighbours' entities approaching the seam -> can adopt them on the authority grant.
-    wr.write_all(&frame(&json!({"op":"Interest","center":[0.0,0.0],"radius":interest})))
-        .await
-        .ok();
+    wr.write_all(&frame(
+        &json!({"op":"Interest","center":[0.0,0.0],"radius":interest}),
+    ))
+    .await
+    .ok();
     eprintln!(
         "[zw {region}] connected id={wid} port={port} hz={hz} mode={} cell={:?} neighbors={:?}",
         if fold_mode { "fold" } else { "auto" },
@@ -264,7 +278,7 @@ async fn main() {
             let ang = rng.range(0.0, std::f32::consts::TAU);
             (ang.cos() * spawn_speed, ang.sin() * spawn_speed)
         };
-        let m0 = rng.range(1.0, 4.0);  // agar.io: spawn cells with small varied mass (size variety -> eat dynamics)
+        let m0 = rng.range(1.0, 4.0); // agar.io: spawn cells with small varied mass (size variety -> eat dynamics)
         view_pos.insert(eid.clone(), [x, y]);
         view_vel.insert(eid.clone(), [vx, vy]);
         view_mass.insert(eid.clone(), m0);
@@ -330,7 +344,12 @@ async fn main() {
         // (3b) FOLD mode: a body that left this worker's cell is Fold()'d to the 4-neighbour region; the
         //      broker performs the authority transfer (mesh_forward -> adopt) server-side.
         let mut folded: Vec<String> = Vec::new();
-        // pass A: positions / folds
+        // pass A: positions / folds. SCALE FIX (#41 F2 frame-storm): collect every owned body's pos into ONE
+        // BatchUpdate (2 frames/tick instead of 2N) -> the broker applies them under ONE dispatch-lock + ONE
+        // fsync, yet each entry still runs apply_one_update (per-entity authority / epoch-fence / WAL preserved).
+        // pos is sent BEFORE vel so a boundary-crossing body's handoff fires on its pos entry and the later vel
+        // entry is fenced by the moved epoch -- the exact ordering invariant the per-body writes had.
+        let mut pos_updates = Vec::with_capacity(bots.len());
         for (eid, bot) in bots.iter() {
             let (px, py, _vx, _vy) = body_state(&bodies, bot.handle);
             if fold_mode {
@@ -340,14 +359,18 @@ async fn main() {
                     })))
                     .await
                     .ok();
-                    eprintln!("[zw {region}] fold e={eid} -> {target} (exit pos=[{px:.2},{py:.2}])");
+                    eprintln!(
+                        "[zw {region}] fold e={eid} -> {target} (exit pos=[{px:.2},{py:.2}])"
+                    );
                     folded.push(eid.clone());
                     continue;
                 }
             }
+            pos_updates.push(json!([eid, [px, py], bot.epoch]));
+        }
+        if !pos_updates.is_empty() {
             wr.write_all(&frame(&json!({
-                "op":"UpdateComponent","entity":eid,"comp":"pos","value":[px,py],
-                "authority_epoch":bot.epoch
+                "op":"BatchUpdate","comp":"pos","updates":pos_updates
             })))
             .await
             .ok();
@@ -355,15 +378,25 @@ async fn main() {
         // a folded body is now the neighbour's; drop it locally (the broker revokes our authority too)
         for eid in &folded {
             if let Some(bot) = bots.remove(eid) {
-                destroy_body(bot.handle, &mut bodies, &mut islands, &mut colliders, &mut ijoints, &mut mjoints);
+                destroy_body(
+                    bot.handle,
+                    &mut bodies,
+                    &mut islands,
+                    &mut colliders,
+                    &mut ijoints,
+                    &mut mjoints,
+                );
             }
         }
-        // pass B: velocities (so the carried momentum is current for whoever adopts next)
+        // pass B: velocities (so the carried momentum is current for whoever adopts next) -- ONE BatchUpdate too.
+        let mut vel_updates = Vec::with_capacity(bots.len());
         for (eid, bot) in bots.iter() {
             let (_px, _py, vx, vy) = body_state(&bodies, bot.handle);
+            vel_updates.push(json!([eid, [vx, vy], bot.epoch]));
+        }
+        if !vel_updates.is_empty() {
             wr.write_all(&frame(&json!({
-                "op":"UpdateComponent","entity":eid,"comp":"vel","value":[vx,vy],
-                "authority_epoch":bot.epoch
+                "op":"BatchUpdate","comp":"vel","updates":vel_updates
             })))
             .await
             .ok();
@@ -371,7 +404,9 @@ async fn main() {
 
         // (4) heartbeat ~4x/s (renew the region lease)
         if tick % ((hz as u64 / 4).max(1)) == 0 {
-            wr.write_all(&frame(&json!({"op":"Heartbeat","worker_id":wid}))).await.ok();
+            wr.write_all(&frame(&json!({"op":"Heartbeat","worker_id":wid})))
+                .await
+                .ok();
         }
 
         tick += 1;
@@ -395,7 +430,10 @@ async fn main() {
     }
 
     wr.write_all(&frame(&json!({"op":"Disconnect"}))).await.ok();
-    eprintln!("[zw {region}] done tick={tick} owned={} rejects={rejects}", bots.len());
+    eprintln!(
+        "[zw {region}] done tick={tick} owned={} rejects={rejects}",
+        bots.len()
+    );
 }
 
 fn body_state(bodies: &RigidBodySet, h: RigidBodyHandle) -> (f32, f32, f32, f32) {
@@ -470,7 +508,11 @@ fn apply_op(
     let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
     match op {
         "AddEntity" => {
-            let eid = f.get("entity").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let eid = f
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if eid.is_empty() {
                 return;
             }
@@ -505,13 +547,20 @@ fn apply_op(
             }
         }
         "AuthorityChange" => {
-            let eid = f.get("entity").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let eid = f
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let comp = f.get("comp").and_then(|v| v.as_str()).unwrap_or("");
             // only the physics-island root component drives the body lifecycle (pos). vel rides with it.
             if comp != "pos" && !comp.is_empty() {
                 return;
             }
-            let epoch = f.get("authority_epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+            let epoch = f
+                .get("authority_epoch")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             // C2 pre-handoff intent: NOT a real authority change — log + ignore for the body lifecycle
             if f.get("state").and_then(|v| v.as_str()) == Some("AUTHORITY_LOSS_IMMINENT") {
                 let tgt = f
@@ -521,7 +570,10 @@ fn apply_op(
                 eprintln!("[zw {region}] LOSS-IMMINENT e={eid} target={tgt}");
                 return;
             }
-            let authoritative = f.get("authoritative").and_then(|v| v.as_bool()).unwrap_or(false);
+            let authoritative = f
+                .get("authoritative")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if authoritative {
                 // ADOPT: create a rapier body from the carried pos+vel (exactly-one-zone simulates it now)
                 if let Some(bot) = bots.get_mut(&eid) {
@@ -537,7 +589,10 @@ fn apply_op(
                         .build();
                     let h = bodies.insert(rb);
                     colliders.insert_with_parent(
-                        ColliderBuilder::ball(radius).restitution(rest).density(1.0).build(),
+                        ColliderBuilder::ball(radius)
+                            .restitution(rest)
+                            .density(1.0)
+                            .build(),
                         h,
                         bodies,
                     );
