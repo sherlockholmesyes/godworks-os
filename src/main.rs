@@ -6561,6 +6561,95 @@ fn qbi_entity_id(q: &Value) -> &str {
         .unwrap_or("")
 }
 
+fn qbi_field_segments(v: &Value) -> Vec<String> {
+    match v {
+        Value::String(s) => s
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .filter(|part| !part.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn qbi_value_path(q: &Value) -> Vec<String> {
+    if let Some(path) = q.get("path") {
+        let parts = qbi_field_segments(path);
+        if !parts.is_empty() {
+            return parts;
+        }
+    }
+    let mut parts = Vec::new();
+    if let Some(component) = q
+        .get("comp")
+        .or_else(|| q.get("component"))
+        .or_else(|| q.get("name"))
+        .and_then(Value::as_str)
+    {
+        if !component.is_empty() {
+            parts.push(component.to_string());
+        }
+    }
+    if let Some(field) = q.get("field").or_else(|| q.get("fields")) {
+        parts.extend(qbi_field_segments(field));
+    }
+    parts
+}
+
+fn value_at_path<'a>(components: &'a Map<String, Value>, path: &[String]) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let mut current = components.get(first)?;
+    for segment in rest {
+        match current {
+            Value::Object(map) => {
+                current = map.get(segment)?;
+            }
+            Value::Array(items) => {
+                let idx = segment.parse::<usize>().ok()?;
+                current = items.get(idx)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn qbi_number_cmp(actual: &Value, expected: &Value, op: &str) -> bool {
+    let Some(a) = actual.as_f64() else {
+        return false;
+    };
+    let Some(b) = expected.as_f64() else {
+        return false;
+    };
+    match op {
+        "gt" => a > b,
+        "gte" => a >= b,
+        "lt" => a < b,
+        "lte" => a <= b,
+        _ => false,
+    }
+}
+
+fn qbi_value_matches(actual: &Value, q: &Value) -> bool {
+    if let Some(expected) = q.get("eq").or_else(|| q.get("equals")) {
+        return actual == expected;
+    }
+    if let Some(expected) = q.get("ne").or_else(|| q.get("not_equals")) {
+        return actual != expected;
+    }
+    for op in ["gt", "gte", "lt", "lte"] {
+        if let Some(expected) = q.get(op) {
+            return qbi_number_cmp(actual, expected, op);
+        }
+    }
+    false
+}
+
 fn matches_query_parts(
     eid: &str,
     pos: [f64; 2],
@@ -6599,6 +6688,12 @@ fn matches_query_parts(
         "component" => {
             let comp = qbi_component_name(q);
             components.contains_key(comp) || comp == "pos" || comp == "vel"
+        }
+        "value" | "field" | "component_value" => {
+            let path = qbi_value_path(q);
+            value_at_path(components, &path)
+                .map(|actual| qbi_value_matches(actual, q))
+                .unwrap_or(false)
         }
         "region" => q.get("region").and_then(|v| v.as_str()) == Some(region),
         _ => false,

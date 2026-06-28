@@ -122,7 +122,7 @@ cargo test dense_seam_with_matching_e_worker_conserves_authority -- --nocapture
 - the E-side owner writes a full `physics` payload (`pos`, `rot`, `lin`, `ang`, `at_rest`, `gen`, `t_server`, `sim_time`) and a public `EntityQuery` sees the post-handoff value with monotonic clocks.
 - the public `EntityQuery` also returns an `asset_manifest` for visible crossed bodies, with shared dependencies deduped and non-visible dependencies excluded.
 - the public `EntityQuery` also returns a `schema_manifest` for visible crossed components, including the `physics` field shape.
-- a nested query constraint AST selects the crossed bodies and excludes an in-radius decoy.
+- a nested query constraint AST selects the crossed bodies by component payload value and excludes an in-radius decoy with the same broad components.
 
 The parseable result line exposes this as `handoff_probe_ok=<N>`, `handoff_probe_rejected=<N>`, `physics_payload_ok=<N>`, `physics_clock_ok=<N>`, `asset_manifest_ok=<N>`, `schema_manifest_ok=<N>`, and `qbi_ast_ok=<N>`.
 

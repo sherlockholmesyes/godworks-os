@@ -812,8 +812,9 @@ fn entity_query_supports_qbi_boolean_constraint_ast() {
         json!({
             "pos": [2.0, 1.0],
             "vel": [0.0, 0.0],
-            "ore_resource": {"tier": 5},
-            "asset": {"id": "ore/metal", "kind": "ore"}
+            "ore_resource": {"tier": 5, "grade": "rich"},
+            "asset": {"id": "ore/metal", "kind": "ore"},
+            "stats": {"yields": [100, 25]}
         }),
     );
     create_entity_with_components(
@@ -833,7 +834,21 @@ fn entity_query_supports_qbi_boolean_constraint_ast() {
         json!({
             "pos": [50.0, 0.0],
             "vel": [0.0, 0.0],
-            "ore_resource": {"tier": 5}
+            "ore_resource": {"tier": 5, "grade": "rich"},
+            "asset": {"id": "ore/far", "kind": "ore"},
+            "stats": {"yields": [100, 25]}
+        }),
+    );
+    create_entity_with_components(
+        &mut owner,
+        "poor-ore",
+        "EARTH",
+        json!({
+            "pos": [2.5, 1.0],
+            "vel": [0.0, 0.0],
+            "ore_resource": {"tier": 3, "grade": "poor"},
+            "asset": {"id": "ore/poor", "kind": "ore"},
+            "stats": {"yields": [40, 10]}
         }),
     );
 
@@ -851,6 +866,9 @@ fn entity_query_supports_qbi_boolean_constraint_ast() {
                         {"type": "entity", "entity": "target-ore"}
                     ]
                 },
+                {"type": "value", "path": ["asset", "kind"], "eq": "ore"},
+                {"type": "value", "component": "ore_resource", "field": "tier", "gte": 5},
+                {"type": "field", "path": "stats.yields.0", "gte": 100},
                 {"type": "not", "constraint": {"type": "component", "comp": "hidden_logic"}},
                 {"type": "region", "region": "EARTH"}
             ]

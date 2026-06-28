@@ -319,6 +319,8 @@ fn qbi_ast_query() -> Value {
                     {"type":"component","comp":"asset"}
                 ]
             },
+            {"type":"value","path":["physics","writer"],"eq":"E"},
+            {"type":"value","path":["physics","at_rest"],"eq":false},
             {"type":"not","constraint":{"type":"component","comp":"control_decoy"}}
         ]
     })
@@ -791,7 +793,18 @@ async fn main() {
             "components":{
                 "pos":[3.0,0.0],
                 "vel":[0.0,0.0],
-                "control_decoy":true
+                "physics":{
+                    "pos":[3.0,0.0,0.0],
+                    "rot":[0.0,0.0,0.0,1.0],
+                    "lin":[0.0,0.0,0.0],
+                    "ang":[0.0,0.0,0.0],
+                    "at_rest":false,
+                    "gen":1,
+                    "t_server":1,
+                    "sim_time":1,
+                    "writer":"DECOY"
+                },
+                "handoff_probe":{"writer":"E","seq":9999}
             }
         }),
     )

@@ -15,7 +15,7 @@ In cross-broker mode, the harness now verifies the writer swap after a seam hand
 7. A public `EntityQuery` sees that payload and verifies broker-normalized monotonic clocks after handoff.
 8. The same public `EntityQuery` returns an `asset_manifest` for every visible crossed body, including deduped shared dependencies.
 9. The same public `EntityQuery` returns a `schema_manifest` for visible components, including the `physics` field shape.
-10. A nested `and` / `or` / `not` `EntityQuery` constraint AST selects the crossed bodies and excludes an in-radius decoy.
+10. A nested `and` / `or` / `not` `EntityQuery` constraint AST selects the crossed bodies by component payload value and excludes an in-radius decoy with the same broad components.
 
 The final line exposes the gate as:
 
@@ -43,7 +43,7 @@ The receiver must also carry the component bag across the seam and accept a post
 
 `EntityQueryResponse` also derives `schema_manifest` from the same visible rows. It exposes `abi_version`, component names, observed authority modes, JSON shape hints, and `entity_components`. It is an ABI discovery surface, not a separate schema registry.
 
-`EntityQuery` supports a boolean constraint AST over the same row source: `and`, `or`, `not`, `sphere`, `box`, `component`, `region`, and `entity`. The runtime gate includes an in-radius decoy so a broad query or ignored boolean node cannot pass.
+`EntityQuery` supports a constraint AST over the same row source: `and`, `or`, `not`, `sphere`, `box`, `component`, `region`, `entity`, and component value predicates. The runtime gate includes an in-radius decoy with `physics` and `handoff_probe`, but with `physics.writer != "E"`, so a broad query or component-only query cannot pass.
 
 ## Run
 
