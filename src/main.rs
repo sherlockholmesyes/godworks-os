@@ -114,6 +114,7 @@ fn parse_boundaries() -> Vec<f64> {
     let b = std::env::var("GW_BOUNDARY")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
+        .filter(|f| f.is_finite())
         .unwrap_or(BOUNDARY);
     vec![b]
 }
@@ -136,7 +137,15 @@ fn parse_grid2d() -> Option<(usize, usize, f64, f64)> {
     let mut it = arena.split(',').filter_map(|s| s.trim().parse::<f64>().ok());
     let aw = it.next().unwrap_or(5000.0);
     let ah = it.next().unwrap_or(aw);
-    Some((cols, rows, aw / cols as f64, ah / rows as f64))
+    if !aw.is_finite() || !ah.is_finite() || aw <= 0.0 || ah <= 0.0 {
+        return None;
+    }
+    let cw = aw / cols as f64;
+    let ch = ah / rows as f64;
+    if !cw.is_finite() || !ch.is_finite() || cw <= 0.0 || ch <= 0.0 {
+        return None;
+    }
+    Some((cols, rows, cw, ch))
 }
 
 // The 2D cell name "Z<col>_<row>" for a position.
@@ -247,11 +256,16 @@ fn coarse_region(region: &str) -> &str {
 // by the broker's boundary list; without it (a worker that never set GW_BOUNDAR*) only W|E count, so a plain
 // "Z3" on a single-zone broker is treated as a named region (unchanged behaviour).
 fn is_strip_region_name(region: &str, bounds: &[f64]) -> bool {
-    strip_index_of_name(region, bounds).is_some() && matches!(coarse_region(region), "W" | "E")
-        || coarse_region(region)
-            .strip_prefix('Z')
-            .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && bounds.len() >= 2)
-            .unwrap_or(false)
+    let coarse = coarse_region(region);
+    if bounds.len() <= 1 {
+        return strip_index_of_name(coarse, bounds).is_some();
+    }
+    coarse
+        .strip_prefix('Z')
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .and_then(|n| n.parse::<usize>().ok())
+        .map(|i| i <= bounds.len())
+        .unwrap_or(false)
 }
 
 fn movement_region_after(
@@ -1652,6 +1666,26 @@ impl ServerState {
             }
             bytes += buf.len() as u64;
         }
+        // Preserve permanent delete tombstones across compaction. The broker rejects a CreateEntity for any
+        // tombstoned id; dropping these records during compaction would let a restart recreate a deleted id.
+        let mut tombstones: Vec<String> = self.deleted_entities.iter().cloned().collect();
+        tombstones.sort();
+        for eid in tombstones {
+            let ev = json!({
+                "kind": "delete_tombstone",
+                "entity": eid,
+                "version": 0,
+                "writer": "wal_compaction",
+            });
+            buf.clear();
+            buf.push_str(&wal_v1_envelope_line(&ev));
+            buf.push('\n');
+            if out.write_all(buf.as_bytes()).is_err() {
+                self.wal_degraded = true;
+                return;
+            }
+            bytes += buf.len() as u64;
+        }
         // latest partition_config so the router restores the SAME placement function (do NOT bump the rev --
         // this is a faithful re-encoding of the current topology, not a new topology change).
         let splits: Map<String, Value> =
@@ -2676,9 +2710,9 @@ fn spawn_in_region(
     requested_region: Option<&str>,
     authority_epoch: Option<u64>,
     authority_snapshot: Option<Value>,
-) {
+) -> bool {
     if state.deleted_entities.contains(eid) {
-        return;
+        return false;
     }
     let region = match state.grid2d {
         // D1: 2D-grid mode derives the cell from (x,y); single-broker so requested_region is moot here
@@ -2718,7 +2752,7 @@ fn spawn_in_region(
         .is_err()
     {
         state.entities.remove(eid); // not persisted -> not live; never announce it
-        return;
+        return false;
     }
     let wids: Vec<String> = state.workers.keys().cloned().collect();
     for wid in wids {
@@ -2732,6 +2766,7 @@ fn spawn_in_region(
             grant_region_physics_island_authority(state, &wid, eid);
         }
     }
+    true
 }
 
 // CROSS-BROKER MESH: hand an entity across the PROCESS seam to the neighbour broker owning `target`.
@@ -2802,37 +2837,49 @@ fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
         "src_region":src_region,
         "lease_epoch":src_lease_epoch,
         "components":Value::Object(comps)});
-    let delivered = match state.mesh.get(target) {
-        Some(tx) => tx.send(frame(&handoff)).is_ok(),
-        None => false,
+    let tx = match state.mesh.get(target).cloned() {
+        Some(tx) => tx,
+        None => {
+            // the link is down RIGHT NOW -- keep the entity LOCAL (do not park+remove into a dead seam). A
+            // stalled body at the boundary beats a vanished one; the next move re-handoffs when the link returns.
+            eprintln!("[mesh] link to {target} down -- keeping {eid} local (not vanishing it into a dead seam)");
+            return;
+        }
     };
-    if !delivered {
-        // the link is down RIGHT NOW -- keep the entity LOCAL (do not park+remove into a dead seam). A
-        // stalled body at the boundary beats a vanished one; the next move re-handoffs when the link returns.
-        eprintln!("[mesh] link to {target} down -- keeping {eid} local (not vanishing it into a dead seam)");
+    let mesh_out = json!({"kind":"mesh_out","entity":eid,"target":target,
+        "authority_epoch":authority_epoch,"authority":authority,
+        "src_region":src_region,
+        "lease_epoch":src_lease_epoch,
+        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
+        "components":handoff.get("components").cloned().unwrap_or(Value::Null)});
+    // WAL the cross-seam departure BEFORE a neighbour can observe/adopt the handoff. The WAL record is the
+    // source-side linearization point: crash before it -> source keeps the entity; crash after it -> recovery
+    // rebuilds pending_mesh and resends. Sending first creates a split-brain window (receiver adopted, source
+    // crashed before mesh_out and resurrects the old copy).
+    if state.wal_append(&mesh_out).is_err() {
+        eprintln!("[mesh] WAL failed before forwarding {eid} -> {target}; keeping entity local and failing closed");
         return;
     }
-    // WAL the cross-seam departure after a live link accepted the handoff frame. Recovery treats this as
-    // the source-side linearization point: source must not resurrect the entity if it crashes before MeshAck.
-    // G2.1d: mesh_out_full -- carry the COMPLETE handoff payload (incl. components) so a restore that cuts
-    // through an in-flight handoff can recreate pending_mesh from the WAL and resend it (the resolver).
-    let _ = state.wal_append(&json!({"kind":"mesh_out","entity":eid,"target":target,
-        "authority_epoch":authority_epoch,"authority":authority,
-        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
-        "components":handoff.get("components").cloned().unwrap_or(Value::Null)}));
+    // Park it pending the neighbour's MeshAck BEFORE attempting the send; if this process crashes after the WAL
+    // but before/while sending, recovery reconstructs the same pending handoff from mesh_out.
+    state.pending_mesh.insert(
+        eid.to_string(),
+        (handoff.clone(), Instant::now(), target.to_string()),
+    );
+    state.entities.remove(eid);
+    let delivered = tx.send(frame(&handoff)).is_ok();
+    if !delivered {
+        // the link is down RIGHT NOW -- keep the entity LOCAL (do not park+remove into a dead seam). A
+        // WAL already linearized the departure, so do NOT resurrect locally; pending_mesh will resend once
+        // the mesh task reconnects.
+        eprintln!("[mesh] link to {target} dropped after WAL -- parked {eid} pending resend");
+    }
     // CROSS-BROKER handoff counted HERE -- the delivered-departure linearization point (a live link accepted
     // the frame + the mesh_out is WAL'd). The mirror of `handoffs += 1` in the LOCAL handoff() path, but a
     // DISTINCT metric so the Inspector sees same-broker vs cross-server handoffs separately. Counted on the
     // SENDING broker (the one initiating the authority transfer across the seam); a dropped/re-sent frame goes
     // through resend_pending_mesh (a different path), so this fires exactly once per logical cross-broker move.
     state.metrics.mesh_handoffs += 1;
-    // park it pending the neighbour's MeshAck, THEN remove from the local set -- the entity is never in
-    // NEITHER place (the old path removed it before any confirmation, so a dropped handoff vanished it).
-    state.pending_mesh.insert(
-        eid.to_string(),
-        (handoff, Instant::now(), target.to_string()),
-    );
-    state.entities.remove(eid);
     let wids: Vec<String> = state.workers.keys().cloned().collect();
     for wid in wids {
         if state.workers[&wid].view.contains(eid) {
@@ -4400,7 +4447,25 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             let created = !state.entities.contains_key(&eid);
             if created {
                 let requested_region = f.get("region").and_then(|v| v.as_str());
-                spawn_in_region(state, &eid, pos2, vel2, comps, requested_region, None, None);
+                if !spawn_in_region(state, &eid, pos2, vel2, comps, requested_region, None, None) {
+                    if let Some(req) = f.get("request_id") {
+                        emit(
+                            state,
+                            wid,
+                            json!({"op":"CreateEntityResponse","request_id":req,
+                            "entity":eid,"success":false,
+                            "reason":"wal_persist_failed: create not durably persisted"}),
+                        );
+                    } else {
+                        emit(
+                            state,
+                            wid,
+                            json!({"op":"UpdateRejected","entity":eid,"comp":"create",
+                            "reason":"wal_persist_failed: create not durably persisted"}),
+                        );
+                    }
+                    return;
+                }
             }
             if let Some(req) = f.get("request_id") {
                 emit(
@@ -5323,7 +5388,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 // position-derive against our local W|E boundary, which mislabeled a Fold-into-ZB as "W").
                 let target = f.get("target").and_then(|v| v.as_str());
                 let adopt_region = receiving_region_for_adopt(state, pos, target);
-                spawn_in_region(
+                if !spawn_in_region(
                     state,
                     &eid,
                     pos,
@@ -5332,7 +5397,9 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     Some(adopt_region.as_str()),  // FIX: pass the receiving zone so the WORKER grant-loop inside
                     authority_epoch,      // spawn_in_region uses the correct region (Z_i_j), not a pos-derived
                     authority_snapshot,   // W/E. Without this the cross-broker-adopted bot was orphaned
-                );                        // (broker owned it, no worker simulated it) -> frozen at the seam.
+                ) {                       // (broker owned it, no worker simulated it) -> frozen at the seam.
+                    return;
+                }
                 // OVERRIDE the region spawn_in_region derived from position with the receiving zone's region
                 // (spawn_region re-derives W|E from x for the LOCAL create/split path; an inbound mesh adopt
                 // is the one case where the region is dictated by WHICH broker owns the entity now, not by x).
@@ -5744,6 +5811,144 @@ fn spawn_mesh_link_dynamic(st: Arc<Mutex<ServerState>>, region: String, reg_dir:
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap()
+    }
+
+    fn test_entity(pos: [f64; 2], region: &str) -> Entity {
+        let components = Map::new();
+        Entity {
+            pos,
+            vel: [1.0, 0.0],
+            authority: initial_authority_map(&components, 1),
+            components,
+            region: region.to_string(),
+            version: 1,
+            last_broadcast_cell: Some(interest_cell_of(pos)),
+        }
+    }
+
+    #[test]
+    fn grid2d_rejects_non_positive_or_nan_arena() {
+        let _guard = env_guard();
+        std::env::set_var("GW_GRID2D", "2x2");
+
+        std::env::set_var("GW_ARENA", "0,100");
+        assert!(parse_grid2d().is_none());
+
+        std::env::set_var("GW_ARENA", "NaN,100");
+        assert!(parse_grid2d().is_none());
+
+        std::env::set_var("GW_ARENA", "200,100");
+        assert_eq!(parse_grid2d(), Some((2, 2, 100.0, 50.0)));
+
+        std::env::remove_var("GW_ARENA");
+        std::env::remove_var("GW_GRID2D");
+    }
+
+    #[test]
+    fn n_zone_strip_names_do_not_accept_legacy_we_labels() {
+        assert!(is_strip_region_name("W", &[0.0]));
+        assert!(is_strip_region_name("E", &[0.0]));
+        assert!(!is_strip_region_name("W", &[0.0, 10.0]));
+        assert!(!is_strip_region_name("E", &[0.0, 10.0]));
+        assert!(is_strip_region_name("Z2", &[0.0, 10.0]));
+        assert!(!is_strip_region_name("Z2_0", &[0.0, 10.0]));
+    }
+
+    #[test]
+    fn spawn_in_region_reports_failure_when_wal_fails() {
+        let mut state = ServerState::new(30.0);
+        state.wal_fail_inject = true;
+        state.wal_degraded = false;
+
+        let ok = spawn_in_region(
+            &mut state,
+            "e-spawn",
+            [1.0, 2.0],
+            [0.0, 0.0],
+            Map::new(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(!ok);
+        assert!(!state.entities.contains_key("e-spawn"));
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn mesh_forward_does_not_send_or_remove_when_mesh_out_wal_fails() {
+        let mut state = ServerState::new(30.0);
+        state.wal_fail_inject = true;
+        state.wal_degraded = false;
+        state.my_region = "W".to_string();
+        state.region_lease_epoch.insert("W".to_string(), 7);
+        state.entities.insert("ship".to_string(), test_entity([1.0, 0.0], "W"));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.mesh.insert("E".to_string(), tx);
+
+        mesh_forward(&mut state, "ship", "E");
+
+        assert!(state.entities.contains_key("ship"));
+        assert!(state.pending_mesh.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn compaction_preserves_delete_tombstones() {
+        // Regression for the P1: WAL compaction dropped delete tombstones, so compact+restart could
+        // recreate a deleted id. Round-trip through the REAL recovery path: the tombstone must survive.
+        let dir = std::env::temp_dir().join(format!("gw_compact_tomb_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        state.wal_degraded = false;
+        state.snapshot_seen = false; // compaction stays off under coordinated snapshots; this is the disk-fill case
+        state.wal_compact_bytes = 1; // tiny threshold so the compaction gate fires
+        state.wal_bytes = 4096; // > threshold
+        state
+            .entities
+            .insert("alive-1".to_string(), test_entity([1.0, 0.0], "W"));
+        state.deleted_entities.insert("ghost-1".to_string());
+
+        state.maybe_compact_wal();
+        assert!(!state.wal_degraded, "compaction must succeed");
+
+        // Replay the compacted WAL exactly as a restart would.
+        let (entities, deleted, _cfg, _comp, report) = recover_from_wal_report(&wal_path, None);
+        assert!(report.error.is_none(), "recovery must not error: {:?}", report.error);
+        assert!(
+            deleted.contains("ghost-1"),
+            "delete tombstone must survive WAL compaction (else a restart recreates the deleted id)"
+        );
+        assert!(
+            entities.contains_key("alive-1"),
+            "live entity must survive compaction"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let port: u16 = std::env::var("GW_PORT")
@@ -5836,6 +6041,8 @@ async fn main() {
                 "vel":payload.get("vel").cloned().unwrap_or(Value::Null),
                 "authority_epoch":payload.get("authority_epoch").cloned().unwrap_or(Value::Null),
                 "authority":payload.get("authority").cloned().unwrap_or(Value::Null),
+                "src_region":payload.get("src_region").cloned().unwrap_or(Value::Null),
+                "lease_epoch":payload.get("lease_epoch").cloned().unwrap_or(Value::Null),
                 "components":payload.get("components").cloned().unwrap_or(Value::Null)});
             state.pending_mesh.insert(eid, (handoff, Instant::now(), target));
         }
