@@ -1,0 +1,6 @@
+/target
+*.wal
+*.wal.jsonl
+live_logs/
+*.log
+*.err

@@ -1,0 +1,30 @@
+[package]
+name = "godworks_broker"
+version = "0.1.0"
+edition = "2021"
+
+# Godworks OS data-plane in Rust: the authoritative store + op-broker + zone handoff,
+# a drop-in conformance-equivalent of the reference server (same length-prefixed-JSON
+# wire in phase 1, so the Godot bridge is untouched). No GC, real threads, native ARM.
+# the reference is the conformance oracle, not the runtime.
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+# preserve_order: match insertion order so the op-stream is byte-identical
+serde_json = { version = "1", features = ["preserve_order"] }
+# rapier2d (Apache-2.0): REAL 2-D collision/contact physics inside the zone_worker bin ONLY. The broker
+# bin (main.rs) does not reference rapier, so cargo does not link it into godworks_broker (no bloat).
+# 2-D matches the broker's store (Entity.pos = [f64;2], xz-plane); f32 solver.
+rapier2d = "0.22"
+
+[[bin]]
+name = "godworks_broker"
+path = "src/main.rs"
+
+[[bin]]
+name = "zone_worker"
+path = "src/bin/zone_worker.rs"
+
+[profile.release]
+opt-level = 3
+lto = true

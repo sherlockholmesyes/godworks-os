@@ -1,0 +1,6150 @@
+//! Godworks OS data-plane (Rust) — the authoritative store + op-broker + zone handoff
+//! + WAL durability + lease/heartbeat failover. A drop-in, FULL-PARITY equivalent of
+//! the reference server (same ~17-op contract, same length-prefixed-JSON wire in
+//! phase 1, so the Godot bridge and reference wire-tests run against it UNCHANGED).
+//!
+//! design-parity vs the reference (no function lost, none downgraded):
+//!   hot path     : WorkerConnect, Interest/QBI, CreateEntity, DeleteEntity,
+//!                  UpdateComponent (single-writer belt -> apply -> hysteresis handoff
+//!                  -> propagate), UpdateRejected, AddEntity/RemoveEntity/ComponentUpdate/
+//!                  AuthorityChange/CriticalSection.
+//!   durability   : append-only WAL (JSONL, fsync via sync_data) with register/write/
+//!                  transfer events; recover() rebuilds the EXACT store from the log alone
+//!                  (the durable-recovery fix) — GW_WAL=<path> enables it; restart recovers.
+//!   liveness     : per-region lease + Heartbeat/write renew + a monitor that fails a
+//!                  lapsed region over to a STANDBY (reclaim-to-standby), orphaned_regions
+//!                  as the honest no-spare dead-end; metrics{handoffs,applies,failovers}.
+//! the reference is the conformance oracle; this is the runtime (no GC, real threads, ARM).
+
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use std::sync::atomic::AtomicBool;
+
+use serde_json::{json, Map, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc::{self, Sender, UnboundedSender};
+use tokio::sync::Mutex;
+
+const BOUNDARY: f64 = 0.0;
+const H: f64 = 0.5;
+const INTEREST_MARGIN: f64 = 1.0;
+// G4 backpressure: over this per-worker egress backlog, DEGRADABLE ops (ComponentUpdate / InspectorFrame)
+// are dropped to bound a slow consumer's memory; CRITICAL ops (AuthorityChange / Add+RemoveEntity /
+// CommandResponse / WAL-visible) always send -- but only INTO the bounded channel below.
+const EGRESS_SOFT_CAP: u64 = 4096;
+// T1 HARD CAP (the structural egress bound). The per-consumer egress is a BOUNDED tokio channel of this
+// capacity -- a slow/malicious consumer that stops draining can hold AT MOST this many unsent frames, then
+// the bound is hit and the consumer is force-DISCONNECTED (it reconnects + re-checks-out via checkout_all,
+// so NO state is silently lost). The cap is a PROPERTY OF THE CHANNEL TYPE (mpsc::channel(CHANNEL_CAP) cannot
+// physically buffer more), not a flag anyone can forget to enable -- remove it and it no longer compiles as
+// bounded. It sits ABOVE EGRESS_SOFT_CAP so the order is: healthy -> degradable-shed at the soft cap ->
+// (only a genuinely stuck consumer that won't drain even critical-only traffic reaches) hard cap -> kick.
+// This is the hard RAM ceiling the G4 comment promised + the convergent Interest/Security T1 finding's fix.
+// VALUE = 4x EGRESS_SOFT_CAP (16384). Rationale: the degradable soft-drop already sheds at 4096, so a consumer
+// holding 4x that many UNSENT frames -- and still not draining even critical-only traffic -- is unambiguously
+// stuck (no legitimate healthy consumer backs up 16k critical frames). At ~150 B/frame that is a ~2.5 MB hard
+// ceiling PER consumer: tight, principled, not a test-tuned knob. Above it, the critical-send-failure kicks it.
+const CHANNEL_CAP: usize = EGRESS_SOFT_CAP as usize * 4;
+const PROTOCOL_VERSION: u64 = 1; // L4: this broker's wire-format version
+const MIN_PROTO: u64 = 1; // L4: oldest peer wire-version still understood
+
+// ── DYNAMIC SPLITTING (load-based capacity-add, not just the W|E boundary-shift) ──
+// A coarse region under sustained high load SPLITS into sub-bands, each owned by a fresh
+// standby worker -- this ADDS capacity (rebalance() only shifts the W|E line between two
+// fixed workers). `splits[region]` = sorted sub-boundaries within that region's x-range;
+// sub-band 0 keeps the region's own name (its original worker), bands 1.. are "<region>#i"
+// (new workers). Absent/empty => no split => the coarse region is returned unchanged, so
+// the existing W/E + mesh paths are untouched until a split actually happens.
+fn refine_region(
+    coarse: &str,
+    x: f64,
+    splits: &std::collections::HashMap<String, Vec<f64>>,
+) -> String {
+    match splits.get(coarse) {
+        Some(subs) if !subs.is_empty() => {
+            for (i, b) in subs.iter().enumerate() {
+                if x < *b {
+                    return if i == 0 {
+                        coarse.to_string()
+                    } else {
+                        format!("{coarse}#{i}")
+                    };
+                }
+            }
+            format!("{coarse}#{}", subs.len())
+        }
+        _ => coarse.to_string(),
+    }
+}
+
+// ── N-ZONE 1D-STRIP PARTITION (the generalization of the W|E split) ──────────────────────────────
+// The partition model is a 1D STRIP of N zones along x, cut by a SORTED list of boundaries:
+//   `bounds = []`        -> ONE zone "E" (the all-positive default; the original const-BOUNDARY=0 behaviour)
+//   `bounds = [b0]`      -> TWO zones W (x<b0) | E (x>=b0)  -- BYTE-FOR-BYTE the proven 2-zone path
+//   `bounds = [b0,b1,..]`-> N zones  Z0 (x<b0) | Z1 [b0,b1) | .. | Z{k} (x>=b_{k-1})
+// A unit crossing ANY strip edge auto-handoffs to the neighbour that owns the strip (the SAME position-driven
+// handoff proven for W|E in S3 -- mesh routing/conservation/fencing are already N-neighbour generic). The
+// W|E names are KEPT for the 0/1-boundary case so every existing 2-zone gate + the W/E worker pass unchanged;
+// >=2 boundaries switch to Z-indexed strip names. `boundary: f64` (the DYNAMIC load-balance line) is the
+// 1-boundary special case -- a single-element `boundaries` carries it; rebalance() still shifts that one line.
+
+// Parse the partition cut points from the environment. GW_BOUNDARIES="50,100,150" (any whitespace tolerated)
+// => a SORTED, de-duplicated list of N-1 cuts for N strips. Absent => the single GW_BOUNDARY (or BOUNDARY=0.0)
+// as a 1-element list (the proven W|E split). Empty/garbage entries are skipped; an empty result falls back to
+// [BOUNDARY] so region-assignment always has at least the one all-positive-x => "E" cut (today's default).
+fn parse_boundaries() -> Vec<f64> {
+    if let Ok(spec) = std::env::var("GW_BOUNDARIES") {
+        let mut v: Vec<f64> = spec
+            .split(',')
+            .filter_map(|s| s.trim().parse::<f64>().ok())
+            .filter(|f| f.is_finite())
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v.dedup();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let b = std::env::var("GW_BOUNDARY")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(BOUNDARY);
+    vec![b]
+}
+
+// ── 2D GRID PARTITION (D1: square zones instead of 1D strips) ──────────────────────────────────────
+// GW_GRID2D="<cols>x<rows>" (+ GW_ARENA="<w>[,<h>]", default 5000) => a COLSxROWS grid of square-ish
+// zones named "Z<col>_<row>", derived from BOTH x AND y (the 1D strip path is along x only). When set,
+// the broker auto-hands-off by 2D cell (per-axis hysteresis, mirroring region_after's W|E band). Absent
+// => None => the 1D-strip path is byte-for-byte unchanged. Note: CONFIG (a partition MODEL choice, like
+// GW_BOUNDARIES), not a per-call flag -- the handoff stays automatic + structural.
+fn parse_grid2d() -> Option<(usize, usize, f64, f64)> {
+    let spec = std::env::var("GW_GRID2D").ok()?;
+    let (cs, rs) = spec.split_once('x')?;
+    let cols: usize = cs.trim().parse().ok()?;
+    let rows: usize = rs.trim().parse().ok()?;
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let arena = std::env::var("GW_ARENA").ok().unwrap_or_default();
+    let mut it = arena.split(',').filter_map(|s| s.trim().parse::<f64>().ok());
+    let aw = it.next().unwrap_or(5000.0);
+    let ah = it.next().unwrap_or(aw);
+    Some((cols, rows, aw / cols as f64, ah / rows as f64))
+}
+
+// The 2D cell name "Z<col>_<row>" for a position.
+fn region_2d(pos: [f64; 2], cols: usize, rows: usize, cw: f64, ch: f64) -> String {
+    let cx = ((pos[0] / cw).floor() as i64).clamp(0, cols as i64 - 1);
+    let cy = ((pos[1] / ch).floor() as i64).clamp(0, rows as i64 - 1);
+    format!("Z{cx}_{cy}")
+}
+
+// Parse a 2D cell name "Z<cx>_<cy>" back to indices (None if not a 2D cell name, e.g. a strip "Z3"/"W").
+fn parse_grid_cell(name: &str) -> Option<(i64, i64)> {
+    let s = name.strip_prefix('Z')?;
+    let (a, b) = s.split_once('_')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+// Per-axis hysteretic next cell index: commit to the neighbour cell only once past the shared edge by
+// +/- H (so a unit straddling a cell seam doesn't ping-pong) -- the 2D analogue of region_after's band.
+fn hysteretic_cell(p: f64, cur: i64, cell: f64, n: usize) -> i64 {
+    let upper = (cur + 1) as f64 * cell;
+    let lower = cur as f64 * cell;
+    if p >= upper + H || p < lower - H {
+        ((p / cell).floor() as i64).clamp(0, n as i64 - 1)
+    } else {
+        cur.clamp(0, n as i64 - 1)
+    }
+}
+
+// Where a unit in `current` (a "Z<cx>_<cy>" cell) moves to after reaching pos, with per-axis hysteresis.
+// If `current` is not a 2D cell name (fresh spawn / cross-broker adopt), snap to the geometric cell.
+fn region_2d_after(pos: [f64; 2], current: &str, cols: usize, rows: usize, cw: f64, ch: f64) -> String {
+    match parse_grid_cell(current) {
+        Some((cx, cy)) => format!(
+            "Z{}_{}",
+            hysteretic_cell(pos[0], cx, cw, cols),
+            hysteretic_cell(pos[1], cy, ch, rows)
+        ),
+        None => region_2d(pos, cols, rows, cw, ch),
+    }
+}
+
+// The strip INDEX x falls into, given the sorted boundary list (0..=bounds.len()).
+fn strip_index(x: f64, bounds: &[f64]) -> usize {
+    let mut i = 0;
+    while i < bounds.len() && x >= bounds[i] {
+        i += 1;
+    }
+    i
+}
+
+// The zone NAME for a strip index. 0/1-boundary => W|E (back-compat); >=2 boundaries => Z<i>.
+fn strip_name(idx: usize, bounds: &[f64]) -> String {
+    if bounds.len() <= 1 {
+        // 0 boundaries => single zone "E"; 1 boundary => W (idx 0) | E (idx 1). The original W|E partition.
+        if idx == 0 && !bounds.is_empty() {
+            "W".to_string()
+        } else {
+            "E".to_string()
+        }
+    } else {
+        format!("Z{idx}")
+    }
+}
+
+// The strip index a strip NAME denotes (inverse of strip_name), or None if it is not a continuous-partition
+// zone of THIS topology. W=>0, E=>last; Z<i> parses i. Used to apply edge-hysteresis on the ACTIVE strip.
+fn strip_index_of_name(name: &str, bounds: &[f64]) -> Option<usize> {
+    match name {
+        "W" => Some(0),
+        "E" => Some(bounds.len()), // the last strip (1 boundary => idx 1; 0 boundaries => idx 0)
+        other => other
+            .strip_prefix('Z')
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|i| *i <= bounds.len()),
+    }
+}
+
+fn initial_region(x: f64, bounds: &[f64]) -> String {
+    strip_name(strip_index(x, bounds), bounds)
+}
+
+// Where `current` moves to after reaching x, with HYSTERESIS on the active strip's two edges (so a unit
+// straddling a seam doesn't ping-pong). Generalizes the W|E [b-H,b+H] band to per-edge bands on N strips:
+// the unit only commits to the next strip up once x >= upper_edge + H, or down once x < lower_edge - H.
+fn region_after(x: f64, current: &str, bounds: &[f64]) -> String {
+    let cur_idx = match strip_index_of_name(current, bounds) {
+        Some(i) => i,
+        None => return current.to_string(),
+    };
+    // commit UP across the strip's upper edge (bounds[cur_idx]) only past the +H hysteresis band
+    if cur_idx < bounds.len() && x >= bounds[cur_idx] + H {
+        // jump as many strips as the position warrants (a big teleport crosses several edges at once)
+        return strip_name(strip_index(x, bounds), bounds);
+    }
+    // commit DOWN across the strip's lower edge (bounds[cur_idx-1]) only past the -H hysteresis band
+    if cur_idx > 0 && x < bounds[cur_idx - 1] - H {
+        return strip_name(strip_index(x, bounds), bounds);
+    }
+    current.to_string()
+}
+
+fn coarse_region(region: &str) -> &str {
+    region.split('#').next().unwrap_or(region)
+}
+
+// A region label that names a 1D-strip partition zone (W/E for 0-1 boundaries, Z<i> for N) -- as opposed to
+// a NAMED region (a planet/portal zone honored verbatim, never position-re-derived). The topology is implied
+// by the broker's boundary list; without it (a worker that never set GW_BOUNDAR*) only W|E count, so a plain
+// "Z3" on a single-zone broker is treated as a named region (unchanged behaviour).
+fn is_strip_region_name(region: &str, bounds: &[f64]) -> bool {
+    strip_index_of_name(region, bounds).is_some() && matches!(coarse_region(region), "W" | "E")
+        || coarse_region(region)
+            .strip_prefix('Z')
+            .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && bounds.len() >= 2)
+            .unwrap_or(false)
+}
+
+fn movement_region_after(
+    x: f64,
+    current: &str,
+    bounds: &[f64],
+    splits: &std::collections::HashMap<String, Vec<f64>>,
+) -> String {
+    let coarse = coarse_region(current);
+    let next = if is_strip_region_name(coarse, bounds) {
+        region_after(x, coarse, bounds)
+    } else {
+        coarse.to_string()
+    };
+    refine_region(&next, x, splits)
+}
+
+fn spawn_region(
+    pos: [f64; 2],
+    requested: Option<&str>,
+    bounds: &[f64],
+    splits: &std::collections::HashMap<String, Vec<f64>>,
+) -> String {
+    match requested.map(str::trim).filter(|r| !r.is_empty()) {
+        // a NAMED region (not a strip zone of this topology) is honored verbatim (planet/portal zones).
+        Some(region) if !is_strip_region_name(region, bounds) => {
+            refine_region(coarse_region(region), pos[0], splits)
+        }
+        // a strip zone request (W/E/Z<i>) OR none: the position picks the strip (the source of truth).
+        _ => refine_region(&initial_region(pos[0], bounds), pos[0], splits),
+    }
+}
+
+// CROSS-BROKER ADOPT region label (the cross-broker fold A->B region-mislabel fix). When this broker ADOPTS an
+// entity handed across the process seam, the entity now belongs to one of THIS broker's OWNED zones -- its
+// `region` must name that zone, NOT be re-derived from position against this broker's local W|E boundary
+// (the old `spawn_in_region(..., None, ...)` path did the latter -> a unit Folded into ZB at x<0 got
+// mislabeled "W" instead of "ZB"). The receiving region, by most-authoritative source available:
+//   1. `my_region` (this broker's GW_ADVERTISE'd owned region) -- set in the registry/advertise topology
+//      (the advertise-topology tests): the broker IS that zone, so adopt -> it.
+//   2. else the `target` the sender addressed, IF this broker actually owns it (a local worker leases it:
+//      region_worker has it) -- the static-GW_MESH topology (mesh_soak owns "E", routed target "E") where
+//      my_region is empty but the broker still owns the target zone.
+//   3. else fall back to the position-derived region (preserves the prior behavior for a topology that
+//      advertises nothing AND doesn't own the target as a named zone -- e.g. nzone's "EARTH" target landing
+//      on a broker whose only owned zone is "E": there is no better label than the geometric one).
+fn receiving_region_for_adopt(state: &ServerState, pos: [f64; 2], target: Option<&str>) -> String {
+    if !state.my_region.is_empty() {
+        return state.my_region.clone();
+    }
+    if let Some(t) = target.map(str::trim).filter(|t| !t.is_empty()) {
+        if state.region_worker.contains_key(t) {
+            return refine_region(coarse_region(t), pos[0], &state.splits);
+        }
+    }
+    spawn_region(pos, None, &state.boundaries, &state.splits)
+}
+
+fn is_platform_reserved_component(comp: &str) -> bool {
+    comp == "kernel"
+        || comp.starts_with("kernel.")
+        || comp == "ownership"
+        || comp.starts_with("ownership.")
+        || comp == "zone.law"
+        || comp == "threshold.tx"
+        || comp == "authority.mode"
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthorityMode {
+    ClientForwardSparse,
+    ServerArbitrated,
+    ServerPhysicsIsland,
+    ThresholdOverlap,
+    PersistentKernelLock,
+}
+
+impl AuthorityMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            AuthorityMode::ClientForwardSparse => "client_forward_sparse",
+            AuthorityMode::ServerArbitrated => "server_arbitrated",
+            AuthorityMode::ServerPhysicsIsland => "server_physics_island",
+            AuthorityMode::ThresholdOverlap => "threshold_overlap",
+            AuthorityMode::PersistentKernelLock => "persistent_kernel_lock",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "client_forward_sparse" => Some(AuthorityMode::ClientForwardSparse),
+            "server_arbitrated" => Some(AuthorityMode::ServerArbitrated),
+            "server_physics_island" => Some(AuthorityMode::ServerPhysicsIsland),
+            "threshold_overlap" => Some(AuthorityMode::ThresholdOverlap),
+            "persistent_kernel_lock" => Some(AuthorityMode::PersistentKernelLock),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ComponentAuthority {
+    owner: Option<String>,
+    epoch: u64,
+    mode: AuthorityMode,
+}
+
+struct Entity {
+    pos: [f64; 2],
+    vel: [f64; 2],
+    components: Map<String, Value>,
+    region: String,
+    version: u64,
+    authority: HashMap<String, ComponentAuthority>,
+    last_broadcast_cell: Option<(i64, i64)>, // Interest: the cell at the last propagate -> notify viewers it LEAVES (no stale ghost). Init to the create cell so the FIRST move is covered.
+}
+
+// ── CROSS-BROKER SEAM-INTEREST: a read-only GHOST of a neighbour broker's near-seam entity ──────────────
+// The missing half of the N-zone tiling (handoff ✅; interest was the gap): a unit at the border of zone A
+// must SEE + TARGET a unit in the adjacent zone B WITHOUT either crossing, so the contiguous-world illusion
+// holds. Each broker PUSHES its OWN entities within a BORDER BAND of width `interest_band` around every seam
+// to its meshed neighbour(s) over the EXISTING mesh channel (the same `state.mesh` Sender used for handoff,
+// already retry-resilient); the neighbour holds them HERE -- in `ghosts`, NOT in `entities`.
+//
+// THE KEY INVARIANT (why this can NEVER re-introduce split-brain / packet-loss): a ghost lives in a SEPARATE
+// map from `entities`. Authority is granted ONLY over `entities` (grant_authority/region leases operate on
+// `entities`), and a component WRITE is rejected for any eid not in `entities` (validate_and_apply_nosync's
+// first gate). So a ghost is STRUCTURALLY non-authoritative -- it cannot be leased, cannot be granted, and a
+// forged UpdateComponent/claim on it is rejected. Reading a ghost grants nothing. The ACTUAL cross-seam kill
+// reuses the PROVEN S3 path (a projectile crosses the seam via MeshHandoff -> the owning broker B applies the
+// AoE under its OWN sole authority). Authority STAYS with B. No authority transfer => no split-brain. The
+// ghost is transient (NOT WAL'd -- is_persistent_op is false for MeshGhost): a ghost vanishing on restart is
+// correct (B re-pushes it), so there is no durability fork either. The read-only-ness is the STRUCTURE (a
+// distinct map), not a flag; `interest_band` is CONFIG (GW_INTEREST_BAND), default 0 => no push => byte-for-
+// byte the current behaviour for every existing gate.
+struct GhostEntity {
+    pos: [f64; 2],
+    vel: [f64; 2],
+    components: Map<String, Value>,
+    owner_region: String, // the SOURCE zone (the neighbour broker's owned region) that holds authority -- for the read-only reject message + the observer tag
+    last_seen: Instant,   // refreshed on each push; a ghost not refreshed within GHOST_TTL is reaped (it left the band / its source went away)
+}
+
+struct WorkerHandle {
+    region: String,
+    attributes: HashSet<String>, // worker-type attributes (ACL / LB constraints)
+    view: HashSet<String>,
+    authority_epochs: HashMap<String, u64>,
+    aoi_center: Option<[f64; 2]>,
+    aoi_radius: Option<f64>,
+    fidelity_full_radius: Option<f64>,
+    fidelity_coarse_rate: u64,
+    fidelity_coarse_grid: f64,
+    fidelity_seq: HashMap<String, u64>,
+    tx: Sender<Vec<u8>>, // T1: BOUNDED (capacity CHANNEL_CAP) -- the structural hard cap on this consumer's egress RAM
+    out_queue: Arc<AtomicU64>, // G4 egress backlog depth (enqueued-by-emit minus dequeued-by-writer) -- backpressure visibility
+    dropped: Arc<AtomicU64>,   // G4 count of degradable frames dropped under backpressure (slow consumer)
+    disconnect: Arc<AtomicBool>, // T1: set when this consumer hit the hard egress cap on a CRITICAL frame -> reap_disconnecting tears it down (it reconnects + re-checks-out, no silent loss)
+    grid_cells: Vec<(i64, i64)>, // Interest: the spatial-hash cells this worker's AOI occupies (tracked for removal on re-interest / disconnect)
+}
+
+impl WorkerHandle {
+    fn interested_in(&self, pos: [f64; 2]) -> bool {
+        if let Some(c) = self.aoi_center {
+            let r = self.aoi_radius.unwrap_or(0.0);
+            let dx = pos[0] - c[0];
+            let dy = pos[1] - c[1];
+            return dx * dx + dy * dy <= r * r;
+        }
+        match self.region.as_str() {
+            "OBS" => true,
+            "MESH" => false, // a cross-broker mesh link is a conduit, not an interest-holder
+            "W" => pos[0] < H + INTEREST_MARGIN,
+            _ => pos[0] >= -H - INTEREST_MARGIN,
+        }
+    }
+
+    fn full_fidelity_for(&self, pos: [f64; 2]) -> bool {
+        match (self.aoi_center, self.fidelity_full_radius) {
+            (Some(c), Some(r)) => {
+                let dx = pos[0] - c[0];
+                let dy = pos[1] - c[1];
+                dx * dx + dy * dy <= r * r
+            }
+            _ => true,
+        }
+    }
+}
+
+// the worker-attribute required to WRITE `comp` on entity `e`, or None (unrestricted)
+fn acl_write_attr(e: &Entity, comp: &str) -> Option<String> {
+    e.components
+        .get("acl")
+        .and_then(|a| a.get("write"))
+        .and_then(|w| w.get(comp))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+// the attribute that grants CLIENT-authoritative write to `comp` (player-authoritative: the holder
+// writes WITHOUT owning the region -- a client driving its own avatar), or None. Declared in the
+// entity's `acl`: {"client_write": {comp: attr}} -- a client-authoritative-components partition.
+fn acl_client_write_attr_from_components(comps: &Map<String, Value>, comp: &str) -> Option<String> {
+    comps
+        .get("acl")
+        .and_then(|a| a.get("client_write"))
+        .and_then(|w| w.get(comp))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn acl_client_write_attr(e: &Entity, comp: &str) -> Option<String> {
+    acl_client_write_attr_from_components(&e.components, comp)
+}
+
+fn is_kernel_locked_component(comp: &str) -> bool {
+    comp == "kernel"
+        || comp.starts_with("kernel.")
+        || comp == "ownership"
+        || comp.starts_with("ownership.")
+        || comp == "zone.law"
+}
+
+fn is_spatial_component(comp: &str) -> bool {
+    matches!(
+        comp,
+        "pos" | "vel" | "phys" | "physics" | "rot" | "lin" | "ang" | "at_rest" | "gen" | "t_server" | "sim_time"
+    ) || comp.starts_with("phys.")
+        || comp.starts_with("physics.")
+}
+
+fn authority_mode_from_value(v: &Value) -> Option<AuthorityMode> {
+    if let Some(s) = v.as_str() {
+        AuthorityMode::from_str(s)
+    } else {
+        v.get("mode")
+            .and_then(|m| m.as_str())
+            .and_then(AuthorityMode::from_str)
+    }
+}
+
+fn authority_owner_from_value(v: &Value) -> Option<String> {
+    if let Some(o) = v.get("owner").and_then(|m| m.as_str()) {
+        if !o.is_empty() {
+            return Some(o.to_string());
+        }
+    }
+    None
+}
+
+fn authority_epoch_from_value(v: &Value) -> Option<u64> {
+    v.get("authority_epoch")
+        .or_else(|| v.get("epoch"))
+        .and_then(|m| m.as_u64())
+}
+
+fn authority_spec_for<'a>(comps: &'a Map<String, Value>, comp: &str) -> Option<&'a Value> {
+    comps
+        .get("authority.mode")
+        .and_then(|m| m.as_object())
+        .and_then(|m| m.get(comp))
+}
+
+fn default_authority_mode(comps: &Map<String, Value>, comp: &str) -> AuthorityMode {
+    if let Some(v) = authority_spec_for(comps, comp) {
+        if let Some(mode) = authority_mode_from_value(v) {
+            return mode;
+        }
+    }
+    if is_kernel_locked_component(comp) {
+        AuthorityMode::PersistentKernelLock
+    } else if comp == "threshold.tx" {
+        AuthorityMode::ThresholdOverlap
+    } else if acl_client_write_attr_from_components(comps, comp).is_some() {
+        AuthorityMode::ClientForwardSparse
+    } else if is_spatial_component(comp) {
+        AuthorityMode::ServerPhysicsIsland
+    } else {
+        AuthorityMode::ServerArbitrated
+    }
+}
+
+fn initial_authority_map(
+    comps: &Map<String, Value>,
+    epoch: u64,
+) -> HashMap<String, ComponentAuthority> {
+    let mut names: HashSet<String> = comps.keys().cloned().collect();
+    names.insert("pos".to_string());
+    names.insert("vel".to_string());
+    if let Some(spec) = comps.get("authority.mode").and_then(|m| m.as_object()) {
+        for comp in spec.keys() {
+            names.insert(comp.clone());
+        }
+    }
+    let mut authority = HashMap::new();
+    for comp in names {
+        let spec = authority_spec_for(comps, &comp);
+        authority.insert(
+            comp.clone(),
+            ComponentAuthority {
+                owner: spec.and_then(authority_owner_from_value),
+                epoch: spec.and_then(authority_epoch_from_value).unwrap_or(epoch),
+                mode: default_authority_mode(comps, &comp),
+            },
+        );
+    }
+    authority
+}
+
+fn apply_authority_snapshot(e: &mut Entity, snapshot: &Value) {
+    let Some(map) = snapshot.as_object() else {
+        return;
+    };
+    for (comp, spec) in map {
+        let mode = authority_mode_from_value(spec)
+            .unwrap_or_else(|| default_authority_mode(&e.components, comp));
+        let owner = authority_owner_from_value(spec);
+        let epoch =
+            authority_epoch_from_value(spec).unwrap_or_else(|| component_authority_epoch(e, comp));
+        e.authority
+            .insert(comp.clone(), ComponentAuthority { owner, epoch, mode });
+    }
+}
+
+fn authority_to_json(authority: &HashMap<String, ComponentAuthority>) -> Value {
+    let mut out = Map::new();
+    for (comp, ca) in authority {
+        out.insert(
+            comp.clone(),
+            json!({
+                "owner": ca.owner.clone(),
+                "authority_epoch": ca.epoch,
+                "mode": ca.mode.as_str()
+            }),
+        );
+    }
+    Value::Object(out)
+}
+
+fn ensure_component_authority(e: &mut Entity, comp: &str) {
+    if e.authority.contains_key(comp) {
+        return;
+    }
+    let epoch = e.authority.get("pos").map(|ca| ca.epoch).unwrap_or(1);
+    e.authority.insert(
+        comp.to_string(),
+        ComponentAuthority {
+            owner: authority_spec_for(&e.components, comp).and_then(authority_owner_from_value),
+            epoch,
+            mode: default_authority_mode(&e.components, comp),
+        },
+    );
+}
+
+fn component_authority_epoch(e: &Entity, comp: &str) -> u64 {
+    e.authority
+        .get(comp)
+        .or_else(|| {
+            if matches!(comp, "delete" | "threshold.tx" | "fold") {
+                e.authority.get("pos")
+            } else {
+                None
+            }
+        })
+        .map(|ca| ca.epoch)
+        .unwrap_or(1)
+}
+
+fn set_component_authority_epoch(e: &mut Entity, comp: &str, epoch: u64) {
+    ensure_component_authority(e, comp);
+    if let Some(ca) = e.authority.get_mut(comp) {
+        ca.epoch = epoch;
+    }
+}
+
+fn bump_component_authority_epoch(e: &mut Entity, comp: &str) -> u64 {
+    ensure_component_authority(e, comp);
+    let ca = e.authority.get_mut(comp).unwrap();
+    ca.epoch = ca.epoch.saturating_add(1);
+    ca.epoch
+}
+
+fn physics_island_component_names(
+    comps: &Map<String, Value>,
+    authority: &HashMap<String, ComponentAuthority>,
+) -> Vec<String> {
+    let mut names: HashSet<String> = authority.keys().cloned().collect();
+    for comp in comps.keys() {
+        names.insert(comp.clone());
+    }
+    names.insert("pos".to_string());
+    names.insert("vel".to_string());
+    let mut out: Vec<String> = names
+        .into_iter()
+        .filter(|comp| {
+            authority
+                .get(comp)
+                .map(|ca| ca.mode == AuthorityMode::ServerPhysicsIsland)
+                .unwrap_or_else(|| {
+                    default_authority_mode(comps, comp) == AuthorityMode::ServerPhysicsIsland
+                })
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn set_physics_island_authority_epoch(e: &mut Entity, epoch: u64) -> Vec<String> {
+    let comps = physics_island_component_names(&e.components, &e.authority);
+    for comp in &comps {
+        set_component_authority_epoch(e, comp, epoch);
+    }
+    comps
+}
+
+fn advance_physics_island_authority(
+    e: &mut Entity,
+    old_owner: Option<&str>,
+    new_owner: Option<&str>,
+) -> (u64, Vec<String>) {
+    let comps = physics_island_component_names(&e.components, &e.authority);
+    let epoch = comps
+        .iter()
+        .map(|comp| component_authority_epoch(e, comp))
+        .max()
+        .unwrap_or_else(|| component_authority_epoch(e, "pos"))
+        .saturating_add(1);
+    let mut moved = Vec::new();
+    for comp in comps {
+        ensure_component_authority(e, &comp);
+        let ca = e.authority.get_mut(&comp).unwrap();
+        if ca.mode != AuthorityMode::ServerPhysicsIsland {
+            continue;
+        }
+        let owner_matches = match old_owner {
+            Some(old) => ca.owner.as_deref() == Some(old) || ca.owner.is_none(),
+            None => ca.owner.is_none(),
+        };
+        if owner_matches {
+            ca.epoch = epoch;
+            ca.owner = new_owner.map(str::to_string);
+            moved.push(comp);
+        }
+    }
+    (epoch, moved)
+}
+
+fn bump_spatial_authority_epoch(e: &mut Entity) -> u64 {
+    let epoch = bump_component_authority_epoch(e, "pos");
+    set_physics_island_authority_epoch(e, epoch);
+    epoch
+}
+
+fn component_authority_mode(e: &Entity, comp: &str) -> AuthorityMode {
+    e.authority
+        .get(comp)
+        .or_else(|| {
+            if matches!(comp, "delete" | "threshold.tx" | "fold") {
+                e.authority.get("pos")
+            } else {
+                None
+            }
+        })
+        .map(|ca| ca.mode.clone())
+        .unwrap_or_else(|| default_authority_mode(&e.components, comp))
+}
+
+fn component_authority_owner(e: &Entity, comp: &str) -> Option<String> {
+    e.authority
+        .get(comp)
+        .or_else(|| {
+            if matches!(comp, "delete" | "threshold.tx" | "fold") {
+                e.authority.get("pos")
+            } else {
+                None
+            }
+        })
+        .and_then(|ca| ca.owner.clone())
+}
+
+// whether a worker with `attrs` may READ (be checked out) entity `e`
+fn acl_read_ok(attrs: &HashSet<String>, e: &Entity) -> bool {
+    if let Some(read) = e
+        .components
+        .get("acl")
+        .and_then(|a| a.get("read"))
+        .and_then(|r| r.as_array())
+    {
+        if !read.is_empty() {
+            return read
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|a| attrs.contains(a));
+        }
+    }
+    true
+}
+
+fn worker_has_attr(state: &ServerState, wid: &str, attr: &str) -> bool {
+    state
+        .workers
+        .get(wid)
+        .map(|w| w.attributes.contains(attr))
+        .unwrap_or(false)
+}
+
+fn reject_kernel_reserved_write(state: &mut ServerState, wid: &str, eid: &str, comp: &str) -> bool {
+    if is_platform_reserved_component(comp) && !worker_has_attr(state, wid, "kernel_admin") {
+        emit(
+            state,
+            wid,
+            json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+            "reason":"platform-reserved components require the 'kernel_admin' attribute"}),
+        );
+        true
+    } else {
+        false
+    }
+}
+
+fn authoritative_entity_owner(state: &ServerState, wid: &str, eid: &str) -> Result<(), String> {
+    let region = state
+        .entities
+        .get(eid)
+        .map(|e| e.region.clone())
+        .ok_or_else(|| "entity not found".to_string())?;
+    let owner = state.region_worker.get(&region).cloned();
+    if owner.as_deref() == Some(wid) || worker_has_attr(state, wid, "kernel_admin") {
+        Ok(())
+    } else {
+        Err(format!(
+            "not authoritative; owner={}",
+            owner.unwrap_or_default()
+        ))
+    }
+}
+
+fn authoritative_component_writer(
+    state: &ServerState,
+    wid: &str,
+    eid: &str,
+    comp: &str,
+) -> Result<(), String> {
+    if worker_has_attr(state, wid, "kernel_admin") {
+        return Ok(());
+    }
+    let e = state
+        .entities
+        .get(eid)
+        .ok_or_else(|| "entity not found".to_string())?;
+    if component_authority_mode(e, comp) == AuthorityMode::ClientForwardSparse {
+        if let Some(attr) = acl_client_write_attr(e, comp) {
+            if state
+                .workers
+                .get(wid)
+                .map(|w| w.attributes.contains(&attr))
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+    }
+    if let Some(owner) = component_authority_owner(e, comp) {
+        if owner == wid {
+            return Ok(());
+        }
+        return Err(format!("not authoritative; owner={owner}"));
+    }
+    authoritative_entity_owner(state, wid, eid)
+}
+
+fn authority_key(eid: &str, comp: &str) -> String {
+    format!("{eid}:{comp}")
+}
+
+fn grant_authority(state: &mut ServerState, wid: &str, eid: &str, comp: &str) {
+    let (epoch, mode) = match state.entities.get_mut(eid) {
+        Some(e) => {
+            ensure_component_authority(e, comp);
+            let ca = e.authority.get_mut(comp).unwrap();
+            ca.owner = Some(wid.to_string());
+            (ca.epoch, ca.mode.as_str())
+        }
+        None => return,
+    };
+    if let Some(w) = state.workers.get_mut(wid) {
+        w.authority_epochs.insert(authority_key(eid, comp), epoch);
+    }
+    emit(
+        state,
+        wid,
+        json!({"op":"AuthorityChange","entity":eid,"comp":comp,
+        "authoritative":true,"authority_epoch":epoch,"mode":mode}),
+    );
+}
+
+fn revoke_authority(state: &mut ServerState, wid: &str, eid: &str, comp: &str) {
+    let (epoch, mode) = match state.entities.get_mut(eid) {
+        Some(e) => {
+            ensure_component_authority(e, comp);
+            let ca = e.authority.get_mut(comp).unwrap();
+            if ca.owner.as_deref() == Some(wid) {
+                ca.owner = None;
+            }
+            (ca.epoch, ca.mode.as_str())
+        }
+        None => (0, "server_arbitrated"),
+    };
+    if let Some(w) = state.workers.get_mut(wid) {
+        w.authority_epochs.remove(&authority_key(eid, comp));
+    }
+    emit(
+        state,
+        wid,
+        json!({"op":"AuthorityChange","entity":eid,"comp":comp,
+        "authoritative":false,"authority_epoch":epoch,"mode":mode}),
+    );
+}
+
+fn region_physics_island_grants(state: &ServerState, wid: &str, eid: &str) -> Vec<String> {
+    let Some(e) = state.entities.get(eid) else {
+        return Vec::new();
+    };
+    if state.region_worker.get(&e.region).map(|s| s.as_str()) != Some(wid) {
+        return Vec::new();
+    }
+    physics_island_component_names(&e.components, &e.authority)
+        .into_iter()
+        .filter(|comp| {
+            component_authority_mode(e, comp) == AuthorityMode::ServerPhysicsIsland
+                && acl_client_write_attr(e, comp).is_none()
+                && component_authority_owner(e, comp)
+                    .map(|owner| owner == wid)
+                    .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn grant_region_physics_island_authority(state: &mut ServerState, wid: &str, eid: &str) {
+    let comps = region_physics_island_grants(state, wid, eid);
+    for comp in comps {
+        grant_authority(state, wid, eid, &comp);
+    }
+}
+
+fn frame_authority_epoch(f: &Value) -> Option<u64> {
+    f.get("authority_epoch")
+        .or_else(|| f.get("epoch"))
+        .and_then(|v| v.as_u64())
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as u64
+}
+
+fn value_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+}
+
+fn stored_component_u64(e: &Entity, comp: &str) -> Option<u64> {
+    e.components.get(comp).and_then(value_u64)
+}
+
+fn stored_physics_field_u64(e: &Entity, field: &str) -> Option<u64> {
+    e.components
+        .get("physics")
+        .and_then(|v| v.get(field))
+        .and_then(value_u64)
+}
+
+fn next_gen_value(current: Option<u64>, supplied: &Value) -> u64 {
+    match current {
+        Some(v) => v.saturating_add(1),
+        None => value_u64(supplied).unwrap_or(1),
+    }
+}
+
+fn next_server_time_value(current: Option<u64>) -> u64 {
+    let floor = current.map(|v| v.saturating_add(1)).unwrap_or(0);
+    floor.max(unix_time_ms())
+}
+
+// G1 cross-broker time-interpolation: sim_time is a WALL-CLOCK-INDEPENDENT logical clock. Unlike t_server
+// (unix_time_ms-based -> skews across brokers with different wall-clocks -> seam teleport/rubberbanding),
+// sim_time accumulates a nominal sim step per accepted sample, so a client can interpolate by it ACROSS a
+// seam without cross-broker clock skew. A worker may supply a larger value (its real dt * zone_time_scale);
+// the broker takes the max to stay monotonic and continuous on handoff (the gen-twin for interpolation TIME).
+const SIM_DT_MS: u64 = 16;
+
+fn next_sim_time_value(current: Option<u64>, supplied: &Value) -> u64 {
+    let supplied_v = value_u64(supplied).unwrap_or(0);
+    match current {
+        Some(v) => v.saturating_add(SIM_DT_MS).max(supplied_v),
+        None => supplied_v.max(SIM_DT_MS),
+    }
+}
+
+fn normalize_physics_clock_write(e: &Entity, comp: &str, value: Value) -> Value {
+    match comp {
+        "gen" => json!(next_gen_value(stored_component_u64(e, "gen"), &value)),
+        "t_server" => json!(next_server_time_value(stored_component_u64(e, "t_server"))),
+        "sim_time" => json!(next_sim_time_value(stored_component_u64(e, "sim_time"), &value)),
+        "physics" => {
+            let Some(obj) = value.as_object() else {
+                return value;
+            };
+            let mut out = obj.clone();
+            let supplied_gen = out.get("gen").unwrap_or(&Value::Null);
+            out.insert(
+                "gen".to_string(),
+                json!(next_gen_value(
+                    stored_physics_field_u64(e, "gen"),
+                    supplied_gen
+                )),
+            );
+            out.insert(
+                "t_server".to_string(),
+                json!(next_server_time_value(stored_physics_field_u64(
+                    e, "t_server"
+                ))),
+            );
+            let supplied_sim = out.get("sim_time").cloned().unwrap_or(Value::Null);
+            out.insert(
+                "sim_time".to_string(),
+                json!(next_sim_time_value(stored_physics_field_u64(e, "sim_time"), &supplied_sim)),
+            );
+            Value::Object(out)
+        }
+        _ => value,
+    }
+}
+
+fn authority_bound_f64(e: &Entity, comp: &str, keys: &[&str]) -> Option<f64> {
+    let spec = authority_spec_for(&e.components, comp)?;
+    for key in keys {
+        if let Some(v) = spec
+            .get(*key)
+            .or_else(|| spec.get("bounds").and_then(|b| b.get(*key)))
+        {
+            if let Some(n) = v.as_f64() {
+                return Some(n.max(0.0));
+            }
+        }
+    }
+    None
+}
+
+fn authority_spec_string(e: &Entity, comp: &str, keys: &[&str]) -> Option<String> {
+    let spec = authority_spec_for(&e.components, comp)?;
+    for key in keys {
+        if let Some(v) = spec
+            .get(*key)
+            .or_else(|| spec.get("bounds").and_then(|b| b.get(*key)))
+        {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn reject_client_forward_sparse_envelope(
+    state: &mut ServerState,
+    wid: &str,
+    eid: &str,
+    comp: &str,
+    value: &Value,
+) -> bool {
+    let reason = {
+        let Some(e) = state.entities.get(eid) else {
+            return false;
+        };
+        if component_authority_mode(e, comp) != AuthorityMode::ClientForwardSparse {
+            None
+        } else if comp == "pos" {
+            authority_bound_f64(
+                e,
+                comp,
+                &["max_position_delta", "max_pos_delta", "max_delta", "maxPositionDelta"],
+            )
+            .and_then(|max_delta| {
+                let next = arr2(Some(value));
+                let dx = next[0] - e.pos[0];
+                let dy = next[1] - e.pos[1];
+                let distance = (dx * dx + dy * dy).sqrt();
+                if distance > max_delta {
+                    Some(format!(
+                        "client_forward_sparse envelope: pos delta {:.3} exceeds max_position_delta {:.3}",
+                        distance, max_delta
+                    ))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        }
+    };
+    if let Some(reason) = reason {
+        emit(
+            state,
+            wid,
+            json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+            "reason":reason,"mode":"client_forward_sparse"}),
+        );
+        true
+    } else {
+        false
+    }
+}
+
+fn contact_arbitration_owner(state: &ServerState, a: &str, b: &str, comp: &str) -> Option<String> {
+    state
+        .entities
+        .get(a)
+        .and_then(|e| {
+            authority_spec_string(
+                e,
+                comp,
+                &[
+                    "arbitration_owner",
+                    "contact_owner",
+                    "contactArbiter",
+                    "arbiter",
+                ],
+            )
+        })
+        .or_else(|| {
+            state.entities.get(b).and_then(|e| {
+                authority_spec_string(
+                    e,
+                    comp,
+                    &[
+                        "arbitration_owner",
+                        "contact_owner",
+                        "contactArbiter",
+                        "arbiter",
+                    ],
+                )
+            })
+        })
+        .or_else(|| {
+            state
+                .entities
+                .get(a)
+                .and_then(|e| state.region_worker.get(&e.region).cloned())
+        })
+}
+
+fn escalate_component_to_server_arbitrated(
+    state: &mut ServerState,
+    eid: &str,
+    comp: &str,
+    owner: Option<String>,
+    reason: &str,
+) {
+    let (old_owner, authority_epoch, version, authority) = {
+        let Some(e) = state.entities.get_mut(eid) else {
+            return;
+        };
+        ensure_component_authority(e, comp);
+        let ca = e.authority.get_mut(comp).unwrap();
+        let old_owner = ca.owner.clone();
+        ca.mode = AuthorityMode::ServerArbitrated;
+        ca.owner = owner.clone();
+        ca.epoch = ca.epoch.saturating_add(1);
+        let authority_epoch = ca.epoch;
+        e.version += 1;
+        (
+            old_owner,
+            authority_epoch,
+            e.version,
+            authority_to_json(&e.authority),
+        )
+    };
+    let _ = state.wal_append(&json!({
+        "kind":"component_authority","entity":eid,"version":version,
+        "writer":"broker.contact","comp":comp,"owner":owner.clone(),
+        "authority_epoch":authority_epoch,"mode":"server_arbitrated",
+        "reason":reason,"authority":authority
+    }));
+    if let Some(old) = old_owner {
+        if owner.as_deref() != Some(old.as_str()) {
+            if let Some(w) = state.workers.get_mut(&old) {
+                w.authority_epochs.remove(&authority_key(eid, comp));
+            }
+            emit(
+                state,
+                &old,
+                json!({"op":"AuthorityChange","entity":eid,"comp":comp,
+                "authoritative":false,"authority_epoch":authority_epoch,
+                "mode":"server_arbitrated","reason":reason}),
+            );
+        }
+    }
+    if let Some(owner_wid) = owner.as_deref() {
+        if state.workers.contains_key(owner_wid) {
+            grant_authority(state, owner_wid, eid, comp);
+        }
+    }
+}
+
+fn reject_and_escalate_contact_risk(
+    state: &mut ServerState,
+    wid: &str,
+    eid: &str,
+    comp: &str,
+    value: &Value,
+) -> bool {
+    if comp != "pos" {
+        return false;
+    }
+    let (next, radius) = {
+        let Some(e) = state.entities.get(eid) else {
+            return false;
+        };
+        if component_authority_mode(e, comp) != AuthorityMode::ClientForwardSparse {
+            return false;
+        }
+        let Some(radius) = authority_bound_f64(
+            e,
+            comp,
+            &[
+                "contact_radius",
+                "contactRadius",
+                "contact_margin",
+                "contactMargin",
+            ],
+        ) else {
+            return false;
+        };
+        (arr2(Some(value)), radius)
+    };
+    let contact = state.entities.iter().find_map(|(other_id, other)| {
+        if other_id == eid
+            || component_authority_mode(other, comp) != AuthorityMode::ClientForwardSparse
+        {
+            return None;
+        }
+        let other_radius = authority_bound_f64(
+            other,
+            comp,
+            &[
+                "contact_radius",
+                "contactRadius",
+                "contact_margin",
+                "contactMargin",
+            ],
+        )
+        .unwrap_or(0.0);
+        let threshold = radius + other_radius;
+        if threshold <= 0.0 {
+            return None;
+        }
+        let dx = next[0] - other.pos[0];
+        let dy = next[1] - other.pos[1];
+        let distance = (dx * dx + dy * dy).sqrt();
+        if distance <= threshold {
+            Some((other_id.clone(), distance, threshold))
+        } else {
+            None
+        }
+    });
+    let Some((other_id, distance, threshold)) = contact else {
+        return false;
+    };
+    let owner = contact_arbitration_owner(state, eid, &other_id, comp);
+    let reason = format!(
+        "contact-risk: candidate distance {:.3} <= contact threshold {:.3}; escalated to server_arbitrated",
+        distance, threshold
+    );
+    escalate_component_to_server_arbitrated(state, eid, comp, owner.clone(), &reason);
+    escalate_component_to_server_arbitrated(state, &other_id, comp, owner, &reason);
+    emit(
+        state,
+        wid,
+        json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+        "reason":reason,"mode":"server_arbitrated","contact_entity":other_id}),
+    );
+    true
+}
+
+fn reject_stale_authority_epoch(
+    state: &mut ServerState,
+    wid: &str,
+    eid: &str,
+    comp: &str,
+    f: &Value,
+) -> bool {
+    reject_stale_authority_epoch_val(state, wid, eid, comp, frame_authority_epoch(f))
+}
+
+// Same staleness check, but the supplied epoch is passed directly (so a BatchUpdate entry can carry its
+// OWN authority_epoch, or None to fall back to the per-(eid,comp) cached epoch). The frame-based wrapper
+// above just extracts f["authority_epoch"] and delegates here -> ONE epoch-fencing path, no divergence.
+fn reject_stale_authority_epoch_val(
+    state: &mut ServerState,
+    wid: &str,
+    eid: &str,
+    comp: &str,
+    supplied: Option<u64>,
+) -> bool {
+    let current = match state.entities.get(eid) {
+        Some(e) => component_authority_epoch(e, comp),
+        None => return false,
+    };
+    let cached = state
+        .workers
+        .get(wid)
+        .and_then(|w| w.authority_epochs.get(&authority_key(eid, comp)).copied());
+    let candidate = supplied.or(cached);
+    if let Some(epoch) = candidate {
+        if epoch != current {
+            emit(
+                state,
+                wid,
+                json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                "reason":format!("stale authority epoch {}; current={}", epoch, current),
+                "authority_epoch":current}),
+            );
+            return true;
+        }
+    }
+    false
+}
+
+// visibility = geometric interest AND read-ACL
+fn visible(w: &WorkerHandle, e: &Entity) -> bool {
+    w.interested_in(e.pos) && acl_read_ok(&w.attributes, e)
+}
+
+#[derive(Default)]
+struct Metrics {
+    handoffs: u64, // LOCAL same-broker region->region transfers (the in-process handoff() path)
+    mesh_handoffs: u64, // CROSS-BROKER handoffs: an entity FORWARDED across the process seam to a neighbour broker (mesh_forward, counted on the SENDING broker at the delivered-departure linearization point). Local handoffs counted ONLY same-broker -> cross-server handoffs were invisible in the Inspector before this.
+    applies: u64,
+    failovers: u64,
+    wal_compactions: u64, // R0.3: how many times the WAL was compacted (bounded-disk metric)
+    fenced_stale_handoffs: u64, // L6: inbound MeshHandoffs REJECTED because the sender carried a stale lease_epoch (a fenced returned-from-partition incarnation)
+}
+
+// C2: pre-handoff intent (the overlay's I:<target>). One per entity (our handoff is per-region);
+// set when the entity enters the hysteresis overlap band, cleared at commit / on leaving the band.
+#[derive(Clone)]
+struct HandoffIntent {
+    source_region: String,
+    target_region: String,
+    source_worker: String,
+    target_worker: String,
+    epoch: u64,
+}
+
+// Hardening #1 Step 1: a budgeted INCREMENTAL split. maybe_split enqueues this job (the movers to hand off
+// to the new sub-region) instead of handing off ALL of them in one locked pass; process_rebalance_jobs
+// applies a small batch per monitor tick under a time budget, so the split spreads over many ticks and
+// NEVER freezes the broker (Step 0 measured 2.3s @ 20k in one pass). should_still_move re-checks each mover.
+struct RebalanceJob {
+    eids: Vec<String>, // candidate eids to RE-ROUTE (snapshotted at enqueue); the drain recomputes each
+                       // entity's correct region NOW (movement_region_after) + hands it off if it changed,
+                       // so the job is idempotent with the move-path and a shifted boundary. BOTH maybe_split
+                       // and rebalance feed this one queue, so neither does an unbudgeted O(N) handoff loop.
+    cursor: usize,
+}
+
+// L1 event-storm: a buffered EntityEvent awaiting the coalescing flush. Events buffer per-broker, then
+// flush_events() coalesces them by class (critical=all delivered, visual=one-per-coalesce_key with a count,
+// debug=dropped over budget) so a 1000-event burst can't flood the egress or the client frame.
+struct BufferedEvent {
+    target_wids: Vec<String>, // the interested workers (computed at buffer time, before the flush)
+    eid: String,
+    event: Value,
+    payload: Value,
+    class: String,        // "critical" (never coalesced/dropped) | "visual" (coalesced by key) | "debug" (dropped over budget)
+    coalesce_key: String, // visual events sharing this key collapse to one (with a count)
+    sim_time: Value,
+    gen: Value,
+}
+
+struct ServerState {
+    entities: HashMap<String, Entity>,
+    workers: HashMap<String, WorkerHandle>,
+    region_worker: HashMap<String, String>,
+    // ── durability ──
+    wal: Option<File>,
+    wal_bytes: u64, // G2 snapshot: cumulative WAL bytes written = the point-in-time restore offset (consistent cut)
+    wal_path: String, // R0.3 compaction: the GW_WAL path (so the tick can rewrite/rename it). Empty = no WAL.
+    wal_compact_bytes: u64, // R0.3: compact when wal_bytes exceeds this (GW_WAL_COMPACT_BYTES, default 64 MB; 0 = disabled)
+    snapshot_seen: bool, // R0.3: a coordinated G2 SnapshotMarker was taken against THIS broker -> disable compaction (an external GW_RESTORE_OFFSET cut must stay valid; rewriting the file would invalidate it)
+    wal_degraded: bool, // R0.1: a WAL write/sync failed -> fail-closed (reject persistent ops, do not publish)
+    wal_fail_inject: bool, // R0.1: GW_WAL_FAIL test hook (force a WAL failure for the recovery-correctness gate)
+    zone_topology_rev: u64, // R0.2: bumped on every boundary/split change; the latest partition_config restores on recovery
+    mesh_ack_drop: bool, // G2.1c test hook (GW_MESH_ACK_DROP): adopt an inbound MeshHandoff but DROP the MeshAck -> a stable in-flight state for the consistent-cut test
+    mesh_adopt_drop: bool, // G2.1d test hook (GW_MESH_ADOPT_DROP): DROP an inbound MeshHandoff (no adopt, no ack) -> the wire-transit state for the resolver test
+    interest_grid: HashMap<(i64, i64), HashSet<String>>, // Interest: spatial-hash cell -> AOI-worker ids covering it (broadphase to prune the O(E×V) propagate fan-out)
+    global_workers: HashSet<String>, // Interest: workers NOT grid-indexed (no AOI, or an AOI too large to index) -> propagate always checks these
+    // ── liveness / failover ──
+    region_expires: HashMap<String, Instant>,
+    lease_ttl: f64,
+    standbys: Vec<String>,
+    orphaned_regions: Vec<String>,
+    metrics: Metrics,
+    rejected: Vec<Value>,
+    // ── documented SpatialOS contract ops ──
+    pending_commands: HashMap<String, String>, // request_id -> caller wid (route the response back)
+    entity_id_reservations: u64,               // monotonic ReserveEntityIds counter
+    flags: Map<String, Value>,                 // runtime config flags (FlagUpdate)
+    worker_load: HashMap<String, f64>,         // wid -> last reported load (Metrics)
+    boundary: f64,                             // DYNAMIC partition split (load balancing) -- the 1-boundary W|E line; == boundaries[0] when present
+    boundaries: Vec<f64>, // N-ZONE 1D-strip cut points (sorted). 0/1 elems => W|E names; >=2 => Z<i> strips. Source of truth for region-assignment (the W|E `boundary` above is the 1-element special case rebalance() still shifts).
+    grid2d: Option<(usize, usize, f64, f64)>, // D1: 2D-grid partition (cols, rows, cell_w, cell_h) from GW_GRID2D; Some => square "Z<col>_<row>" zones derived from (x,y); None => the 1D-strip path above (unchanged)
+    splits: HashMap<String, Vec<f64>>, // region -> sorted sub-boundaries (dynamic load-split capacity-add)
+    rebalance_jobs: Vec<RebalanceJob>, // Hardening #1: pending budgeted-incremental split jobs (front = active)
+    event_outbox: Vec<BufferedEvent>, // L1: EntityEvents buffered for the coalescing flush (storm-bounded delivery)
+    load_level: u8, // L3 graceful-degradation: 0 normal / 1 stressed / 2 overloaded (derived from the egress backlog); degradation keys off this; recovers when load clears
+    mesh: HashMap<String, UnboundedSender<Vec<u8>>>, // region -> link to the neighbour BROKER owning it (N-neighbour cross-broker mesh)
+    // B1 cross-broker seam: entities handed EAST but not yet ACK'd by the neighbour. The forward removes
+    // the entity from `entities` but parks it here (the MeshHandoff frame + when-sent) until a MeshAck
+    // confirms it landed; a periodic re-send covers a dropped handoff (the receive is idempotent). The
+    // invariant: an entity crossing the seam is in EXACTLY ONE of {here.entities, pending_mesh, neighbour}
+    // -- it never vanishes (the old path removed it before any confirmation).
+    pending_mesh: HashMap<String, (Value, Instant, String)>, // eid -> (MeshHandoff frame, when-sent, TARGET region) -- target picks the re-send link
+    // B1 fix: this broker is CONFIGURED to mesh east (GW_MESH_EAST set), independent of whether the link
+    // is momentarily up (mesh_east Some). Routing must NOT depend on the link being up at the instant an
+    // entity crosses -- else a cross while the neighbour is down fell through to a LOCAL handoff and
+    // ORPHANED the entity (region E, no owner, frozen) instead of keeping it local + retrying each move.
+    mesh_regions: HashSet<String>, // regions this broker meshes OUT to (remote zones), independent of a link being momentarily up
+    mesh_link_spawned: HashSet<String>, // regions with a (forever-retrying) dynamic mesh-link TASK spawned THIS process lifetime. NOT persisted/restored: a WAL recovery repopulates mesh_regions (routing) but the OLD link task died with the crash, so spawning must gate on THIS set -- else a recovered broker thinks it is linked (mesh_regions.contains) yet has no live link, and recovered in-flight handoffs never resend (the churn pending-leak).
+    // L6 LEASE-FENCED REGISTRY (broker-incarnation fencing across the mesh): the per-region MONOTONIC lease
+    // epoch this broker KNOWS (its OWN region's claimed epoch + every peer region's epoch learned from the
+    // registry). A region taken over by a new broker incarnation gets a STRICTLY HIGHER epoch (registry
+    // current +1, or an explicit GW_ADVERTISE "@N"). Ownership-bearing mesh traffic carries the SENDER's
+    // (src_region, lease_epoch); a receiver REJECTS a frame whose epoch is STALE (< the epoch it knows for
+    // that region) -> a returned-from-partition OLD incarnation is fenced out (its handoffs refused, never
+    // adopted = no split-brain). ADDITIVE: a missing epoch (legacy single-incarnation frames/tests) reads as
+    // None -> accepted, so the existing nzone/mesh_seam/discovery/soak gates are unaffected.
+    region_lease_epoch: HashMap<String, u64>,
+    my_region: String, // this broker's OWN advertised region (from GW_ADVERTISE "E=host:port[@epoch]"); empty if none. Source-stamp for outbound MeshHandoffs.
+    superseded_regions: HashSet<String>, // L6 self-fence: my_region for which the registry now shows a STRICTLY HIGHER epoch held by a DIFFERENT addr -> I am the stale incarnation; suppress my outbound ownership traffic for it.
+    deleted_entities: HashSet<String>, // durable tombstones: delete dominates late threshold/mesh/recreate attempts
+    // C2: pre-handoff intent per entity (the overlay's I:<target>); cleared at commit / on leaving the band
+    pending_handoff_intent: HashMap<String, HandoffIntent>,
+    threshold_ttl: Duration,
+    // Hardening #1 Step 0: lock-hold instrumentation -- the max time the monitor tick held the global lock,
+    // by path, exposed via InspectorFrame. MEASURES the zone-split freeze (GPT-Pro: "first bound the work
+    // and measure; then shard only if contention remains") BEFORE the budgeted-rebalance fix.
+    lock_max_hold_ms: f64,
+    lock_max_hold_path: String,
+    lock_last_hold_ms: f64,
+    // ── CROSS-BROKER SEAM-INTEREST ──
+    ghosts: HashMap<String, GhostEntity>, // read-only mirrors of NEIGHBOUR-broker near-seam entities (NEVER in `entities` -> structurally non-authoritative). Keyed by the SAME eid the source broker uses.
+    interest_band: f64, // GW_INTEREST_BAND: the border-band half-width around each seam whose entities a broker pushes to its neighbour(s) as ghosts. 0 (default) => no push => the current behaviour, byte-for-byte.
+    ghost_seq: u64,     // monotonic counter so a ghost-push batch can be cheap to throttle (push every Nth tick is unnecessary; the monitor tick is 300ms which is already a fine ghost-refresh rate)
+    // ── #3 OPS: GRACEFUL-DRAIN (rolling-deploy without kicking players) ─────────────────────────────────────
+    // A broker told to DRAIN (the `Drain` op, or GW_DRAIN_ON_START for a test) (1) STOPS accepting new entity
+    // CreateEntity (rejected with reason "draining" so the caller re-creates on a live broker), and (2) hands EVERY
+    // entity it owns across the mesh to the neighbour that owns where the entity IS -- via the SAME proven 2-phase
+    // mesh_forward path (pending_mesh -> MeshAck -> exactly-once, conservation-EXACT). When entities AND pending_mesh
+    // both empty, the drain is COMPLETE and (if `drain_exit`) the process exits 0 -- a clean rolling-deploy shutdown.
+    // Note: `draining` is STATE set by a COMMAND, not a config flag on a shelf; the reject-new + hand-off-all + exit-when-
+    // empty IS the structural behaviour of that state. Players are uninterrupted: the neighbour adopts each entity
+    // (AddEntity + the component stream) and a client re-checks-out from the neighbour (checkout_all), so no view is lost.
+    draining: bool,
+    drain_exit: bool,    // when a completed drain should std::process::exit(0) (a real rolling deploy); a test can drain-without-exit to assert conservation against the still-running neighbour.
+    tick_lag_ms: f64,    // #3 metrics: how late the 300ms monitor tick actually fired vs schedule (the broker's saturation signal -- a healthy broker is ~0, a CPU-starved one lags). Measured in the monitor loop.
+}
+
+impl ServerState {
+    fn new(lease_ttl: f64) -> Self {
+        ServerState {
+            entities: HashMap::new(),
+            workers: HashMap::new(),
+            region_worker: HashMap::new(),
+            wal: None,
+            wal_bytes: 0,
+            wal_path: String::new(),
+            // R0.3: compact past 64 MB by default; GW_WAL_COMPACT_BYTES overrides; 0 disables compaction.
+            wal_compact_bytes: std::env::var("GW_WAL_COMPACT_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(64 * 1024 * 1024),
+            snapshot_seen: false,
+            wal_degraded: std::env::var("GW_WAL_FAIL").is_ok(), // R0.1: a configured-broken WAL starts fail-closed
+            wal_fail_inject: std::env::var("GW_WAL_FAIL").is_ok(),
+            zone_topology_rev: 0,
+            mesh_ack_drop: std::env::var("GW_MESH_ACK_DROP").is_ok(),
+            mesh_adopt_drop: std::env::var("GW_MESH_ADOPT_DROP").is_ok(),
+            interest_grid: HashMap::new(),
+            global_workers: HashSet::new(),
+            region_expires: HashMap::new(),
+            lease_ttl,
+            standbys: Vec::new(),
+            orphaned_regions: Vec::new(),
+            metrics: Metrics::default(),
+            rejected: Vec::new(),
+            pending_commands: HashMap::new(),
+            entity_id_reservations: 0,
+            flags: Map::new(),
+            worker_load: HashMap::new(),
+            // CONFIGURABLE W|E partition line. BOUNDARY (0.0) was the only value -> on a map with all-positive-x
+            // coordinates (the godot-open-rts map, any real game map) EVERY entity is region "E" from the start
+            // (initial_region: x<boundary -> W) and region_after never returns "W" (needs x < boundary-H = -0.5),
+            // so a position-driven cross-zone handoff NEVER fired (mesh_handoffs stayed 0). GW_BOUNDARY=<f64> sets
+            // the split line so e.g. GW_BOUNDARY=80 makes an entity crossing x=80 auto-handoff W<->E. Parsed here
+            // (mirrors wal_compact_bytes just below); default = BOUNDARY (0.0) so the old behavior is byte-for-byte
+            // preserved when unset. Note: this is CONFIG, the handoff stays automatic + structural (no per-call flag);
+            // state.boundary remains DYNAMIC afterward (rebalance() load-shifts it; WAL recovery restores it).
+            // N-ZONE: GW_BOUNDARIES="b0,b1,.." (sorted) cuts the map into N strips (Z0..Zn). Back-compat:
+            // absent => fall back to the single GW_BOUNDARY (or BOUNDARY=0.0) -> a 1-element list == today's
+            // W|E split, byte-for-byte. `boundary` carries the first cut (the dynamic W|E line rebalance shifts).
+            boundary: parse_boundaries().first().copied().unwrap_or(BOUNDARY),
+            boundaries: parse_boundaries(),
+            grid2d: parse_grid2d(),
+            splits: HashMap::new(),
+            rebalance_jobs: Vec::new(),
+            event_outbox: Vec::new(),
+            load_level: 0,
+            mesh: HashMap::new(),
+            pending_mesh: HashMap::new(),
+            mesh_regions: HashSet::new(),
+            mesh_link_spawned: HashSet::new(),
+            region_lease_epoch: HashMap::new(),
+            my_region: String::new(),
+            superseded_regions: HashSet::new(),
+            deleted_entities: HashSet::new(),
+            pending_handoff_intent: HashMap::new(),
+            threshold_ttl: Duration::from_secs(30),
+            lock_max_hold_ms: 0.0,
+            lock_max_hold_path: String::new(),
+            lock_last_hold_ms: 0.0,
+            ghosts: HashMap::new(),
+            // GW_INTEREST_BAND=<f64>: the seam border-band half-width. Default 0.0 => seam-interest OFF (no
+            // ghost push) => every existing gate is unaffected. A real game sets e.g. 12 (>= weapon range) so a
+            // unit within 12 of a seam sees + can target the neighbour zone's units within 12 of it.
+            interest_band: std::env::var("GW_INTEREST_BAND")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|f| f.is_finite() && *f >= 0.0)
+                .unwrap_or(0.0),
+            ghost_seq: 0,
+            // #3 OPS: GW_DRAIN_ON_START=1 brings the broker up already draining (a test hook to start a node in the
+            // drain state without racing the Drain op); default off. drain_exit defaults true (a real rolling deploy
+            // exits when drained); GW_DRAIN_NO_EXIT=1 keeps it alive after draining so a test can read the post-drain
+            // metrics + assert the neighbour absorbed every entity. Both ADDITIVE: unset => no drain => unchanged.
+            draining: std::env::var("GW_DRAIN_ON_START").is_ok(),
+            drain_exit: std::env::var("GW_DRAIN_NO_EXIT").is_err(),
+            tick_lag_ms: 0.0,
+        }
+    }
+
+    // ── WAL: append-only durable journal (== persistence.py WAL.append + fsync) ──
+    // R0.1: durable-before-publish. Returns Err if the WAL write/sync fails (a swallowed error is NOT
+    // commercial-grade); the broker then goes fail-closed (wal_degraded) so persistent ops are rejected and
+    // nothing is published as success. GW_WAL_FAIL injects a failure for the recovery-correctness acceptance.
+    fn wal_append(&mut self, ev: &Value) -> Result<(), ()> {
+        // single-record durable append = write the line THEN fsync (behaviour unchanged: durable-before-return).
+        self.wal_append_nosync(ev)?;
+        self.wal_sync()
+    }
+
+    // GROUP-COMMIT primitive: write the record's line WITHOUT fsync. A caller applying MANY records in one
+    // tick (BatchUpdate) writes all their lines via this, then calls wal_sync() ONCE -- collapsing N fsyncs
+    // into 1 (the per-tick durability wall at scale) while preserving the SAME on-disk format + the SAME
+    // durable-before-publish invariant (every line is on disk + fsync'd before ANY of the group is published).
+    fn wal_append_nosync(&mut self, ev: &Value) -> Result<(), ()> {
+        if self.wal_fail_inject {
+            self.wal_degraded = true;
+            return Err(());
+        }
+        if let Some(f) = self.wal.as_mut() {
+            // #2: write each record as a v1 integrity envelope ({"_c":crc32,"_d":payload}) so a half-written
+            // last line is DETECTED on recovery (CRC), not silently skipped. wal_bytes counts the on-disk
+            // envelope line so GW_RESTORE_OFFSET / recovery byte-accounting stay consistent.
+            let mut line = wal_v1_envelope_line(ev);
+            line.push('\n');
+            if f.write_all(line.as_bytes()).is_err() {
+                self.wal_degraded = true;
+                return Err(());
+            }
+            self.wal_bytes += line.len() as u64; // G2: the offset for point-in-time snapshots / consistent cuts
+        }
+        Ok(())
+    }
+
+    // flush the OS buffer + fsync to disk (one durability barrier). Pairs with wal_append_nosync for group
+    // commit; called once after a batch's lines are all written. A failure -> fail-closed (wal_degraded).
+    fn wal_sync(&mut self) -> Result<(), ()> {
+        if self.wal_fail_inject {
+            self.wal_degraded = true;
+            return Err(());
+        }
+        if let Some(f) = self.wal.as_mut() {
+            if f.flush().is_err() || f.sync_data().is_err() {
+                self.wal_degraded = true;
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    // #2: stamp the v1 version header as the FIRST line of a FRESH WAL (file currently empty). On an existing
+    // WAL (wal_bytes>0) this is a no-op, so re-opening a populated log never double-writes the header. Counts
+    // the header into wal_bytes so the offset accounting includes it. Called right after the WAL is opened.
+    fn ensure_wal_header(&mut self) {
+        if self.wal_bytes != 0 || self.wal_fail_inject {
+            return; // existing WAL (header already there) or fail-closed -> nothing to stamp
+        }
+        if let Some(f) = self.wal.as_mut() {
+            let mut line = wal_v1_header_line();
+            line.push('\n');
+            if f.write_all(line.as_bytes()).is_err() || f.flush().is_err() || f.sync_data().is_err() {
+                self.wal_degraded = true;
+                return;
+            }
+            self.wal_bytes += line.len() as u64;
+        }
+    }
+
+    // ── R0.3 WAL COMPACTION: bound the append-only journal on disk ──
+    // Without this the WAL grows forever (every write/transfer/epoch is an appended fsync'd line), so a
+    // broker running for days fills the disk -- the disk analog of the unbounded `state.rejected` RAM leak.
+    // Compaction rewrites the log as the CURRENT state expressed in the EXISTING `register` events (one per
+    // LIVE entity) + the latest `partition_config`, which `recover_from_wal` already replays verbatim, so the
+    // recovery FORMAT does not change. Live-entity snapshot inherently drops tombstones (correct: a deleted
+    // entity must not resurrect) and departed/mesh-handed entities (correct: they live on the neighbour now).
+    // Called ONLY from the single-threaded broker tick under the Arc<Mutex>, so it never races a concurrent
+    // write -> no torn-write window (the rename is atomic; the reopened handle then appends fresh writes).
+    fn maybe_compact_wal(&mut self) {
+        // gates: WAL configured, not fail-closed, threshold enabled (>0) and exceeded.
+        if self.wal_path.is_empty()
+            || self.wal.is_none()
+            || self.wal_degraded
+            || self.wal_compact_bytes == 0
+            || self.wal_bytes <= self.wal_compact_bytes
+        {
+            return;
+        }
+        // G2 SAFETY: if a coordinated point-in-time snapshot was taken against this broker, an external
+        // coordinator may restart us with GW_RESTORE_OFFSET=<bytes>. Rewriting the file would invalidate that
+        // byte offset (the consistent cut), so compaction stays OFF for the lifetime of a snapshot-using
+        // broker. The disk-fill case (no coordinated snapshots) compacts normally. Structural guard, not a flag.
+        if self.snapshot_seen {
+            return;
+        }
+        let tmp = format!("{}.tmp", self.wal_path);
+        // Build the snapshot as register lines (== spawn_in_region's WAL event, == recover_from_wal's reader)
+        // + the latest partition_config (== wal_partition_config), into <wal>.tmp.
+        let mut out = match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(_) => {
+                self.wal_degraded = true; // can't write the snapshot -> fail-closed (do not pretend success)
+                return;
+            }
+        };
+        let mut bytes: u64 = 0;
+        let mut buf = String::new();
+        // #2: the compacted WAL is a fresh v1 log -> stamp the version header first so recovery reads it as v1.
+        buf.clear();
+        buf.push_str(&wal_v1_header_line());
+        buf.push('\n');
+        if out.write_all(buf.as_bytes()).is_err() {
+            self.wal_degraded = true;
+            return;
+        }
+        bytes += buf.len() as u64;
+        for (eid, e) in self.entities.iter() {
+            // authority_epoch scalar = the spatial (pos) epoch seed; the full `authority` map below carries
+            // every component's exact owner/epoch/mode (apply_authority_snapshot overlays it on recovery).
+            let pos_epoch = e.authority.get("pos").map(|ca| ca.epoch).unwrap_or(1);
+            let ev = json!({
+                "kind": "register",
+                "entity": eid,
+                "version": e.version,
+                "authority_epoch": pos_epoch,
+                "pos": [e.pos[0], e.pos[1]],
+                "vel": [e.vel[0], e.vel[1]],
+                "components": Value::Object(e.components.clone()),
+                "region": e.region,
+                "authority": authority_to_json(&e.authority),
+            });
+            buf.clear();
+            buf.push_str(&wal_v1_envelope_line(&ev)); // #2: integrity envelope, same format as wal_append
+            buf.push('\n');
+            if out.write_all(buf.as_bytes()).is_err() {
+                self.wal_degraded = true;
+                return;
+            }
+            bytes += buf.len() as u64;
+        }
+        // latest partition_config so the router restores the SAME placement function (do NOT bump the rev --
+        // this is a faithful re-encoding of the current topology, not a new topology change).
+        let splits: Map<String, Value> =
+            self.splits.iter().map(|(r, v)| (r.clone(), json!(v))).collect();
+        let mesh: Vec<String> = self.mesh_regions.iter().cloned().collect();
+        let pc = json!({
+            "kind": "partition_config",
+            "version": self.zone_topology_rev,
+            "boundary": self.boundary,
+            "boundaries": self.boundaries.clone(),
+            "splits": Value::Object(splits),
+            "mesh_regions": mesh,
+        });
+        buf.clear();
+        buf.push_str(&wal_v1_envelope_line(&pc)); // #2: integrity envelope
+        buf.push('\n');
+        if out.write_all(buf.as_bytes()).is_err() {
+            self.wal_degraded = true;
+            return;
+        }
+        bytes += buf.len() as u64;
+        // durably land the snapshot, then atomically swap it in.
+        if out.flush().is_err() || out.sync_all().is_err() {
+            self.wal_degraded = true;
+            return;
+        }
+        drop(out); // close the tmp handle before the rename (Windows: can't rename an open-for-write file onto target)
+        // Drop the OLD wal handle so the rename can replace the file on Windows.
+        self.wal = None;
+        if std::fs::rename(&tmp, &self.wal_path).is_err() {
+            // rename failed -> the original WAL is still intact on disk; reopen it (append) and keep serving.
+            if let Ok(f) = OpenOptions::new().create(true).append(true).open(&self.wal_path) {
+                self.wal = Some(f);
+            } else {
+                self.wal_degraded = true;
+            }
+            return;
+        }
+        // reopen the freshly-compacted WAL in append mode and reset the offset to the snapshot size.
+        match OpenOptions::new().create(true).append(true).open(&self.wal_path) {
+            Ok(f) => {
+                self.wal = Some(f);
+                let before = self.wal_bytes;
+                self.wal_bytes = bytes;
+                self.metrics.wal_compactions += 1;
+                println!(
+                    "[rust-broker] R0.3 WAL compacted: {} entities, {} -> {} bytes ({} compaction(s))",
+                    self.entities.len(),
+                    before,
+                    bytes,
+                    self.metrics.wal_compactions
+                );
+            }
+            Err(_) => {
+                self.wal_degraded = true; // compacted file exists but we can't reopen it -> fail-closed
+            }
+        }
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+// #3 OPS metric: this process's resident-set size in bytes, for the health endpoint (an operator/k8s watches RSS
+// to catch a leaking broker before OOM). Platform-native with NO new crate dependency (the Cargo.toml stays
+// tokio+serde_json only): Windows reads GetProcessMemoryInfo.WorkingSetSize via a tiny psapi FFI; Linux reads
+// /proc/self/statm (pages * page_size). Where unavailable we return 0 HONESTLY rather than fabricate a number --
+// a 0 RSS in the frame means "not measured on this platform", not "0 bytes used".
+#[cfg(windows)]
+fn process_rss_bytes() -> u64 {
+    // PROCESS_MEMORY_COUNTERS layout (psapi.h); we only read WorkingSetSize. cb must be the struct size.
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(
+            process: isize,
+            ppsmemcounters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+    unsafe {
+        let mut pmc: ProcessMemoryCounters = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+            pmc.working_set_size as u64
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_rss_bytes() -> u64 {
+    // /proc/self/statm field 2 = resident pages; * the page size = RSS bytes.
+    if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+        if let Some(rss_pages) = s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()) {
+            let page = 4096u64; // the near-universal default; a small skew here is irrelevant for a leak-watch metric
+            return rss_pages * page;
+        }
+    }
+    0
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn process_rss_bytes() -> u64 {
+    0
+}
+
+// #3 OPS: the live broker health/metrics snapshot, as a plain JSON object over the EXISTING length-prefixed wire
+// (no HTTP stack pulled in, no second port to secure). Carries exactly the fields Gemini's #2 blocker named --
+// entity_count, mesh_handoffs, tick-lag, RSS, WAL size, ghost count -- plus the liveness-relevant rest. Built from
+// the SAME state.metrics the Inspector reads, so the two never diverge. Returned by the `Health` op (ungated: a
+// liveness prober holds no inspector attribute) and folded into the InspectorFrame too.
+fn health_snapshot(state: &ServerState) -> Value {
+    json!({
+        "status": if state.draining { "draining" } else if state.wal_degraded { "degraded" } else { "ok" },
+        "draining": state.draining,
+        "wal_degraded": state.wal_degraded,
+        "entity_count": state.entities.len(),
+        "ghost_count": state.ghosts.len(),
+        "worker_count": state.workers.len(),
+        "mesh_handoffs": state.metrics.mesh_handoffs,
+        "handoffs": state.metrics.handoffs,
+        "applies": state.metrics.applies,
+        "failovers": state.metrics.failovers,
+        "fenced_stale_handoffs": state.metrics.fenced_stale_handoffs,
+        "wal_compactions": state.metrics.wal_compactions,
+        "pending_mesh": state.pending_mesh.len(),
+        "tick_lag_ms": state.tick_lag_ms,
+        "lock_max_hold_ms": state.lock_max_hold_ms,
+        "rss_bytes": process_rss_bytes(),
+        "wal_bytes": state.wal_bytes,
+        "load_level": state.load_level,
+        "my_region": state.my_region,
+        "mesh_regions": state.mesh_regions.iter().cloned().collect::<Vec<String>>(),
+        "boundaries": state.boundaries.clone(),
+        "t_server": now_millis(),
+    })
+}
+
+// #3 OPS: GRACEFUL-DRAIN core -- pick the mesh-neighbour region each owned entity should be handed to, then hand
+// EVERY owned entity across via the proven 2-phase mesh_forward (pending_mesh -> MeshAck -> exactly-once). Routing:
+// if this broker runs a strip topology (W/E/Z<i>) and a position-derived neighbour strip is a live mesh region,
+// the entity goes to the strip it would cross into (the natural adjacency); otherwise it goes to ANY live mesh
+// neighbour (a named-zone topology like nzone's planets -- still conservation-exact, just not position-adjacent).
+// Returns how many it dispatched THIS pass. Idempotent across ticks: an entity already moved into pending_mesh is
+// gone from `entities`, so a re-run only dispatches what remains. Conservation is the mesh path's exactly-once.
+fn drain_handoff_owned(state: &mut ServerState) -> usize {
+    if state.mesh.is_empty() {
+        return 0; // nowhere to drain to (a single-broker topology has no neighbour) -- honest dead-end, caller reports it
+    }
+    let live_targets: Vec<String> = state.mesh.keys().cloned().collect();
+    // a stable, deterministic neighbour to fall back to (sorted so the choice is reproducible across runs/ticks)
+    let mut sorted_targets = live_targets.clone();
+    sorted_targets.sort();
+    let fallback = sorted_targets[0].clone();
+    let bounds = state.boundaries.clone();
+    let eids: Vec<String> = state.entities.keys().cloned().collect();
+    let mut dispatched = 0usize;
+    for eid in eids {
+        let (pos, region) = match state.entities.get(&eid) {
+            Some(e) => (e.pos, e.region.clone()),
+            None => continue,
+        };
+        // position-adjacent strip neighbour, if this broker is a strip owner and that neighbour is a live mesh link
+        let target = {
+            let mut chosen: Option<String> = None;
+            if is_strip_region_name(coarse_region(&region), &bounds) {
+                let idx = strip_index(pos[0], &bounds);
+                let neighbour = strip_name(idx, &bounds);
+                if neighbour != region && state.mesh.contains_key(&neighbour) {
+                    chosen = Some(neighbour);
+                }
+            }
+            chosen.unwrap_or_else(|| fallback.clone())
+        };
+        mesh_forward(state, &eid, &target);
+        dispatched += 1;
+    }
+    dispatched
+}
+
+fn threshold_tx_value(tx_id: &str, phase: &str, from: Value, to: Value, ts_ms: u64) -> Value {
+    json!({
+        "tx_id": tx_id,
+        "phase": phase,
+        "from": from,
+        "to": to,
+        "ts_ms": ts_ms
+    })
+}
+
+// ══ #2 WAL HYGIENE: version header + per-record CRC + corrupt-tail truncate / mid-corruption refuse ══
+// The WAL is JSONL (one event per line). v1 wraps each event line in a 2-field integrity ENVELOPE:
+//   {"_c":<crc32 of the inner payload string>,"_d":"<the event JSON, serde-escaped as a string>"}
+// `_d` is the EXACT serialized payload string; serde un-escapes it back byte-for-byte on read, so the CRC
+// is computed over a reproducible canonical string (no key-order / re-serialization ambiguity). A fresh WAL
+// also gets a header line {"kind":"wal_header","wal_version":1}. v0 WALs (no header, bare event lines) stay
+// readable via the lenient legacy path so existing logs + the L5 drill never regress.
+const WAL_VERSION: u64 = 1;
+
+// CRC32 (IEEE 802.3, the zlib/PNG polynomial) — self-contained so the broker adds NO new crate dependency
+// (offline build, fast link). Table built once on first use.
+fn crc32_ieee(bytes: &[u8]) -> u32 {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        let mut i = 0usize;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+                k += 1;
+            }
+            t[i] = c;
+            i += 1;
+        }
+        t
+    });
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in bytes {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+// Encode one event as a v1 integrity-envelope LINE (no trailing newline). The payload is serialized once,
+// the CRC is taken over that exact string, and the string is embedded (serde-escaped) as `_d`.
+fn wal_v1_envelope_line(ev: &Value) -> String {
+    let payload = serde_json::to_string(ev).unwrap();
+    let crc = crc32_ieee(payload.as_bytes());
+    // build {"_c":<crc>,"_d":<escaped payload>} — Value::String does the escaping; preserve_order keeps _c,_d.
+    serde_json::to_string(&json!({ "_c": crc, "_d": payload })).unwrap()
+}
+
+fn wal_v1_header_line() -> String {
+    serde_json::to_string(&json!({ "kind": "wal_header", "wal_version": WAL_VERSION })).unwrap()
+}
+
+// Per-line decode result: a v1 envelope that PASSED its CRC, a legacy v0 bare event, or CORRUPT (failed CRC
+// or a v1-mode line that isn't a valid envelope). The header line is reported separately by the caller.
+enum WalLine {
+    Ok(Value),    // a usable event (v1 verified, or v0 bare)
+    Corrupt,      // integrity failure: failed CRC, or non-envelope line while in v1 mode
+}
+
+// Decode a single raw line. `v1_mode` = the header declared v1 (so bare/garbled lines are corruption, not v0).
+fn decode_wal_line(line: &str, v1_mode: bool) -> WalLine {
+    // try the v1 envelope shape first
+    if let Ok(v) = serde_json::from_str::<Value>(line) {
+        if let (Some(c), Some(d)) = (
+            v.get("_c").and_then(|x| x.as_u64()),
+            v.get("_d").and_then(|x| x.as_str()),
+        ) {
+            // an integrity envelope -> verify the CRC over the inner payload string
+            if crc32_ieee(d.as_bytes()) != c as u32 {
+                return WalLine::Corrupt; // CRC mismatch (bit-rot / half-write)
+            }
+            return match serde_json::from_str::<Value>(d) {
+                Ok(ev) => WalLine::Ok(ev),
+                Err(_) => WalLine::Corrupt, // CRC ok but inner not valid JSON (shouldn't happen) -> corrupt
+            };
+        }
+        // parsed JSON but NOT an envelope:
+        if v1_mode {
+            // in v1 mode every record must be an envelope; a bare object = a torn/foreign line = corruption.
+            return WalLine::Corrupt;
+        }
+        return WalLine::Ok(v); // v0 legacy: a bare event line is normal
+    }
+    // not parseable JSON at all
+    WalLine::Corrupt
+}
+
+// What recovery learned about the WAL's integrity (for the dry-run report + the startup fail-closed gate).
+struct RecoverReport {
+    wal_version: u64,
+    truncated_tail_bytes: u64,
+    // Some(msg) => REFUSE: mid-stream corruption or an unknown version. Startup must NOT serve; print the msg.
+    error: Option<String>,
+}
+
+// A stable content hash of the recovered store (order-independent: per-entity hashes XOR-folded) so the
+// dry-run can fingerprint a recovered world without serving it. Covers id/pos/vel/region/version/components.
+fn store_content_hash(store: &HashMap<String, Entity>) -> u64 {
+    let mut acc: u64 = 0;
+    for (eid, e) in store.iter() {
+        let canon = json!({
+            "id": eid,
+            "pos": [e.pos[0], e.pos[1]],
+            "vel": [e.vel[0], e.vel[1]],
+            "region": e.region,
+            "version": e.version,
+            "components": Value::Object(e.components.clone()),
+        });
+        let s = serde_json::to_string(&canon).unwrap();
+        // fold a 32-bit CRC into 64-bit, XOR across entities (commutative -> order-independent)
+        acc ^= ((crc32_ieee(s.as_bytes()) as u64) << 1) | 1;
+    }
+    acc
+}
+
+// ── recover the EXACT store from the WAL alone (== the reference server recover / apply_event) ──
+// #2: now ALSO returns a RecoverReport (version / truncated-tail bytes / refuse-error). A v1 file with a
+// corrupt TRAILING run truncates it cleanly; a corrupt record with a VALID record AFTER it (mid-stream) or an
+// unknown wal_version REFUSES (report.error set, empty store) so the caller fails closed instead of serving
+// partial state. v0 files keep the lenient legacy behavior (skip unparseable lines) — no regression.
+fn recover_from_wal_report(
+    path: &str,
+    up_to_offset: Option<u64>,
+) -> (
+    HashMap<String, Entity>,
+    HashSet<String>,
+    Option<Value>,
+    HashMap<String, Value>,
+    RecoverReport,
+) {
+    // First pass: read raw lines + classify, so we can distinguish a TAIL corrupt-run (truncate) from a
+    // MID-stream corruption (refuse). The WAL is bounded by compaction, so reading it whole is fine.
+    let raw_lines: Vec<String> = match File::open(path) {
+        Ok(f) => BufReader::new(f).lines().map_while(Result::ok).collect(),
+        Err(_) => {
+            // no file yet -> a fresh v1 WAL will be created by the caller; nothing to recover.
+            return (
+                HashMap::new(),
+                HashSet::new(),
+                None,
+                HashMap::new(),
+                RecoverReport { wal_version: WAL_VERSION, truncated_tail_bytes: 0, error: None },
+            );
+        }
+    };
+
+    // Detect the header / version from the FIRST non-empty line.
+    let mut wal_version: u64 = 0; // 0 == legacy (no header)
+    let mut first_idx: Option<usize> = None;
+    for (i, raw) in raw_lines.iter().enumerate() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        first_idx = Some(i);
+        if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
+            if v.get("kind").and_then(|k| k.as_str()) == Some("wal_header") {
+                wal_version = v.get("wal_version").and_then(|x| x.as_u64()).unwrap_or(0);
+            }
+        }
+        break;
+    }
+    // UNKNOWN version -> VersionReject (do not guess how to parse a future format).
+    if wal_version > WAL_VERSION {
+        let report = RecoverReport {
+            wal_version,
+            truncated_tail_bytes: 0,
+            error: Some(format!(
+                "VersionReject: WAL wal_version={} is newer than this broker supports (max {}); refusing to recover",
+                wal_version, WAL_VERSION
+            )),
+        };
+        return (HashMap::new(), HashSet::new(), None, HashMap::new(), report);
+    }
+    let v1_mode = wal_version >= 1;
+    let header_idx = if v1_mode { first_idx } else { None };
+
+    // Classify every non-empty, non-header line as Ok(ev) or Corrupt, tracking on-disk byte spans so a tail
+    // truncation can report exact bytes and stay consistent with wal_bytes / GW_RESTORE_OFFSET accounting.
+    struct Rec {
+        ev: Option<Value>, // None == corrupt
+        bytes: u64,        // raw.len() + 1 (the '\n') — the physical span of this line
+        cum_end: u64,      // cumulative on-disk offset at the END of this line
+    }
+    let mut recs: Vec<Rec> = Vec::with_capacity(raw_lines.len());
+    let mut cumulative: u64 = 0;
+    for (i, raw) in raw_lines.iter().enumerate() {
+        let span = raw.len() as u64 + 1; // +1 for the newline BufReader stripped
+        cumulative += span;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || Some(i) == header_idx {
+            continue; // blank padding / the header line are not events
+        }
+        let ev = match decode_wal_line(trimmed, v1_mode) {
+            WalLine::Ok(v) => {
+                // skip a header that appears mid-file (defensive) — it's not an event
+                if v.get("kind").and_then(|k| k.as_str()) == Some("wal_header") {
+                    continue;
+                }
+                Some(v)
+            }
+            WalLine::Corrupt => None,
+        };
+        recs.push(Rec { ev, bytes: span, cum_end: cumulative });
+    }
+
+    // TAIL vs MID corruption (v1 only). Find the longest run of corrupt records at the very END: those = the
+    // crash's in-progress / torn trailing write(s) -> truncate them. Any corrupt record BEFORE the last good
+    // record is mid-stream corruption -> REFUSE. In v0 (legacy, no CRC) we cannot tell torn-tail from bit-rot,
+    // so we keep the original lenient behavior (corrupt lines were already being dropped) to avoid regressing
+    // existing v0 WALs / the L5 drill's prior format.
+    let mut truncated_tail_bytes: u64 = 0;
+    let mut tail_corrupt = 0usize;
+    let mut good_prefix_len = recs.len();
+    if v1_mode {
+        for r in recs.iter().rev() {
+            if r.ev.is_none() {
+                tail_corrupt += 1;
+                truncated_tail_bytes += r.bytes;
+            } else {
+                break;
+            }
+        }
+        good_prefix_len = recs.len() - tail_corrupt;
+        // corruption inside the good prefix (a valid record FOLLOWS a corrupt one) -> mid-stream violation.
+        let mid_corrupt = recs[..good_prefix_len].iter().any(|r| r.ev.is_none());
+        if mid_corrupt {
+            let report = RecoverReport {
+                wal_version,
+                truncated_tail_bytes: 0,
+                error: Some(
+                    "RestoreIntegrityError: corrupt WAL record(s) in the MIDDLE of the log (a valid record follows a \
+                     CRC failure) — refusing to serve partial/forked state. Repair or restore from a snapshot."
+                        .to_string(),
+                ),
+            };
+            return (HashMap::new(), HashSet::new(), None, HashMap::new(), report);
+        }
+    }
+
+    // Replay the good prefix (== the original recover_from_wal apply loop), honoring up_to_offset.
+    let good_events: Vec<&Value> = recs[..good_prefix_len]
+        .iter()
+        .filter(|r| match up_to_offset {
+            Some(off) => r.cum_end <= off,
+            None => true,
+        })
+        .filter_map(|r| r.ev.as_ref())
+        .collect();
+    let (store, tombstones, last_partition, recovered_pending) = apply_wal_events(&good_events);
+    if truncated_tail_bytes > 0 {
+        println!(
+            "[rust-broker] #2 WAL: truncated {} corrupt trailing byte(s) ({} record(s)) — the in-progress write from the crash",
+            truncated_tail_bytes, tail_corrupt
+        );
+    }
+    let report = RecoverReport { wal_version, truncated_tail_bytes, error: None };
+    (store, tombstones, last_partition, recovered_pending, report)
+}
+
+// Apply already-decoded (CRC-verified) WAL events to a fresh store. Split out of recover_from_wal_report so
+// the integrity/version gate runs FIRST, then this pure replay runs on the good (CRC-passing) prefix only.
+fn apply_wal_events(events: &[&Value]) -> (HashMap<String, Entity>, HashSet<String>, Option<Value>, HashMap<String, Value>) {
+    let mut store: HashMap<String, Entity> = HashMap::new();
+    let mut tombstones: HashSet<String> = HashSet::new();
+    let mut last_partition: Option<Value> = None; // R0.2: the latest partition_config (boundary/splits/mesh) to restore
+    let mut recovered_pending: HashMap<String, Value> = HashMap::new(); // G2.1d: mesh_out not acked by the cut -> resend on restore
+    let g2d_off = std::env::var("GW_G2D_OFF").is_ok(); // G2.1d test toggle: OFF reverts to pre-resolver (proves the wire-transit LOSS)
+    for ev in events.iter().copied() {
+        let ev = ev.clone();
+        match ev.get("kind").and_then(|v| v.as_str()).unwrap_or("") {
+            "register" => {
+                let eid = ev["entity"].as_str().unwrap_or("").to_string();
+                if tombstones.contains(&eid) {
+                    continue;
+                }
+                let pos = arr2(ev.get("pos"));
+                let vel = arr2(ev.get("vel"));
+                let components = ev
+                    .get("components")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                let region = ev["region"].as_str().unwrap_or("E").to_string();
+                let version = ev["version"].as_u64().unwrap_or(0);
+                let authority_epoch = ev["authority_epoch"].as_u64().unwrap_or(1);
+                store.insert(
+                    eid,
+                    Entity {
+                        pos,
+                        vel,
+                        authority: initial_authority_map(&components, authority_epoch),
+                        components,
+                        region,
+                        version,
+                        last_broadcast_cell: Some(interest_cell_of(pos)),
+                    },
+                );
+                if let (Some(e), Some(snapshot)) = (
+                    store.get_mut(ev["entity"].as_str().unwrap_or("")),
+                    ev.get("authority"),
+                ) {
+                    apply_authority_snapshot(e, snapshot);
+                }
+            }
+            "write" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                if let Some(e) = store.get_mut(eid) {
+                    let comp = ev["comp"].as_str().unwrap_or("");
+                    let val = ev.get("value").cloned().unwrap_or(Value::Null);
+                    if comp == "pos" {
+                        e.pos = arr2(Some(&val));
+                    } else if comp == "vel" {
+                        e.vel = arr2(Some(&val));
+                    } else {
+                        e.components.insert(comp.to_string(), val);
+                    }
+                    ensure_component_authority(e, comp);
+                    e.version = ev["version"].as_u64().unwrap_or(e.version);
+                }
+            }
+            "component_add" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                if let Some(e) = store.get_mut(eid) {
+                    let comp = ev["comp"].as_str().unwrap_or("");
+                    let val = ev.get("value").cloned().unwrap_or(Value::Null);
+                    e.components.insert(comp.to_string(), val);
+                    ensure_component_authority(e, comp);
+                    e.version = ev["version"].as_u64().unwrap_or(e.version);
+                }
+            }
+            "component_remove" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                if let Some(e) = store.get_mut(eid) {
+                    let comp = ev["comp"].as_str().unwrap_or("");
+                    e.components.remove(comp);
+                    e.version = ev["version"].as_u64().unwrap_or(e.version);
+                }
+            }
+            "delete_tombstone" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                tombstones.insert(eid.to_string());
+                store.remove(eid);
+            }
+            "transfer" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                if let Some(e) = store.get_mut(eid) {
+                    e.region = ev["to"].as_str().unwrap_or(&e.region).to_string();
+                    e.version = ev["version"].as_u64().unwrap_or(e.version);
+                    if let Some(authority) = ev.get("authority") {
+                        apply_authority_snapshot(e, authority);
+                    } else {
+                        let authority_epoch = ev["authority_epoch"]
+                            .as_u64()
+                            .unwrap_or_else(|| bump_spatial_authority_epoch(e));
+                        set_physics_island_authority_epoch(e, authority_epoch);
+                    }
+                }
+            }
+            "authority_epoch" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                if let Some(e) = store.get_mut(eid) {
+                    let comp = ev["comp"].as_str().unwrap_or("pos");
+                    let authority_epoch = ev["authority_epoch"]
+                        .as_u64()
+                        .unwrap_or_else(|| component_authority_epoch(e, comp));
+                    if let Some(authority) = ev.get("authority") {
+                        apply_authority_snapshot(e, authority);
+                    } else if comp == "pos" || comp == "physics_island" {
+                        set_physics_island_authority_epoch(e, authority_epoch);
+                    } else {
+                        set_component_authority_epoch(e, comp, authority_epoch);
+                    }
+                    e.version = ev["version"].as_u64().unwrap_or(e.version);
+                }
+            }
+            "component_authority" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                if let Some(e) = store.get_mut(eid) {
+                    let comp = ev["comp"].as_str().unwrap_or("");
+                    ensure_component_authority(e, comp);
+                    if let Some(ca) = e.authority.get_mut(comp) {
+                        ca.owner = ev
+                            .get("owner")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        ca.epoch = ev["authority_epoch"].as_u64().unwrap_or(ca.epoch);
+                        if let Some(mode) = ev["mode"].as_str().and_then(AuthorityMode::from_str) {
+                            ca.mode = mode;
+                        }
+                    }
+                    e.version = ev["version"].as_u64().unwrap_or(e.version);
+                }
+            }
+            "threshold_prepare" | "threshold_preload_ready" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                if let Some(e) = store.get_mut(eid) {
+                    let kind = ev["kind"].as_str().unwrap_or("");
+                    let phase = kind.strip_prefix("threshold_").unwrap_or(kind);
+                    e.components.insert(
+                        "threshold.tx".to_string(),
+                        threshold_tx_value(
+                            ev.get("tx_id").and_then(|v| v.as_str()).unwrap_or(""),
+                            phase,
+                            ev.get("from").cloned().unwrap_or(Value::Null),
+                            ev.get("to").cloned().unwrap_or(Value::Null),
+                            ev.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+                        ),
+                    );
+                    e.version = ev["version"].as_u64().unwrap_or(e.version);
+                }
+            }
+            "threshold_commit" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                if let Some(e) = store.get_mut(eid) {
+                    if let Some(to) = ev.get("to").and_then(|v| v.as_str()) {
+                        if !to.is_empty() {
+                            e.region = to.to_string();
+                        }
+                    }
+                    if let Some(authority) = ev.get("authority") {
+                        apply_authority_snapshot(e, authority);
+                    } else {
+                        let authority_epoch = ev["authority_epoch"]
+                            .as_u64()
+                            .unwrap_or_else(|| bump_spatial_authority_epoch(e));
+                        set_physics_island_authority_epoch(e, authority_epoch);
+                    }
+                    e.components.insert(
+                        "threshold.tx".to_string(),
+                        threshold_tx_value(
+                            ev.get("tx_id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "commit",
+                            ev.get("from").cloned().unwrap_or(Value::Null),
+                            ev.get("to").cloned().unwrap_or(Value::Null),
+                            ev.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+                        ),
+                    );
+                    e.version = ev["version"].as_u64().unwrap_or(e.version);
+                }
+            }
+            "threshold_adopt" | "threshold_abort" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                if let Some(e) = store.get_mut(eid) {
+                    e.components.remove("threshold.tx");
+                    e.version = ev["version"].as_u64().unwrap_or(e.version);
+                }
+            }
+            "mesh_out" => {
+                // The source WAL says a departure crossed the process seam: remove the local copy (the
+                // receiver's register WAL is the target-side copy). G2.1d: ALSO park the full payload as
+                // in-flight channel state -- if no mesh_acked follows by the cut, the handoff is "in the
+                // channel", so restore recreates pending_mesh from this record and resends (exactly-once).
+                let eid = ev["entity"].as_str().unwrap_or("");
+                store.remove(eid);
+                if !g2d_off {
+                    recovered_pending.insert(eid.to_string(), ev.clone());
+                }
+            }
+            "mesh_acked" => {
+                // The entity crossed the seam AND the neighbour ACK'd it -> it lives THERE now. Drop the
+                // local copy AND clear the in-flight channel state (the handoff completed -> do NOT resend).
+                let eid = ev["entity"].as_str().unwrap_or("");
+                store.remove(eid);
+                recovered_pending.remove(eid);
+            }
+            "partition_config" => {
+                last_partition = Some(ev.clone()); // R0.2: keep the LATEST -> restored before serving routing
+            }
+            _ => {}
+        }
+    }
+    // Crash before threshold_commit -> recover as ABORT, not as a half-open threshold.
+    for e in store.values_mut() {
+        let committed = e
+            .components
+            .get("threshold.tx")
+            .and_then(|v| v.get("phase"))
+            .and_then(|v| v.as_str())
+            == Some("commit");
+        if !committed {
+            e.components.remove("threshold.tx");
+        }
+    }
+    (store, tombstones, last_partition, recovered_pending)
+}
+
+fn arr2(v: Option<&Value>) -> [f64; 2] {
+    if let Some(a) = v.and_then(|x| x.as_array()) {
+        [
+            a.first().and_then(|x| x.as_f64()).unwrap_or(0.0),
+            a.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0),
+        ]
+    } else {
+        [0.0, 0.0]
+    }
+}
+
+fn frame(v: &Value) -> Vec<u8> {
+    let body = serde_json::to_vec(v).unwrap();
+    let n = body.len() as u32;
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&n.to_be_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+fn emit(state: &ServerState, wid: &str, v: Value) {
+    if let Some(w) = state.workers.get(wid) {
+        // G4 bounding (graceful first line): over the soft cap, a slow consumer's DEGRADABLE flood is
+        // dropped to bound memory; CRITICAL ops (AuthorityChange / Add+RemoveEntity / CommandResponse /
+        // WAL-visible) are never soft-dropped. L3: the degradable-drop cap LOWERS as load_level rises
+        // (4096 -> 2048 -> 1024) so a stressed broker sheds degradable floods sooner. CRITICAL goes on to
+        // the bounded channel below.
+        let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
+        let degradable = op == "ComponentUpdate" || op == "InspectorFrame";
+        let cap = EGRESS_SOFT_CAP >> state.load_level;
+        if degradable && w.out_queue.load(Ordering::Relaxed) > cap {
+            w.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // T1 STRUCTURAL HARD CAP: the channel is BOUNDED (CHANNEL_CAP). try_send returns Full ONLY when the
+        // consumer has not drained CHANNEL_CAP frames -- i.e. it is stuck even on critical-only traffic (the
+        // degradable shedding above already kept a healthy-but-bursty consumer well under this). A degradable
+        // Full is just dropped (it's degradable, already past the soft cap). A CRITICAL Full means "this
+        // consumer is genuinely not draining" -> we MUST NOT grow RAM (unbounded) and MUST NOT silently drop
+        // the critical frame; the structural answer is to FORCE-DISCONNECT it (flag here, reaped at the end
+        // of dispatch). The client reconnects and re-checks-out via checkout_all, rebuilding its full view --
+        // no state is silently lost. This is the bound the G4 comment promised, enforced by the channel TYPE.
+        match w.tx.try_send(frame(&v)) {
+            Ok(()) => {
+                w.out_queue.fetch_add(1, Ordering::Relaxed); // enqueued -> egress backlog (G4 visibility)
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if degradable {
+                    w.dropped.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // hard-cap hit on a CRITICAL frame -> mark for force-disconnect (reaped post-dispatch)
+                    w.disconnect.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {} // receiver gone (already disconnecting)
+        }
+    }
+}
+
+// T1: reap any worker flagged for force-disconnect (it hit the hard egress cap on a CRITICAL frame). Removing
+// it from `workers` DROPS its bounded Sender, which makes the writer task's rx.recv() return None -> the
+// writer exits + closes the socket -> the slow consumer's read loop gets EOF and tears its connection down.
+// The client then reconnects and re-checks-out (checkout_all) -> NO silent state loss. Called at the end of
+// dispatch (which holds &mut state), so the slow consumer is torn down within ONE frame of the overflow --
+// bounding broker RAM at CHANNEL_CAP frames per consumer, structurally (not via any flag).
+fn reap_disconnecting(state: &mut ServerState) {
+    let kick: Vec<String> = state
+        .workers
+        .iter()
+        .filter(|(_, w)| w.disconnect.load(Ordering::Relaxed))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for wid in kick {
+        remove_from_interest_grid(state, &wid);
+        state.workers.remove(&wid);
+        println!("[T1] worker '{wid}' force-disconnected -- hard egress cap ({CHANNEL_CAP}) hit on a critical frame (slow/stuck consumer); it will reconnect + re-checkout");
+    }
+}
+
+// L1 event-storm: flush the buffered EntityEvents to interested workers, COALESCED by class so a 1000-event
+// burst delivers BOUNDED output -- visual: one per coalesce_key carrying a count (1000 tracers from one
+// source -> 1 with count=1000); debug: dropped under the storm. The client still orders by sim_time/gen;
+// this caps egress + the client frame (the deepest L1 product hole). NOTE: CRITICAL events no longer reach
+// this buffer -- they deliver INLINE at ingress (see the EntityEvent handler) so their "never dropped/exact/
+// timely" guarantee is load-independent (not behind this lock-contending 20Hz tick). The `_ =>` critical arm
+// below is kept only as a defensive fallback (delivers ALL, exact) in case any path ever buffers a critical.
+fn flush_events(state: &mut ServerState) {
+    if state.event_outbox.is_empty() {
+        return;
+    }
+    // L3 graceful-degradation: the visual-event budget SHRINKS as load_level rises (64 -> 32 -> 16) so a
+    // stressed broker coalesces harder; critical events are unaffected (always delivered, exact count).
+    let max_visual: usize = 64usize >> state.load_level;
+    let buffered = std::mem::take(&mut state.event_outbox);
+    // per worker -> (critical events [all], visual coalesce_key -> (representative, count))
+    let mut per_worker: HashMap<String, (Vec<Value>, HashMap<String, (Value, u64)>)> = HashMap::new();
+    for ev in buffered {
+        let base = json!({"op":"EntityEvent","entity":ev.eid,"event":ev.event,"payload":ev.payload,
+            "sim_time":ev.sim_time,"gen":ev.gen,"class":ev.class});
+        for wid in &ev.target_wids {
+            let entry = per_worker.entry(wid.clone()).or_insert_with(|| (Vec::new(), HashMap::new()));
+            match ev.class.as_str() {
+                "visual" => {
+                    let v = entry.1.entry(ev.coalesce_key.clone()).or_insert_with(|| (base.clone(), 0));
+                    v.0 = base.clone(); // newest representative (last buffered = latest)
+                    v.1 += 1;
+                }
+                "debug" => {} // dropped under the storm (lowest priority)
+                _ => entry.0.push(base.clone()), // critical (default): keep ALL, exact count
+            }
+        }
+    }
+    for (wid, (critical, visual)) in per_worker {
+        for c in critical {
+            emit(state, &wid, c);
+        }
+        for (_, (mut rep, count)) in visual.into_iter().take(max_visual) {
+            rep["count"] = json!(count); // one per key, carrying how many coalesced
+            emit(state, &wid, rep);
+        }
+    }
+}
+
+fn quantize_f64(v: f64, grid: f64) -> f64 {
+    if grid <= 0.0 {
+        v
+    } else {
+        (v / grid).round() * grid
+    }
+}
+
+fn quantize_array(value: &Value, grid: f64) -> Value {
+    match value.as_array() {
+        Some(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    item.as_f64()
+                        .map(|v| json!(quantize_f64(v, grid)))
+                        .unwrap_or_else(|| item.clone())
+                })
+                .collect(),
+        ),
+        None => value.clone(),
+    }
+}
+
+fn coarsen_component_value(comp: &str, value: &Value, grid: f64) -> Value {
+    if grid <= 0.0 {
+        return value.clone();
+    }
+    if comp == "pos" || comp == "vel" {
+        return quantize_array(value, grid);
+    }
+    if comp == "physics" {
+        if let Some(obj) = value.as_object() {
+            let mut out = obj.clone();
+            for key in ["pos", "vel", "lin", "ang"] {
+                if let Some(v) = out.get(key).cloned() {
+                    out.insert(key.to_string(), quantize_array(&v, grid));
+                }
+            }
+            return Value::Object(out);
+        }
+    }
+    value.clone()
+}
+
+fn fidelity_update_for_worker(
+    state: &mut ServerState,
+    wid: &str,
+    eid: &str,
+    comp: &str,
+    value: &Value,
+) -> Option<(Value, bool)> {
+    let pos = state.entities.get(eid)?.pos;
+    let w = state.workers.get_mut(wid)?;
+    if w.full_fidelity_for(pos) {
+        return Some((value.clone(), false));
+    }
+
+    let rate = w.fidelity_coarse_rate.max(1);
+    let key = format!("{eid}:{comp}");
+    let seq = w.fidelity_seq.entry(key).or_insert(0);
+    *seq += 1;
+    if rate > 1 && (*seq - 1) % rate != 0 {
+        return None;
+    }
+
+    Some((
+        coarsen_component_value(comp, value, w.fidelity_coarse_grid),
+        true,
+    ))
+}
+
+fn send_full(state: &mut ServerState, wid: &str, eid: &str) {
+    let (pos, vel, comps) = match state.entities.get(eid) {
+        Some(e) => (e.pos, e.vel, e.components.clone()),
+        None => return,
+    };
+    emit(
+        state,
+        wid,
+        json!({"op":"CriticalSection","phase":"begin","entity":eid}),
+    );
+    emit(state, wid, json!({"op":"AddEntity","entity":eid}));
+    emit(
+        state,
+        wid,
+        json!({"op":"ComponentUpdate","entity":eid,"comp":"pos","value":[pos[0],pos[1]]}),
+    );
+    emit(
+        state,
+        wid,
+        json!({"op":"ComponentUpdate","entity":eid,"comp":"vel","value":[vel[0],vel[1]]}),
+    );
+    for (k, val) in comps.iter() {
+        emit(
+            state,
+            wid,
+            json!({"op":"ComponentUpdate","entity":eid,"comp":k,"value":val}),
+        );
+    }
+    emit(
+        state,
+        wid,
+        json!({"op":"CriticalSection","phase":"end","entity":eid}),
+    );
+    if let Some(w) = state.workers.get_mut(wid) {
+        w.view.insert(eid.to_string());
+    }
+    grant_client_authority(state, wid, eid);
+}
+
+fn grant_client_authority(state: &mut ServerState, wid: &str, eid: &str) {
+    // on checkout, grant `wid` client-authority over each comp the entity's ACL client-writes to one
+    // of its attributes -- emit AuthorityChange(true) so the client learns it owns its avatar's comp.
+    let grants: Vec<String> = match state.entities.get(eid) {
+        Some(e) => match e
+            .components
+            .get("acl")
+            .and_then(|a| a.get("client_write"))
+            .and_then(|m| m.as_object())
+        {
+            Some(cw) => {
+                let attrs = state
+                    .workers
+                    .get(wid)
+                    .map(|w| w.attributes.clone())
+                    .unwrap_or_default();
+                cw.iter()
+                    .filter(|(_, v)| v.as_str().map(|a| attrs.contains(a)).unwrap_or(false))
+                    .map(|(comp, _)| comp.clone())
+                    .collect()
+            }
+            None => vec![],
+        },
+        None => vec![],
+    };
+    for comp in grants {
+        grant_authority(state, wid, eid, &comp);
+    }
+}
+
+fn checkout_all(state: &mut ServerState, wid: &str) {
+    let eids: Vec<String> = state.entities.keys().cloned().collect();
+    for eid in eids {
+        let (pos, region) = {
+            let e = &state.entities[&eid];
+            (e.pos, e.region.clone())
+        };
+        let interested = match (state.workers.get(wid), state.entities.get(&eid)) {
+            (Some(w), Some(e)) => visible(w, e),
+            _ => false,
+        };
+        let _ = pos;
+        if interested {
+            send_full(state, wid, &eid);
+            let _ = region;
+            grant_region_physics_island_authority(state, wid, &eid);
+        }
+    }
+}
+
+fn renew(state: &mut ServerState, wid: &str) {
+    let until = Instant::now() + Duration::from_secs_f64(state.lease_ttl);
+    let regions: Vec<String> = state
+        .region_worker
+        .iter()
+        .filter(|(_, owner)| owner.as_str() == wid)
+        .map(|(r, _)| r.clone())
+        .collect();
+    for r in regions {
+        state.region_expires.insert(r, until);
+    }
+}
+
+fn spawn_in_region(
+    state: &mut ServerState,
+    eid: &str,
+    pos: [f64; 2],
+    vel: [f64; 2],
+    comps: Map<String, Value>,
+    requested_region: Option<&str>,
+    authority_epoch: Option<u64>,
+    authority_snapshot: Option<Value>,
+) {
+    if state.deleted_entities.contains(eid) {
+        return;
+    }
+    let region = match state.grid2d {
+        // D1: 2D-grid mode derives the cell from (x,y); single-broker so requested_region is moot here
+        Some((c, r, cw, ch)) => region_2d(pos, c, r, cw, ch),
+        None => spawn_region(pos, requested_region, &state.boundaries, &state.splits),
+    };
+    let epoch = authority_epoch.unwrap_or(1);
+    state.entities.insert(
+        eid.to_string(),
+        Entity {
+            pos,
+            vel,
+            authority: initial_authority_map(&comps, epoch),
+            components: comps.clone(),
+            region: region.clone(),
+            version: 1,
+            last_broadcast_cell: Some(interest_cell_of(pos)),
+        },
+    );
+    if let (Some(e), Some(snapshot)) = (state.entities.get_mut(eid), authority_snapshot.as_ref()) {
+        apply_authority_snapshot(e, snapshot);
+    }
+    let authority = state
+        .entities
+        .get(eid)
+        .map(|e| authority_to_json(&e.authority))
+        .unwrap_or_else(|| json!({}));
+    // #2 WAL-THEN-PUBLISH: persist the spawn BEFORE announcing the entity. If the WAL append fails (disk full /
+    // fail-closed) the entity did NOT durably persist -> roll the in-memory insert back and do NOT publish it,
+    // so a CreateEntity that didn't survive is never broadcast to observers (it would vanish on restart).
+    if state
+        .wal_append(&json!({
+            "kind":"register","entity":eid,"version":1,"authority_epoch":epoch,
+            "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
+            "components":Value::Object(comps),"region":region,"authority":authority
+        }))
+        .is_err()
+    {
+        state.entities.remove(eid); // not persisted -> not live; never announce it
+        return;
+    }
+    let wids: Vec<String> = state.workers.keys().cloned().collect();
+    for wid in wids {
+        let interested = match state.entities.get(eid) {
+            Some(e) => visible(&state.workers[&wid], e),
+            None => false,
+        };
+        if interested {
+            send_full(state, &wid, eid);
+            let _ = &region;
+            grant_region_physics_island_authority(state, &wid, eid);
+        }
+    }
+}
+
+// CROSS-BROKER MESH: hand an entity across the PROCESS seam to the neighbour broker owning `target`.
+fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
+    let (pos, vel, comps, authority_epoch, authority) = match state.entities.get(eid) {
+        Some(e) => {
+            let mut authority = e.authority.clone();
+            let comps_to_move = physics_island_component_names(&e.components, &authority);
+            let authority_epoch = comps_to_move
+                .iter()
+                .map(|comp| component_authority_epoch(e, comp))
+                .max()
+                .unwrap_or_else(|| component_authority_epoch(e, "pos"))
+                .saturating_add(1);
+            for comp in comps_to_move {
+                let mode = authority
+                    .get(&comp)
+                    .map(|ca| ca.mode.clone())
+                    .unwrap_or_else(|| default_authority_mode(&e.components, &comp));
+                if mode == AuthorityMode::ServerPhysicsIsland {
+                    authority
+                        .entry(comp.clone())
+                        .and_modify(|ca| {
+                            ca.epoch = authority_epoch;
+                            ca.owner = None;
+                        })
+                        .or_insert(ComponentAuthority {
+                            owner: None,
+                            epoch: authority_epoch,
+                            mode: AuthorityMode::ServerPhysicsIsland,
+                        });
+                }
+            }
+            (
+                e.pos,
+                e.vel,
+                e.components.clone(),
+                authority_epoch,
+                authority_to_json(&authority),
+            )
+        }
+        None => return,
+    };
+    // L6 SELF-FENCE: if a NEWER incarnation has taken over the region I own (the registry shows my_region at
+    // a strictly higher lease_epoch held by a different addr), I am the STALE owner -- do NOT keep emitting
+    // ownership traffic. Hold the entity local + park-and-refuse rather than push a stale handoff the peer
+    // would (rightly) reject. This is the sender-side half of the fence; the receiver-side reject is the
+    // authoritative one. ADDITIVE: superseded_regions is empty unless the registry actually superseded me.
+    if !state.my_region.is_empty() && state.superseded_regions.contains(&state.my_region) {
+        eprintln!(
+            "[fence] SELF-FENCED: region '{}' superseded by a higher lease_epoch -- holding {eid} local, NOT forwarding (stale incarnation)",
+            state.my_region
+        );
+        return;
+    }
+    // carry velocity across the process seam too -- adopting with [0,0] stalls the body at the boundary
+    // then re-accelerates (discontinuous cross-broker flight). pos+vel both ride. Build the frame ONCE so
+    // a dropped send can be re-tried verbatim until the neighbour ACKs. `target` rides too so the receiver
+    // lands the entity in the right one of ITS regions (N-neighbour, not just an east seam).
+    // L6 lease fence: stamp the SENDER's owned region + the lease_epoch it holds for it, so the receiver can
+    // fence a stale incarnation (a returned-from-partition old owner carries its OLD, lower epoch).
+    let src_region = state.my_region.clone();
+    let src_lease_epoch = state.region_lease_epoch.get(&src_region).copied();
+    let handoff = json!({"op":"MeshHandoff","entity":eid,"target":target,
+        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
+        "authority_epoch":authority_epoch,
+        "authority":authority.clone(),
+        "src_region":src_region,
+        "lease_epoch":src_lease_epoch,
+        "components":Value::Object(comps)});
+    let delivered = match state.mesh.get(target) {
+        Some(tx) => tx.send(frame(&handoff)).is_ok(),
+        None => false,
+    };
+    if !delivered {
+        // the link is down RIGHT NOW -- keep the entity LOCAL (do not park+remove into a dead seam). A
+        // stalled body at the boundary beats a vanished one; the next move re-handoffs when the link returns.
+        eprintln!("[mesh] link to {target} down -- keeping {eid} local (not vanishing it into a dead seam)");
+        return;
+    }
+    // WAL the cross-seam departure after a live link accepted the handoff frame. Recovery treats this as
+    // the source-side linearization point: source must not resurrect the entity if it crashes before MeshAck.
+    // G2.1d: mesh_out_full -- carry the COMPLETE handoff payload (incl. components) so a restore that cuts
+    // through an in-flight handoff can recreate pending_mesh from the WAL and resend it (the resolver).
+    let _ = state.wal_append(&json!({"kind":"mesh_out","entity":eid,"target":target,
+        "authority_epoch":authority_epoch,"authority":authority,
+        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
+        "components":handoff.get("components").cloned().unwrap_or(Value::Null)}));
+    // CROSS-BROKER handoff counted HERE -- the delivered-departure linearization point (a live link accepted
+    // the frame + the mesh_out is WAL'd). The mirror of `handoffs += 1` in the LOCAL handoff() path, but a
+    // DISTINCT metric so the Inspector sees same-broker vs cross-server handoffs separately. Counted on the
+    // SENDING broker (the one initiating the authority transfer across the seam); a dropped/re-sent frame goes
+    // through resend_pending_mesh (a different path), so this fires exactly once per logical cross-broker move.
+    state.metrics.mesh_handoffs += 1;
+    // park it pending the neighbour's MeshAck, THEN remove from the local set -- the entity is never in
+    // NEITHER place (the old path removed it before any confirmation, so a dropped handoff vanished it).
+    state.pending_mesh.insert(
+        eid.to_string(),
+        (handoff, Instant::now(), target.to_string()),
+    );
+    state.entities.remove(eid);
+    let wids: Vec<String> = state.workers.keys().cloned().collect();
+    for wid in wids {
+        if state.workers[&wid].view.contains(eid) {
+            emit(state, &wid, json!({"op":"RemoveEntity","entity":eid}));
+            if let Some(w) = state.workers.get_mut(&wid) {
+                w.view.remove(eid);
+            }
+        }
+    }
+    eprintln!("[mesh] forwarded {eid} -> {target} (pending the neighbour's MeshAck, re-sent until confirmed)");
+}
+
+// B1: re-send any cross-broker handoff the neighbour hasn't ACK'd yet (a dropped MeshHandoff OR a dropped
+// MeshAck). The receive is idempotent (re-sends are re-ACK'd, never double-adopted); entries clear on
+// MeshAck. Only re-send entries older than the ACK round-trip so the happy path doesn't double-send.
+fn resend_pending_mesh(state: &mut ServerState) {
+    if state.pending_mesh.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let stale: Vec<(Value, String)> = state
+        .pending_mesh
+        .values()
+        .filter(|(_, t, _)| now.duration_since(*t) > Duration::from_secs(1))
+        .map(|(fr, _, tgt)| (fr.clone(), tgt.clone()))
+        .collect();
+    for (fr, tgt) in &stale {
+        if let Some(tx) = state.mesh.get(tgt) {
+            let _ = tx.send(frame(fr));
+        }
+    }
+}
+
+// ── CROSS-BROKER SEAM-INTEREST: push this broker's near-seam entities to the meshed neighbour as GHOSTS ──
+// A ghost is a READ-ONLY mirror so the neighbour's worker can SEE + TARGET across the seam without anything
+// crossing. For each LOCAL entity (one this broker owns, i.e. in `entities`) that sits within `interest_band`
+// of a boundary which separates its strip from a NEIGHBOUR strip we MESH to, send a `MeshGhost` frame over the
+// existing mesh channel to that neighbour. The neighbour stores it in `ghosts` (NOT `entities`) -> structurally
+// non-authoritative. Authority NEVER leaves this broker: we keep simulating + owning the entity; the ghost is a
+// projection. A ghost that LEAVES the band (or whose source disappears) is reaped by the receiver's TTL.
+//
+// Cost is bounded to the band, not the world: only entities within `interest_band` of a meshed seam are pushed,
+// and only on the monitor tick (300ms) -- a fine ghost-refresh rate (the actual cross-seam DAMAGE is the S3
+// projectile path, which is realtime; the ghost only needs to keep the AIM-point fresh). GW_INTEREST_BAND=0
+// (default) short-circuits the whole pass -> zero work + zero wire for every gate that doesn't opt in.
+fn push_border_ghosts(state: &mut ServerState) {
+    if state.interest_band <= 0.0 || state.mesh.is_empty() || state.entities.is_empty() {
+        return;
+    }
+    let band = state.interest_band;
+    let bounds = state.boundaries.clone();
+    state.ghost_seq = state.ghost_seq.wrapping_add(1);
+    // Group the frames to send by TARGET neighbour region, so we serialize each entity once per neighbour it
+    // borders (an entity near a seam borders exactly one neighbour strip on that side).
+    let mut to_send: Vec<(String, Value)> = Vec::new(); // (target_region, MeshGhost frame)
+    for (eid, e) in state.entities.iter() {
+        // Only project PERSISTENT entities (units/buildings/etc.) as ghosts -- a PROJECTILE is transient and
+        // crosses via the proven MeshHandoff path when it actually enters the neighbour zone; ghosting it would
+        // be churn + a confusing "enemy" for a targeter. (A wreck/economy is likewise not a target.) Everything
+        // else IS projected so the neighbour can see + target it across the seam.
+        match e.components.get("kind").and_then(|v| v.as_str()) {
+            Some("projectile") | Some("wreck") | Some("economy") => continue,
+            _ => {}
+        }
+        // Only POSITION-SHARDED strip entities have a meaningful seam; a NAMED region (planet/portal) has no
+        // 1D-strip neighbour to push along (its "seam" is a portal, handled by Fold, not border-interest).
+        let cur_coarse = coarse_region(&e.region);
+        let cur_idx = match strip_index_of_name(cur_coarse, &bounds) {
+            Some(i) => i,
+            None => continue,
+        };
+        let x = e.pos[0];
+        // Each strip i has up to two seams: its UPPER edge bounds[i] (neighbour strip i+1) and its LOWER edge
+        // bounds[i-1] (neighbour strip i-1). Push to whichever neighbour seam the entity is within `band` of AND
+        // which this broker actually meshes to (a remote zone).
+        // UPPER seam -> neighbour strip i+1
+        if cur_idx < bounds.len() && (bounds[cur_idx] - x).abs() <= band {
+            let nbr = strip_name(cur_idx + 1, &bounds);
+            if state.mesh_regions.contains(&nbr) && !state.region_worker.contains_key(&nbr) {
+                to_send.push((nbr, ghost_frame(eid, e, &state.my_region)));
+            }
+        }
+        // LOWER seam -> neighbour strip i-1
+        if cur_idx > 0 && (x - bounds[cur_idx - 1]).abs() <= band {
+            let nbr = strip_name(cur_idx - 1, &bounds);
+            if state.mesh_regions.contains(&nbr) && !state.region_worker.contains_key(&nbr) {
+                to_send.push((nbr, ghost_frame(eid, e, &state.my_region)));
+            }
+        }
+    }
+    for (target, fr) in to_send {
+        if let Some(tx) = state.mesh.get(&target) {
+            let _ = tx.send(frame(&fr));
+        }
+    }
+}
+
+// Build a MeshGhost frame: the read-only projection of a local entity (pos/vel/components + the owning region).
+fn ghost_frame(eid: &str, e: &Entity, owner_region: &str) -> Value {
+    json!({"op":"MeshGhost","entity":eid,
+        "pos":[e.pos[0],e.pos[1]],"vel":[e.vel[0],e.vel[1]],
+        "components":Value::Object(e.components.clone()),
+        "owner_region":owner_region})
+}
+
+// ── reap ghosts whose source stopped refreshing them (left the band, or the source broker went away) ──
+// A ghost is refreshed every monitor tick while its source entity stays in the band. If it isn't refreshed
+// within GHOST_TTL the source has moved out of the band (or crossed -- in which case the REAL entity arrives
+// via MeshHandoff and the worker adopts it) or the link dropped; either way the stale ghost is removed and a
+// RemoveEntity-style notice goes to the workers viewing it so no stale enemy lingers on screen / as a target.
+const GHOST_TTL: Duration = Duration::from_millis(1500);
+fn reap_stale_ghosts(state: &mut ServerState) {
+    if state.ghosts.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let stale: Vec<String> = state
+        .ghosts
+        .iter()
+        .filter(|(_, g)| now.duration_since(g.last_seen) > GHOST_TTL)
+        .map(|(eid, _)| eid.clone())
+        .collect();
+    for eid in stale {
+        remove_ghost(state, &eid);
+    }
+}
+
+// Remove a ghost + tell every worker viewing it to drop it (RemoveEntity). Used by the TTL reaper and by an
+// explicit MeshGhostRemove from the source (the source can proactively retract a ghost on the entity's delete).
+fn remove_ghost(state: &mut ServerState, eid: &str) {
+    if state.ghosts.remove(eid).is_none() {
+        return;
+    }
+    let wids: Vec<String> = state.workers.keys().cloned().collect();
+    for wid in wids {
+        if state.workers[&wid].view.contains(eid) {
+            emit(state, &wid, json!({"op":"RemoveEntity","entity":eid}));
+            if let Some(w) = state.workers.get_mut(&wid) {
+                w.view.remove(eid);
+            }
+        }
+    }
+}
+
+// Is this worker interested in a ghost at `pos`? (the ghost analogue of `visible` -- ghosts carry no ACL, so
+// it's just the geometric AOI test). A worker with an AOI covering the seam band sees the neighbour's ghosts.
+fn ghost_visible(w: &WorkerHandle, g: &GhostEntity) -> bool {
+    w.interested_in(g.pos)
+}
+
+// Push a ghost's current state to the interested workers as the SAME AddEntity/ComponentUpdate stream a real
+// entity uses -- so the worker + observer render/track it with NO new client op (a ghost looks like any other
+// viewed entity on the wire; it just never carries an AuthorityChange(true), so the worker never tries to own
+// it). The `ghost:true` component + `owner_region` let a client that cares distinguish it (the observer can
+// tint it); a client that doesn't care just sees an entity it can aim at. Sends only the DELTA-relevant comps.
+fn propagate_ghost(state: &mut ServerState, eid: &str, first_time: bool) {
+    let (pos, vel, comps, owner_region) = match state.ghosts.get(eid) {
+        Some(g) => (g.pos, g.vel, g.components.clone(), g.owner_region.clone()),
+        None => return,
+    };
+    let wids: Vec<String> = state.workers.keys().cloned().collect();
+    for wid in wids {
+        let inside = match state.ghosts.get(eid) {
+            Some(g) => ghost_visible(&state.workers[&wid], g),
+            None => false,
+        };
+        let has = state.workers[&wid].view.contains(eid);
+        if inside && !has {
+            // first appearance to THIS worker: the full checkout stream (so it renders + becomes targetable).
+            emit(state, &wid, json!({"op":"CriticalSection","phase":"begin","entity":eid}));
+            emit(state, &wid, json!({"op":"AddEntity","entity":eid}));
+            // The read-only marker goes FIRST (right after AddEntity), BEFORE the components -- so the receiver
+            // migrates the entity into its read-only ghost store before any `kind` arrives. Otherwise a ghost of
+            // a PROJECTILE would have its `kind:projectile` mistaken for a local adopt + promoted to a real
+            // shell. A ghost NEVER gets an AuthorityChange(true) (the worker's adopt path keys on that), so it
+            // is held read-only forever -- exactly the intent. `owner_region` rides alongside (the zone that
+            // holds authority over it) so a client can label the cross-seam mirror.
+            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"ghost","value":true}));
+            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"owner_region","value":owner_region}));
+            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"pos","value":[pos[0],pos[1]]}));
+            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"vel","value":[vel[0],vel[1]]}));
+            for (k, val) in comps.iter() {
+                emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":k,"value":val}));
+            }
+            emit(state, &wid, json!({"op":"CriticalSection","phase":"end","entity":eid}));
+            if let Some(w) = state.workers.get_mut(&wid) {
+                w.view.insert(eid.to_string());
+            }
+        } else if !inside && has {
+            emit(state, &wid, json!({"op":"RemoveEntity","entity":eid}));
+            if let Some(w) = state.workers.get_mut(&wid) {
+                w.view.remove(eid);
+            }
+        } else if inside && !first_time {
+            // a refresh: just the moving fields (pos/vel) -> keep the aim-point + render fresh.
+            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"pos","value":[pos[0],pos[1]]}));
+            emit(state, &wid, json!({"op":"ComponentUpdate","entity":eid,"comp":"vel","value":[vel[0],vel[1]]}));
+        }
+    }
+}
+
+fn gc_threshold_timeouts(state: &mut ServerState) {
+    let ttl_ms = state.threshold_ttl.as_millis() as u64;
+    if ttl_ms == 0 {
+        return;
+    }
+    let now = now_millis();
+    let stale: Vec<(String, String, Value, Value)> = state
+        .entities
+        .iter()
+        .filter_map(|(eid, e)| {
+            let tx = e.components.get("threshold.tx")?;
+            let phase = tx.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+            if !matches!(phase, "prepare" | "preload_ready") {
+                return None;
+            }
+            let ts = tx.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(now);
+            if now.saturating_sub(ts) < ttl_ms {
+                return None;
+            }
+            Some((
+                eid.clone(),
+                tx.get("tx_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                tx.get("from").cloned().unwrap_or(Value::Null),
+                tx.get("to").cloned().unwrap_or(Value::Null),
+            ))
+        })
+        .collect();
+
+    for (eid, tx_id, from, to) in stale {
+        let version = if let Some(e) = state.entities.get_mut(&eid) {
+            if e.components.remove("threshold.tx").is_none() {
+                continue;
+            }
+            e.version += 1;
+            e.version
+        } else {
+            continue;
+        };
+        let _ = state.wal_append(&json!({
+            "kind":"threshold_abort","entity":&eid,"version":version,
+            "writer":"threshold-gc","tx_id":tx_id,"from":from,"to":to,
+            "reason":"preload timeout"
+        }));
+        let wids: Vec<String> = state.workers.keys().cloned().collect();
+        for wid in wids {
+            if state.workers[&wid].view.contains(&eid) {
+                emit(
+                    state,
+                    &wid,
+                    json!({"op":"RemoveComponent","entity":eid,"comp":"threshold.tx"}),
+                );
+            }
+        }
+    }
+}
+
+fn handoff(state: &mut ServerState, eid: &str, old: &str, new: &str) {
+    // if `new` is a REMOTE zone on a NEIGHBOUR BROKER (no local worker + a configured mesh link), forward
+    // across the process seam to that broker (N-neighbour: ANY meshed region, not just an east seam).
+    if state.mesh_regions.contains(new) && !state.region_worker.contains_key(new) {
+        mesh_forward(state, eid, new); // keeps the entity LOCAL if the link is momentarily down -> the next move retries
+        return;
+    }
+    let old_wid = state.region_worker.get(old).cloned();
+    let new_wid = state.region_worker.get(new).cloned();
+    let (ver, authority_epoch, x, moved_comps, authority) =
+        if let Some(e) = state.entities.get_mut(eid) {
+            e.region = new.to_string();
+            e.version += 1;
+            let (authority_epoch, moved_comps) =
+                advance_physics_island_authority(e, old_wid.as_deref(), new_wid.as_deref());
+            (
+                e.version,
+                authority_epoch,
+                e.pos[0],
+                moved_comps,
+                authority_to_json(&e.authority),
+            )
+        } else {
+            return;
+        };
+    state.metrics.handoffs += 1;
+    let _ = state.wal_append(&json!({
+        "kind":"transfer","entity":eid,"version":ver,
+        "authority_epoch":authority_epoch,"authority":authority,
+        "components":moved_comps.clone(),"from":old,"to":new,"x":x
+    }));
+    if let Some(ow) = old_wid {
+        if state.workers.contains_key(&ow) {
+            for comp in &moved_comps {
+                revoke_authority(state, &ow, eid, comp);
+            }
+        }
+    }
+    if let Some(nw) = new_wid {
+        if state.workers.contains_key(&nw) {
+            if !state.workers[&nw].view.contains(eid) {
+                send_full(state, &nw, eid);
+            }
+            for comp in &moved_comps {
+                grant_authority(state, &nw, eid, comp);
+            }
+        }
+    }
+    // ── ASSEMBLY handoff: an entity's children (components["parent"] == eid) migrate WITH the root as
+    // ONE atomic unit -- same new region, this same lock-held dispatch -- so a multi-part ship/vehicle
+    // never tears across a seam. Recurses for nested assemblies; children never self-zone (pos handler).
+    let children: Vec<String> = state
+        .entities
+        .iter()
+        .filter(|(cid, e)| {
+            cid.as_str() != eid && e.components.get("parent").and_then(|p| p.as_str()) == Some(eid)
+        })
+        .map(|(cid, _)| cid.clone())
+        .collect();
+    for child in children {
+        if let Some(co) = state.entities.get(&child).map(|e| e.region.clone()) {
+            if co != new {
+                handoff(state, &child, &co, new);
+            }
+        }
+    }
+}
+
+// ── C2: pre-handoff AUTHORITY_LOSS_IMMINENT (the overlay's I:<target>) ──
+// In the hysteresis overlap band the entity is approaching the next strip but region_after still returns
+// `current` (no commit yet). Warn the current owner so the overlay can show I:<target>. N-zone: the entity
+// may be approaching EITHER the upper-edge (-> the next strip up) or the lower-edge (-> the strip down) of
+// its current strip; report whichever edge it has entered (within H but before the +/-H commit).
+fn seam_intent_target(x: f64, current: &str, bounds: &[f64]) -> Option<String> {
+    let cur_idx = strip_index_of_name(coarse_region(current), bounds)?;
+    // entered the UPPER-edge band [bounds[cur_idx], bounds[cur_idx]+H) -> intends the next strip up
+    if cur_idx < bounds.len() && x >= bounds[cur_idx] && x < bounds[cur_idx] + H {
+        return Some(strip_name(cur_idx + 1, bounds));
+    }
+    // entered the LOWER-edge band (bounds[cur_idx-1]-H, bounds[cur_idx-1]) -> intends the strip down
+    if cur_idx > 0 && x < bounds[cur_idx - 1] && x > bounds[cur_idx - 1] - H {
+        return Some(strip_name(cur_idx - 1, bounds));
+    }
+    None
+}
+
+fn handoff_intent_to_json(i: &HandoffIntent) -> Value {
+    json!({
+        "source": i.source_worker, "target": i.target_worker,
+        "source_region": i.source_region, "target_region": i.target_region,
+        "epoch": i.epoch, "state": "AUTHORITY_LOSS_IMMINENT"
+    })
+}
+
+// Emit LOSS_IMMINENT to the current owner, once per (entity,target,epoch); dedup via pending_handoff_intent.
+fn maybe_emit_loss_imminent(state: &mut ServerState, eid: &str, source_region: &str, target_region: &str) {
+    let source_worker = match state.entities.get(eid).and_then(|e| component_authority_owner(e, "pos")) {
+        Some(w) => w,
+        None => return,
+    };
+    let target_worker = match state.region_worker.get(target_region).cloned() {
+        Some(w) => w,
+        None => return,
+    };
+    let epoch = state.entities.get(eid).map(|e| component_authority_epoch(e, "pos")).unwrap_or(0);
+    let already = state
+        .pending_handoff_intent
+        .get(eid)
+        .map(|i| i.target_region == target_region && i.epoch == epoch)
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+    state.pending_handoff_intent.insert(
+        eid.to_string(),
+        HandoffIntent {
+            source_region: source_region.to_string(),
+            target_region: target_region.to_string(),
+            source_worker: source_worker.clone(),
+            target_worker: target_worker.clone(),
+            epoch,
+        },
+    );
+    emit(
+        state,
+        &source_worker,
+        json!({
+            "op": "AuthorityChange", "entity": eid, "comp": "pos",
+            "authoritative": true, "state": "AUTHORITY_LOSS_IMMINENT",
+            "authority_epoch": epoch, "mode": "threshold_overlap",
+            "handoff_target": target_worker, "handoff_target_region": target_region
+        }),
+    );
+}
+
+// Interest spatial hash: a fixed-cell grid mapping cell -> the AOI-workers whose interest covers it.
+// propagate() looks up an updated entity's cell and fans out only to those workers (broadphase) + the exact
+// interested_in() narrowphase -- bounding the O(entities × viewers) broadcast for spread-out viewers.
+const INTEREST_CELL: f64 = 4.0;
+
+#[allow(dead_code)] // Interest: used by the propagate-prune (next sub-step); the grid is maintained now
+fn interest_cell_of(pos: [f64; 2]) -> (i64, i64) {
+    (
+        (pos[0] / INTEREST_CELL).floor() as i64,
+        (pos[1] / INTEREST_CELL).floor() as i64,
+    )
+}
+
+// the cells a worker's AOI (center, radius) bounding-box overlaps -- a SUPERSET of the circle (the exact
+// circle test is the narrowphase), so the grid never misses a genuinely-interested worker. An AOI too large
+// to index (> MAX_GRID_CELLS) returns empty -> the caller treats the worker as global (always checked).
+fn interest_cells_for(center: [f64; 2], radius: f64) -> Vec<(i64, i64)> {
+    const MAX_GRID_CELLS: i64 = 256;
+    let x0 = ((center[0] - radius) / INTEREST_CELL).floor() as i64;
+    let x1 = ((center[0] + radius) / INTEREST_CELL).floor() as i64;
+    let y0 = ((center[1] - radius) / INTEREST_CELL).floor() as i64;
+    let y1 = ((center[1] + radius) / INTEREST_CELL).floor() as i64;
+    if (x1 - x0 + 1).saturating_mul(y1 - y0 + 1) > MAX_GRID_CELLS {
+        return Vec::new();
+    }
+    let mut cells = Vec::new();
+    let mut cx = x0;
+    while cx <= x1 {
+        let mut cy = y0;
+        while cy <= y1 {
+            cells.push((cx, cy));
+            cy += 1;
+        }
+        cx += 1;
+    }
+    cells
+}
+
+fn remove_from_interest_grid(state: &mut ServerState, wid: &str) {
+    state.global_workers.remove(wid);
+    let old: Vec<(i64, i64)> = match state.workers.get_mut(wid) {
+        Some(w) => std::mem::take(&mut w.grid_cells),
+        None => return,
+    };
+    for cell in old {
+        if let Some(set) = state.interest_grid.get_mut(&cell) {
+            set.remove(wid);
+            if set.is_empty() {
+                state.interest_grid.remove(&cell);
+            }
+        }
+    }
+}
+
+// recompute a worker's grid cells from its current AOI. A worker with no aoi_center (region/global holder:
+// W/E/OBS) OR an AOI too large to index lands in global_workers (propagate always checks it); otherwise it
+// is indexed in interest_grid. Called on connect (default -> global) and on each Interest op.
+fn update_interest_grid(state: &mut ServerState, wid: &str) {
+    remove_from_interest_grid(state, wid);
+    let cells = match state.workers.get(wid) {
+        Some(w) => match (w.aoi_center, w.aoi_radius) {
+            (Some(c), Some(r)) => interest_cells_for(c, r),
+            _ => Vec::new(),
+        },
+        None => return,
+    };
+    if cells.is_empty() {
+        state.global_workers.insert(wid.to_string());
+    } else {
+        for cell in &cells {
+            state
+                .interest_grid
+                .entry(*cell)
+                .or_default()
+                .insert(wid.to_string());
+        }
+    }
+    if let Some(w) = state.workers.get_mut(wid) {
+        w.grid_cells = cells;
+    }
+}
+
+fn propagate(state: &mut ServerState, eid: &str, comp: &str, value: &Value) {
+    let (pos, last_cell) = match state.entities.get(eid) {
+        Some(e) => (e.pos, e.last_broadcast_cell),
+        None => return,
+    };
+    // Interest broadphase: the AOI-workers whose grid cell covers this entity's pos, PLUS the cell it occupied
+    // at the last broadcast (so a viewer it just LEFT still gets the RemoveEntity -- no stale ghost), PLUS the
+    // global (no-AOI / too-large) workers. interested_in() below is the exact narrowphase (a superset is OK).
+    let cell = interest_cell_of(pos);
+    let mut wid_set: HashSet<String> = state.global_workers.clone();
+    if let Some(set) = state.interest_grid.get(&cell) {
+        wid_set.extend(set.iter().cloned());
+    }
+    if let Some(lc) = last_cell {
+        if lc != cell {
+            if let Some(set) = state.interest_grid.get(&lc) {
+                wid_set.extend(set.iter().cloned());
+            }
+        }
+    }
+    let wids: Vec<String> = wid_set.into_iter().collect();
+    for wid in wids {
+        let inside = match state.entities.get(eid) {
+            Some(e) => visible(&state.workers[&wid], e),
+            None => false,
+        };
+        let has = state.workers[&wid].view.contains(eid);
+        if inside && !has {
+            send_full(state, &wid, eid);
+        } else if !inside && has {
+            emit(state, &wid, json!({"op":"RemoveEntity","entity":eid}));
+            if let Some(w) = state.workers.get_mut(&wid) {
+                w.view.remove(eid);
+            }
+        } else if inside {
+            if let Some((out_value, coarse)) =
+                fidelity_update_for_worker(state, &wid, eid, comp, value)
+            {
+                let mut msg =
+                    json!({"op":"ComponentUpdate","entity":eid,"comp":comp,"value":out_value});
+                if coarse {
+                    msg["fidelity"] = json!("coarse");
+                }
+                emit(state, &wid, msg);
+            }
+        }
+    }
+    if let Some(e) = state.entities.get_mut(eid) {
+        e.last_broadcast_cell = Some(cell); // remember the cell so the next move notifies the viewers it leaves
+    }
+}
+
+// ── failover monitor (== the reference server check_leases): reclaim a lapsed region to a STANDBY ──
+// dynamic LOAD-BASED load balancing: shift the partition boundary toward the heavier
+// region-worker and shed the entities that flip across the new split via the handoff.
+// Hardening #1 Step 0: record the monitor-tick lock-hold by path -> the InspectorFrame exposes max + path,
+// so the zone-split freeze is MEASURED (expect 50-100ms under load) before the budgeted-rebalance fix.
+fn record_lock_hold(state: &mut ServerState, path: &str, dur: std::time::Duration) {
+    let ms = dur.as_secs_f64() * 1000.0;
+    state.lock_last_hold_ms = ms;
+    if ms > state.lock_max_hold_ms {
+        state.lock_max_hold_ms = ms;
+        state.lock_max_hold_path = path.to_string();
+    }
+}
+
+fn rebalance(state: &mut ServerState) {
+    if state.grid2d.is_some() {
+        return; // D1: 2D-grid mode has its own block->worker rebalance (D3); the 1D W|E line-shift does not apply
+    }
+    if !state.rebalance_jobs.is_empty() {
+        return; // a budgeted migration is draining -> don't shift the boundary or pile on another O(N) pass
+    }
+    // N-ZONE: the W|E load-shift is the classic 2-fixed-worker rebalance (shed across ONE line between W & E).
+    // It does not generalize to an N-strip topology (>1 cut, Z<i> workers) -> leave the strip cuts FIXED there
+    // (a multi-strip deployment rebalances by adding/moving zone-servers, not by sliding one of N interior lines
+    // -- which would silently desync boundaries[i]). Only the 1-boundary W|E topology slides its single line.
+    if state.boundaries.len() != 1 {
+        return;
+    }
+    let (threshold, step, lo, hi) = (0.25f64, 0.5f64, -7.0f64, 7.0f64);
+    let w_load = state
+        .region_worker
+        .get("W")
+        .and_then(|w| state.worker_load.get(w))
+        .copied()
+        .unwrap_or(0.0);
+    let e_load = state
+        .region_worker
+        .get("E")
+        .and_then(|w| state.worker_load.get(w))
+        .copied()
+        .unwrap_or(0.0);
+    let imbalance = w_load - e_load;
+    if imbalance > threshold && state.boundary > lo {
+        state.boundary = (state.boundary - step).max(lo); // shrink W -> shed to E
+    } else if imbalance < -threshold && state.boundary < hi {
+        state.boundary = (state.boundary + step).min(hi); // shrink E -> shed to W
+    } else {
+        return;
+    }
+    state.boundaries[0] = state.boundary; // keep the 1-element strip list in lockstep with the slid W|E line
+    wal_partition_config(state); // R0.2: persist the new boundary BEFORE re-routing entities across it
+    // Hardening #1: ENQUEUE the crossers as a budgeted job (re-routed incrementally) instead of handing off
+    // ALL of them in this one locked pass -- the same O(N) freeze maybe_split had (Step 0: 2.3s @ 20k; the
+    // freeze MOVED here once a split set splits[region]). The drain re-routes each via movement_region_after.
+    let bounds = &state.boundaries;
+    let splits = &state.splits;
+    let crossers: Vec<String> = state
+        .entities
+        .iter()
+        .filter(|(_, e)| {
+            is_strip_region_name(&e.region, bounds)
+                && movement_region_after(e.pos[0], &e.region, bounds, splits) != e.region
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    if !crossers.is_empty() {
+        state.rebalance_jobs.push(RebalanceJob { eids: crossers, cursor: 0 });
+    }
+}
+
+// R0.2: persist the partition topology (boundary / splits / mesh_regions) so a restart restores the SAME
+// routing function -- else boundary resets to 0.0 and the router disagrees with recovered entity placement.
+fn wal_partition_config(state: &mut ServerState) {
+    state.zone_topology_rev += 1;
+    let version = state.zone_topology_rev;
+    let boundary = state.boundary;
+    let boundaries = state.boundaries.clone();
+    let splits: Map<String, Value> = state.splits.iter().map(|(r, v)| (r.clone(), json!(v))).collect();
+    let mesh: Vec<String> = state.mesh_regions.iter().cloned().collect();
+    let _ = state.wal_append(&json!({
+        "kind": "partition_config", "version": version, "boundary": boundary,
+        "boundaries": boundaries,
+        "splits": Value::Object(splits), "mesh_regions": mesh
+    }));
+}
+
+// load-SPLIT: a coarse region over SPLIT_HI with a free standby splits at its entities' median x into
+// a NEW sub-band + worker -- ADDS capacity for a crowd-in-one-spot (rebalance() only shifts the W|E
+// line between two FIXED workers; this gives the hot region a SECOND worker). First version splits each
+// coarse region at most once (subs empty); recursive/multi-level split is a later refinement.
+fn maybe_split(state: &mut ServerState) {
+    if state.grid2d.is_some() {
+        return; // D1: 2D-grid mode does not use the 1D median-x split (capacity moves via block reassignment)
+    }
+    const SPLIT_HI: f64 = 0.85;
+    if state.standbys.is_empty() || !state.rebalance_jobs.is_empty() {
+        return; // one budgeted migration at a time -> don't pile a split on an in-flight rebalance/split
+    }
+    let hot = state
+        .region_worker
+        .iter()
+        .filter(|(r, _)| {
+            !r.contains('#')
+                && state
+                    .splits
+                    .get(r.as_str())
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true)
+        })
+        .filter_map(|(r, w)| state.worker_load.get(w).map(|&l| (r.clone(), l)))
+        .filter(|(_, l)| *l > SPLIT_HI)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    let region = match hot {
+        Some((r, _)) => r,
+        None => return,
+    };
+    let mut xs: Vec<f64> = state
+        .entities
+        .values()
+        .filter(|e| e.region == region)
+        .map(|e| e.pos[0])
+        .collect();
+    if xs.len() < 2 {
+        return;
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = xs[xs.len() / 2];
+    state.splits.entry(region.clone()).or_default().push(median);
+    wal_partition_config(state); // R0.2: persist the new split BEFORE the new sub-region routing is used
+    let new_region = format!("{region}#1");
+    let new_wid = state.standbys.remove(0);
+    state
+        .region_worker
+        .insert(new_region.clone(), new_wid.clone());
+    state.region_expires.insert(
+        new_region.clone(),
+        Instant::now() + Duration::from_secs_f64(state.lease_ttl),
+    );
+    if let Some(w) = state.workers.get_mut(&new_wid) {
+        w.region = new_region.clone();
+    }
+    eprintln!("[rust-broker] SPLIT region {region} at x={median} -> {new_region} ({new_wid})");
+    let movers: Vec<String> = state
+        .entities
+        .iter()
+        .filter(|(_, e)| e.region == region && e.pos[0] >= median)
+        .map(|(k, _)| k.clone())
+        .collect();
+    // Hardening #1: ENQUEUE the movers as a budgeted-incremental job instead of handing off ALL of them in
+    // this one locked pass (Step 0 measured 2.3s @ 20k). process_rebalance_jobs drains it a small batch per
+    // monitor tick, re-routing each via movement_region_after (the split boundary is persisted above).
+    let _ = new_region; // the drain recomputes the target region per entity from the persisted split
+    state.rebalance_jobs.push(RebalanceJob { eids: movers, cursor: 0 });
+}
+
+// Hardening #1: RE-ROUTE one candidate -> compute its correct region NOW (movement_region_after with the
+// current pos/boundary/splits) and hand it off if it changed. Idempotent: if the move-path already migrated
+// it (nr == region) or it was deleted (None), this is a no-op. The single migration primitive BOTH
+// maybe_split and rebalance feed, so neither does an unbudgeted O(N) handoff loop.
+fn re_route_one(state: &mut ServerState, eid: &str) {
+    let (pos, region) = match state.entities.get(eid) {
+        Some(e) => (e.pos, e.region.clone()),
+        None => return,
+    };
+    // D1: 2D-grid mode -- re-route by 2D cell (a "Z3_2" name is NOT a strip-name, so the 1D guard below
+    // would skip it; dispatch BEFORE that guard).
+    if let Some((c, r, cw, ch)) = state.grid2d {
+        let nr = region_2d_after(pos, &region, c, r, cw, ch);
+        if nr != region {
+            handoff(state, eid, &region, &nr);
+        }
+        return;
+    }
+    let x = pos[0];
+    if !is_strip_region_name(&region, &state.boundaries) {
+        return;
+    }
+    let nr = movement_region_after(x, &region, &state.boundaries, &state.splits);
+    if nr != region {
+        handoff(state, eid, &region, &nr);
+    }
+}
+
+// Hardening #1: drain the active RebalanceJob a SMALL batch per monitor tick under a time budget, so the
+// O(N) migration (the 2.3s freeze in one pass) spreads over many ticks and the lock-hold stays tiny.
+fn process_rebalance_jobs(state: &mut ServerState) {
+    const BATCH: usize = 8; // candidates per inner batch (fully applied, THEN the budget is re-checked)
+    const BUDGET_MS: u128 = 2; // never hold the global lock longer than this for rebalance work
+    let start = Instant::now();
+    loop {
+        if start.elapsed().as_millis() >= BUDGET_MS {
+            break;
+        }
+        // pull the next batch + advance the cursor by EXACTLY that many (it never runs ahead of the work),
+        // then release the job borrow so re_route_one can take &mut state.
+        let (batch, drained) = {
+            let job = match state.rebalance_jobs.first_mut() {
+                Some(j) => j,
+                None => break,
+            };
+            let end = (job.cursor + BATCH).min(job.eids.len());
+            let batch: Vec<String> = job.eids[job.cursor..end].to_vec();
+            job.cursor = end;
+            (batch, job.cursor >= job.eids.len())
+        };
+        if batch.is_empty() {
+            if drained {
+                state.rebalance_jobs.remove(0);
+            }
+            break;
+        }
+        for eid in &batch {
+            re_route_one(state, eid);
+        }
+        if drained {
+            state.rebalance_jobs.remove(0);
+            break;
+        }
+    }
+}
+
+// L3 graceful-degradation governor: derive a global load_level (0 normal / 1 stressed / 2 overloaded) from
+// the WORST per-worker egress backlog. The degradation actions key off this -- emit() drops degradable ops
+// at a cap that LOWERS with load, and flush_events coalesces visual events HARDER -- bounding memory under a
+// storm while CRITICAL ops always pass; it recovers to 0 when the backlog clears (no manual flag = organic).
+// Hysteresis: rise immediately, but hold in the mid-band so the level doesn't flap.
+fn update_load_governor(state: &mut ServerState) {
+    let max_oq = state
+        .workers
+        .values()
+        .map(|w| w.out_queue.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0);
+    let new_level = if max_oq >= EGRESS_SOFT_CAP {
+        2
+    } else if max_oq >= EGRESS_SOFT_CAP / 2 {
+        1
+    } else if max_oq < EGRESS_SOFT_CAP / 4 {
+        0
+    } else {
+        state.load_level.min(1) // 1/4..1/2 band: hold (don't flap), never above 1
+    };
+    if new_level != state.load_level {
+        eprintln!("[L3] load_level {} -> {new_level} (max out_queue {max_oq})", state.load_level);
+        state.load_level = new_level;
+    }
+}
+
+// D3: 2D-grid LOAD rebalance -- when one worker's blocks hold far more entities than another's, move ONE
+// block from the hottest worker to the coldest by reassigning region_worker + re-authoritying the block's
+// entities (the check_leases failover handover, load-triggered between two LIVE workers). Hysteretic (only
+// on a real imbalance, so it doesn't churn); 2D-grid mode ONLY (the 1D path uses rebalance()/maybe_split()).
+fn rebalance_2d(state: &mut ServerState) {
+    if state.grid2d.is_none() || !state.rebalance_jobs.is_empty() {
+        return;
+    }
+    // per-worker entity load (over the regions each worker owns)
+    let mut load: HashMap<String, usize> = HashMap::new();
+    for wid in state.region_worker.values() {
+        load.entry(wid.clone()).or_insert(0);
+    }
+    for e in state.entities.values() {
+        if let Some(wid) = state.region_worker.get(&e.region) {
+            if let Some(n) = load.get_mut(wid) {
+                *n += 1;
+            }
+        }
+    }
+    if load.len() < 2 {
+        return;
+    }
+    let (hot, hot_n) = load.iter().max_by_key(|(_, n)| **n).map(|(w, n)| (w.clone(), *n)).unwrap();
+    let (cold, cold_n) = load.iter().min_by_key(|(_, n)| **n).map(|(w, n)| (w.clone(), *n)).unwrap();
+    if hot == cold || (hot_n as f64) < (cold_n as f64) * 1.5 + 4.0 {
+        return; // hysteresis: only shed on a real imbalance
+    }
+    let hot_blocks: Vec<String> = state
+        .region_worker
+        .iter()
+        .filter(|(_, w)| **w == hot)
+        .map(|(r, _)| r.clone())
+        .collect();
+    if hot_blocks.len() < 2 {
+        return; // leave the hot worker at least one block
+    }
+    // move the hot block whose load is CLOSEST to half the gap (converges without overshoot/ping-pong)
+    let target = ((hot_n - cold_n) / 2) as i64;
+    let mut bl: HashMap<String, i64> = HashMap::new();
+    for b in &hot_blocks {
+        bl.insert(b.clone(), 0);
+    }
+    for e in state.entities.values() {
+        if let Some(n) = bl.get_mut(&e.region) {
+            *n += 1;
+        }
+    }
+    let block = bl
+        .iter()
+        .min_by_key(|(_, n)| (**n - target).abs())
+        .map(|(b, _)| b.clone())
+        .unwrap();
+    // reassign the block hot->cold + re-authority its entities (the check_leases pattern, load-triggered)
+    state.region_worker.insert(block.clone(), cold.clone());
+    if let Some(w) = state.workers.get_mut(&cold) {
+        w.region = block.clone();
+    }
+    eprintln!("[rust-broker] REBALANCE-2D block {block} {hot}->{cold} (hot_load={hot_n} cold_load={cold_n})");
+    let eids: Vec<String> = state
+        .entities
+        .iter()
+        .filter(|(_, e)| e.region == block)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let old = Some(hot);
+    for eid in eids {
+        if !state.workers.get(&cold).map(|w| w.view.contains(&eid)).unwrap_or(false) {
+            send_full(state, &cold, &eid);
+        }
+        let moved_comps = if let Some(e) = state.entities.get_mut(&eid) {
+            e.version += 1;
+            let (_ep, mc) = advance_physics_island_authority(e, old.as_deref(), Some(&cold));
+            mc
+        } else {
+            continue;
+        };
+        for comp in &moved_comps {
+            grant_authority(state, &cold, &eid, comp);
+        }
+    }
+}
+
+fn check_leases(state: &mut ServerState) {
+    let now = Instant::now();
+    let regions: Vec<String> = state.region_worker.keys().cloned().collect();
+    for region in regions {
+        let expired = match state.region_expires.get(&region) {
+            Some(exp) => now >= *exp,
+            None => false,
+        };
+        if !expired {
+            continue;
+        }
+        if state.standbys.is_empty() {
+            if !state.orphaned_regions.contains(&region) {
+                state.orphaned_regions.push(region.clone());
+                eprintln!("[rust-broker] region {region} ORPHANED (lease lapsed, no standby)");
+            }
+            continue;
+        }
+        let old_wid = state.region_worker.get(&region).cloned();
+        let new_wid = state.standbys.remove(0);
+        state.region_worker.insert(region.clone(), new_wid.clone());
+        state.region_expires.insert(
+            region.clone(),
+            now + Duration::from_secs_f64(state.lease_ttl),
+        );
+        state.metrics.failovers += 1;
+        eprintln!(
+            "[rust-broker] FAILOVER region {region} -> {new_wid} (failovers={})",
+            state.metrics.failovers
+        );
+        if state.workers.contains_key(&new_wid) {
+            if let Some(w) = state.workers.get_mut(&new_wid) {
+                w.region = region.clone(); // the spare now leases this region (interest follows)
+            }
+            let eids: Vec<String> = state
+                .entities
+                .iter()
+                .filter(|(_, e)| e.region == region)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for eid in eids {
+                if !state.workers[&new_wid].view.contains(&eid) {
+                    send_full(state, &new_wid, &eid);
+                }
+                let (version, authority_epoch, moved_comps, authority) =
+                    if let Some(e) = state.entities.get_mut(&eid) {
+                        e.version += 1;
+                        let (authority_epoch, moved_comps) =
+                            advance_physics_island_authority(e, old_wid.as_deref(), Some(&new_wid));
+                        (
+                            e.version,
+                            authority_epoch,
+                            moved_comps,
+                            authority_to_json(&e.authority),
+                        )
+                    } else {
+                        continue;
+                    };
+                if !moved_comps.is_empty() {
+                    let _ = state.wal_append(&json!({
+                        "kind":"authority_epoch","entity":&eid,
+                        "version":version,"comp":"physics_island",
+                        "authority_epoch":authority_epoch,"authority":authority,
+                        "components":moved_comps.clone(),
+                        "reason":"failover","region":&region
+                    }));
+                    for comp in &moved_comps {
+                        grant_authority(state, &new_wid, &eid, comp);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// R0.1: persistent ops mutate durable state (must be WAL'd before publish); transient ops do not.
+fn is_persistent_op(op: &str) -> bool {
+    matches!(
+        op,
+        "CreateEntity" | "DeleteEntity" | "AddComponent" | "RemoveComponent" | "UpdateComponent"
+            | "BatchUpdate"
+            | "SetComponentAuthority" | "MeshHandoff" | "ThresholdTx" | "Fold" | "SnapshotMarker"
+    )
+}
+
+// THE component-write CORE (validate + apply + WAL-WRITE, NO fsync, NO zoning, NO propagate). Validates
+// (authority / ACL / acl-admin / kernel-reserved / epoch-fence / sparse-envelope / contact-risk) -> applies
+// the value in-memory + version++ -> appends the durable WAL line via wal_append_NOSYNC. Returns Some(value)
+// = the normalized value that MUST be fsync'd-then-published by the caller; None = rejected (the caller need
+// not branch -- a rejected entry already emitted its UpdateRejected to `wid`).
+//
+// Two callers share this ONE validation+apply path (no second, divergeable copy; the batch CANNOT bypass a
+// gate -- it is literally the same function):
+//   - apply_one_update          (single UpdateComponent): nosync-write -> wal_sync (1 fsync) -> zone+propagate.
+//   - the BatchUpdate arm        : nosync-write per entry -> wal_sync ONCE for the whole batch -> zone+propagate
+//     each. That collapses N fsyncs into 1 (the per-tick durability wall at scale) while keeping the SAME
+//     durable-before-publish invariant: every line is written AND fsync'd before ANY entry is propagated.
+fn validate_and_apply_nosync(
+    state: &mut ServerState,
+    wid: &str,
+    eid: &str,
+    comp: &str,
+    raw_value: Value,
+    supplied_epoch: Option<u64>,
+) -> Option<Value> {
+    if !state.entities.contains_key(eid) {
+        // SEAM-INTEREST read-only enforcement: a ghost is a non-authoritative mirror of a NEIGHBOUR broker's
+        // entity. It is NOT in `entities`, so it can never be leased or granted authority -- and a WRITE to it
+        // (a forged authority-grab: "I'll just UpdateComponent the cross-seam enemy's pos/hp") is rejected
+        // HERE, structurally (the eid simply isn't an owned entity). We emit an explicit UpdateRejected naming
+        // the real owner so the attempt is VISIBLE (and the truth-gate can assert FAIL-without / PASS-with).
+        // This is the structural guarantee in code: reading a ghost grants nothing; authority stays with the owner zone.
+        if let Some(g) = state.ghosts.get(eid) {
+            let owner = g.owner_region.clone();
+            emit(
+                state,
+                wid,
+                json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                "reason":format!("ghost is read-only (non-authoritative; owned by zone '{}'); cannot claim authority over a cross-seam mirror", owner),
+                "ghost":true,"owner_region":owner}),
+            );
+        }
+        return None;
+    }
+    // 5a: authority is a COMPONENT property. Region ownership remains the fallback for legacy
+    // server-auth components, but a component lease/ACL can move a single component to a physics
+    // worker, logic worker, or sparse client without moving the whole entity.
+    if let Err(reason) = authoritative_component_writer(state, wid, eid, comp) {
+        state
+            .rejected
+            .push(json!({"entity":eid,"writer":wid,"owner":reason,"comp":comp}));
+        if state.rejected.len() > 512 {
+            // SOAK FIX: the rejected log grew unbounded (498K entries = ~550MB over a 90s soak); the
+            // Inspector only ever reads the last 20 (recent_rejected). Keep ~256 most-recent.
+            let drop_n = state.rejected.len() - 256;
+            state.rejected.drain(0..drop_n);
+        }
+        emit(
+            state,
+            wid,
+            json!({"op":"UpdateRejected","entity":eid,"comp":comp,"reason":reason}),
+        );
+        return None;
+    }
+    // WRITE ACL: even an authority holder needs the declared attribute to write this component.
+    let need = state
+        .entities
+        .get(eid)
+        .and_then(|e| acl_write_attr(e, comp));
+    if let Some(attr) = need {
+        let has = state
+            .workers
+            .get(wid)
+            .map(|w| w.attributes.contains(&attr))
+            .unwrap_or(false);
+        if !has {
+            emit(
+                state,
+                wid,
+                json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                "reason":format!("acl: write requires attribute '{}'", attr)}),
+            );
+            return None;
+        }
+    }
+    // A1 thin-fill: the "acl" component governs read/write authority -- rewriting it is a
+    // privilege-escalation. Gate it behind a dedicated 'acl_admin' attribute (the ACL is set at
+    // CreateEntity by the trusted creator; normal gamemode workers cannot mutate it after).
+    if comp == "acl"
+        && !state
+            .workers
+            .get(wid)
+            .map(|w| w.attributes.iter().any(|a| a == "acl_admin"))
+            .unwrap_or(false)
+    {
+        emit(
+            state,
+            wid,
+            json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+            "reason":"acl is immutable post-creation (requires the 'acl_admin' attribute)"}),
+        );
+        return None;
+    }
+    if reject_kernel_reserved_write(state, wid, eid, comp) {
+        return None;
+    }
+    if reject_stale_authority_epoch_val(state, wid, eid, comp, supplied_epoch) {
+        return None;
+    }
+    let value = {
+        let e = state.entities.get(eid).unwrap();
+        normalize_physics_clock_write(e, comp, raw_value)
+    };
+    if reject_client_forward_sparse_envelope(state, wid, eid, comp, &value) {
+        return None;
+    }
+    if reject_and_escalate_contact_risk(state, wid, eid, comp, &value) {
+        return None;
+    }
+    let ver = {
+        let e = state.entities.get_mut(eid).unwrap();
+        ensure_component_authority(e, comp);
+        if comp == "pos" {
+            e.pos = arr2(Some(&value));
+        } else if comp == "vel" {
+            e.vel = arr2(Some(&value));
+        } else {
+            e.components.insert(comp.to_string(), value.clone());
+        }
+        e.version += 1;
+        e.version
+    };
+    state.metrics.applies += 1;
+    renew(state, wid); // an actively-writing owner is alive -> renew its lease
+    // #2 WAL-THEN-PUBLISH: persist the line durably (write now, fsync by the caller) BEFORE broadcasting. If
+    // the WAL WRITE fails (disk full / fail-closed) the write did NOT persist -> reject it + do NOT publish.
+    // (The fsync barrier is the caller's wal_sync; on a single write that's apply_one_update, on a batch it's
+    // one wal_sync for the whole group -- either way every published value is on disk + fsync'd first.)
+    if state
+        .wal_append_nosync(&json!({
+            "kind":"write","entity":eid,"version":ver,"writer":wid,"comp":comp,"value":value
+        }))
+        .is_err()
+    {
+        emit(
+            state,
+            wid,
+            json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+            "reason":"wal_persist_failed: write not durably persisted (disk full / WAL degraded) — not published"}),
+        );
+        return None;
+    }
+    Some(value)
+}
+
+// pos-zoning (seam handoff / loss-imminent / intent-clear) for a just-applied pos write, THEN propagate the
+// value to interested workers. Runs AFTER the durable fsync (publish-after-durable). Factored out so the
+// single + batch paths share the identical post-commit publish step.
+fn zone_and_propagate(state: &mut ServerState, eid: &str, comp: &str, value: &Value) {
+    if comp == "pos" {
+        // a CHILD (has a `parent` component) follows its root's ASSEMBLY handoff and never
+        // self-zones -- else a ship's part could cross the seam a tick before/after the root
+        // and tear the assembly. Only roots / standalone entities zone on their own pos.
+        let is_child = state
+            .entities
+            .get(eid)
+            .map(|e| e.components.contains_key("parent"))
+            .unwrap_or(false);
+        if !is_child {
+            let (pos, cur) = {
+                let e = &state.entities[eid];
+                (e.pos, e.region.clone())
+            };
+            if let Some((c, r, cw, ch)) = state.grid2d {
+                // D1: 2D-grid mode -- handoff by 2D cell (the 1D seam-intent overlap band is x-only and
+                // does not apply; a 2D loss-imminent band is a later refinement).
+                let nr = region_2d_after(pos, &cur, c, r, cw, ch);
+                if nr != cur {
+                    state.pending_handoff_intent.remove(eid);
+                    handoff(state, eid, &cur, &nr);
+                }
+            } else {
+                let x = pos[0];
+                let nr = movement_region_after(x, &cur, &state.boundaries, &state.splits);
+                if nr != cur {
+                    state.pending_handoff_intent.remove(eid); // commit consumes the intent
+                    handoff(state, eid, &cur, &nr);
+                } else if let Some(tgt) = seam_intent_target(x, &cur, &state.boundaries) {
+                    maybe_emit_loss_imminent(state, eid, &cur, &tgt); // C2: in the overlap band
+                } else {
+                    state.pending_handoff_intent.remove(eid); // left the band -> clear
+                }
+            }
+        }
+    }
+    propagate(state, eid, comp, value);
+}
+
+// Single-write path (UpdateComponent): validate+apply+nosync-write -> ONE fsync -> zone+propagate. Behaviour
+// identical to before the group-commit split (one fsync per single write). Returns true if applied+published.
+fn apply_one_update(
+    state: &mut ServerState,
+    wid: &str,
+    eid: &str,
+    comp: &str,
+    raw_value: Value,
+    supplied_epoch: Option<u64>,
+) -> bool {
+    let value = match validate_and_apply_nosync(state, wid, eid, comp, raw_value, supplied_epoch) {
+        Some(v) => v,
+        None => return false,
+    };
+    // durable barrier for this one write. If the fsync fails the value is NOT on disk -> do NOT publish.
+    if state.wal_sync().is_err() {
+        emit(
+            state,
+            wid,
+            json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+            "reason":"wal_sync_failed: write not durably persisted (disk full / WAL degraded) — not published"}),
+        );
+        return false;
+    }
+    zone_and_propagate(state, eid, comp, &value);
+    true
+}
+
+fn dispatch(state: &mut ServerState, wid: &str, f: &Value) {
+    dispatch_inner(state, wid, f);
+    // T1: a single frame's fan-out (e.g. a critical EntityEvent to N observers) may have driven a stuck
+    // consumer past the hard egress cap; reap it NOW (within this frame) so its bounded channel can hold at
+    // most CHANNEL_CAP frames before the socket is torn down -- the structural RAM bound. Runs on EVERY
+    // dispatch path (the inner fn has many early returns) by wrapping, so no overflow path can skip the reap.
+    reap_disconnecting(state);
+}
+
+fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
+    let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    // R0.1 fail-closed: once the WAL is degraded (a durable write failed), reject every PERSISTENT op so
+    // nothing is published-as-success that recovery cannot reproduce; transient ops (events/metrics/queries) pass.
+    if state.wal_degraded && is_persistent_op(op) {
+        let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
+        emit(state, wid, json!({"op":"UpdateRejected","request_id":req_id,
+            "reason":"broker WAL-degraded (fail-closed): persistent op rejected"}));
+        return;
+    }
+    match op {
+        "UpdateComponent" => {
+            let eid = match f.get("entity").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return,
+            };
+            let comp = f
+                .get("comp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let raw_value = f.get("value").cloned().unwrap_or(Value::Null);
+            apply_one_update(state, wid, &eid, &comp, raw_value, frame_authority_epoch(f));
+        }
+        // WIRE-BATCH (the scale fix): ONE frame carrying MANY of a worker's per-tick position writes, so N
+        // separate UpdateComponent frames collapse to 1 (framing + JSON-envelope overhead amortized N->1, and
+        // the broker does 1 frame-read + 1 JSON parse + 1 dispatch-lock acquisition instead of N). The batch is
+        // NOT a fast-path that bypasses anything: every entry runs through apply_one_update -- the SAME
+        // per-entity authority / cheat-line / epoch-fence / ACL / WAL-then-publish / pos-zoning path as a single
+        // UpdateComponent. A non-owner's entry is rejected per-entity (the rest of the batch still applies); a
+        // stale epoch is fenced per-entry. Shape: {"op":"BatchUpdate","comp":"pos","updates":[["eid",[x,y]],...]}
+        //   - `comp` is the shared component for the whole batch (homogeneous; pos is the dominant per-tick push).
+        //   - each `updates` entry is a compact 2- or 3-array [entity, value] or [entity, value, authority_epoch]
+        //     (the array form drops the per-entry {"entity":..,"comp":..,"value":..} key verbosity = the byte win).
+        //   - an OPTIONAL top-level "values" object form is also accepted: {"comp":..,"values":{eid:val,...}}.
+        // Back-compat: single UpdateComponent above is untouched; BatchUpdate is purely additive.
+        "BatchUpdate" => {
+            let comp = f
+                .get("comp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if comp.is_empty() {
+                return;
+            }
+            // collect (eid, value, optional per-entry epoch) without holding any borrow on `f` during apply
+            let mut items: Vec<(String, Value, Option<u64>)> = Vec::new();
+            if let Some(arr) = f.get("updates").and_then(|v| v.as_array()) {
+                for u in arr {
+                    if let Some(entry) = u.as_array() {
+                        // ["eid", value] or ["eid", value, epoch]
+                        let eid = match entry.first().and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        let val = entry.get(1).cloned().unwrap_or(Value::Null);
+                        let ep = entry.get(2).and_then(|v| v.as_u64());
+                        items.push((eid, val, ep));
+                    } else if let Some(obj) = u.as_object() {
+                        // {"entity":..,"value":..[,"authority_epoch":..]} (verbose entry form, also accepted)
+                        if let Some(eid) = obj.get("entity").and_then(|v| v.as_str()) {
+                            let val = obj.get("value").cloned().unwrap_or(Value::Null);
+                            let ep = obj.get("authority_epoch").and_then(|v| v.as_u64());
+                            items.push((eid.to_string(), val, ep));
+                        }
+                    }
+                }
+            } else if let Some(map) = f.get("values").and_then(|v| v.as_object()) {
+                let shared_ep = frame_authority_epoch(f);
+                for (eid, val) in map {
+                    items.push((eid.clone(), val.clone(), shared_ep));
+                }
+            }
+            // GROUP-COMMIT: validate+apply each entry in memory + WAL-WRITE (no fsync); collect the applied
+            // ones; ONE wal_sync for the whole batch (N fsyncs -> 1, the per-tick durability wall at scale);
+            // THEN zone+propagate each applied value (publish-after-durable). A rejected entry already emitted
+            // its UpdateRejected and is simply not in `applied` -- the rest of the batch still commits.
+            let mut applied: Vec<(String, Value)> = Vec::with_capacity(items.len());
+            for (eid, val, ep) in items {
+                if let Some(v) = validate_and_apply_nosync(state, wid, &eid, &comp, val, ep) {
+                    applied.push((eid, v));
+                }
+            }
+            if applied.is_empty() {
+                return; // nothing applied (all rejected / unknown) -> no fsync, no publish
+            }
+            // ONE durability barrier for the whole batch. If it fails, NONE of the group is durable -> publish
+            // nothing + reject the batch (the in-memory writes stand but the broker is now fail-closed, exactly
+            // as a single write's wal failure leaves it; no value is broadcast as committed without being on disk).
+            if state.wal_sync().is_err() {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","comp":comp,
+                    "reason":"wal_sync_failed (batch): writes not durably persisted (disk full / WAL degraded) — not published"}),
+                );
+                return;
+            }
+            for (eid, v) in &applied {
+                zone_and_propagate(state, eid, &comp, v);
+            }
+        }
+        "Fold" => {
+            // PORTAL fold (folds = portals to other dimensions): teleport an entity to a FAR region at
+            // pos P -- NOT an adjacent seam-cross. Reuses the proven authority-handoff; the trigger is a
+            // portal-request from the owning worker (which already validated the portal-entry), not
+            // region_after. So a fold = reposition-to-P + authority(cur -> target).
+            let eid = match f.get("entity").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return,
+            };
+            let target = f
+                .get("region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cur = match state.entities.get(&eid) {
+                Some(e) => e.region.clone(),
+                None => return,
+            };
+            // CHEAT-LINE: only the entity's current owner-worker may fold it (no teleporting others).
+            if state.region_worker.get(&cur).map(|s| s.as_str()) != Some(wid) {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","entity":eid,"comp":"fold",
+                    "reason":"not authoritative; cannot fold an entity you do not own"}),
+                );
+                return;
+            }
+            if target.is_empty() || target == cur {
+                return;
+            }
+            // reposition at the fold destination, then hand authority cur -> target
+            if let Some(p) = f.get("pos").cloned() {
+                if let Some(e) = state.entities.get_mut(&eid) {
+                    e.pos = arr2(Some(&p));
+                }
+            }
+            handoff(state, &eid, &cur, &target); // proven path: WAL transfer + AuthorityChange(old/new)
+            let np = state
+                .entities
+                .get(&eid)
+                .map(|e| e.pos)
+                .unwrap_or([0.0, 0.0]);
+            propagate(state, &eid, "pos", &json!(np));
+        }
+        "Heartbeat" => {
+            renew(state, wid); // liveness with no writes (idle owner stays alive)
+        }
+        "Interest" => {
+            let center = f.get("center").and_then(|v| v.as_array()).map(|a| {
+                [
+                    a.first().and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    a.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0),
+                ]
+            });
+            // A4 (interest-clamp): cap the self-declared AOI radius. An unbounded radius (e.g. 1e9) is both
+            // a fan-out cost (the broker would test/ship a world-sized interest-set) and part of the info-
+            // scrape vector. MAX_AOI is generous vs any real view. NOTE: the OTHER half of the interest-
+            // scrape -- the OBS region's GLOBAL interest -- would be gated by requiring an 'observer'
+            // attribute; that's DEFERRED (it ripples to every trusted relay + dev tool, all of which connect
+            // OBS, and the scrape needs a network-exposed broker that isn't live yet). See the BLUEPRINT.
+            const MAX_AOI: f64 = 5_000.0;
+            let radius = f
+                .get("radius")
+                .and_then(|v| v.as_f64())
+                .map(|r| r.clamp(0.0, MAX_AOI));
+            let full_radius = f
+                .get("full_radius")
+                .or_else(|| f.get("fullRadius"))
+                .and_then(|v| v.as_f64())
+                .map(|r| r.clamp(0.0, MAX_AOI));
+            let coarse_rate = f
+                .get("coarse_rate")
+                .or_else(|| f.get("coarseRate"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .clamp(1, 1_000);
+            let coarse_grid = f
+                .get("coarse_grid")
+                .or_else(|| f.get("coarseGrid"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .clamp(0.0, 1_000_000.0);
+            if let Some(w) = state.workers.get_mut(wid) {
+                w.aoi_center = center;
+                w.aoi_radius = radius;
+                w.fidelity_full_radius = full_radius;
+                w.fidelity_coarse_rate = coarse_rate;
+                w.fidelity_coarse_grid = coarse_grid;
+                w.fidelity_seq.clear();
+            }
+            update_interest_grid(state, wid); // Interest: re-index this worker's AOI into the spatial grid
+            let eids: Vec<String> = state.entities.keys().cloned().collect();
+            for eid in eids {
+                let inside = visible(&state.workers[wid], &state.entities[&eid]);
+                let has = state.workers[wid].view.contains(&eid);
+                if inside && !has {
+                    send_full(state, wid, &eid);
+                } else if !inside && has {
+                    emit(state, wid, json!({"op":"RemoveEntity","entity":eid}));
+                    if let Some(w) = state.workers.get_mut(wid) {
+                        w.view.remove(&eid);
+                    }
+                }
+            }
+        }
+        "LogMessage" => {}
+        // EVENT semantics (gap-C): a TRANSIENT entity event (tree-cut / hit / interact / door-open) that
+        // rides the interest channel to every interested worker but is NEVER stored -- not a component,
+        // no WAL, no checkout-replay (a late joiner must not re-see a one-shot event). Cheat-line: only
+        // the entity's authoritative owner may fire its events. Mirrors WA's "events ride the update
+        // channel" without turning events into state.
+        "EntityEvent" => {
+            let eid = f.get("entity").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if let Err(reason) = authoritative_entity_owner(state, wid, &eid) {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","entity":eid,"comp":"event","reason":reason}),
+                );
+                return;
+            }
+            let event = f.get("event").cloned().unwrap_or(Value::Null);
+            let payload = f.get("payload").cloned().unwrap_or(Value::Null);
+            // Gemini blind-spot fix (cross-seam event ORDERING): stamp the event with the entity's CURRENT
+            // sim_time + gen so the client orders it in the SAME SimTimeInterpBuffer as the state stream --
+            // the event renders at the moment it belongs to (e.g. TakeDamage AFTER the bullet reaches the
+            // target by sim_time), not whenever the packet happens to arrive. Falls back to null (arrival
+            // order) for an entity with no sim_time. The event stays TRANSIENT (not stored); only the stamp
+            // rides, reusing the G1 logical clock + the G4-critical tier (EntityEvent is not degradable).
+            let (ev_sim, ev_gen) = state
+                .entities
+                .get(&eid)
+                .map(|e| {
+                    (
+                        e.components.get("sim_time").cloned().unwrap_or(Value::Null),
+                        e.components.get("gen").cloned().unwrap_or(Value::Null),
+                    )
+                })
+                .unwrap_or((Value::Null, Value::Null));
+            // L1 event-storm: CLASSIFY (default "critical" -- a creator that doesn't classify is never
+            // silently dropped/coalesced) + a coalesce_key (default eid:event so same-name visual events from
+            // one entity collapse).
+            let class = f.get("class").and_then(|v| v.as_str()).unwrap_or("critical").to_string();
+            let coalesce_key = f
+                .get("coalesce_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}:{}", eid, event.as_str().unwrap_or("")));
+            let target_wids: Vec<String> = state
+                .workers
+                .iter()
+                .filter(|(_, w)| state.entities.get(&eid).map(|e| visible(w, e)).unwrap_or(false))
+                .map(|(id, _)| id.clone())
+                .collect();
+            // CRITICAL events deliver INLINE (in THIS lock-hold), NOT via the buffered 20Hz flush tick.
+            // WHY: flush_events runs on a separate 20Hz task that must re-acquire this same global lock, and
+            // tokio's Mutex is not fair -- under a sustained ComponentUpdate flood (many connections each
+            // re-locking per frame) the flush tick can be LOCK-STARVED for seconds, delaying buffered events
+            // unboundedly. For VISUAL events that only costs latency on a coalesced stream (fine). But a
+            // CRITICAL event is the "never dropped, exact, timely" class -- making its delivery depend on a
+            // starvable tick was the defect a commercial fault-soak surfaced (a 600-critical storm under load
+            // delivered only ~390 within 45s, the rest stuck buffered behind the starved flush). Delivering
+            // critical events here, while we already hold the lock that received them, makes the L1 guarantee
+            // load-INDEPENDENT (they ride the same per-frame lock as every other op) -- and it is also the
+            // correct semantics: "critical" means immediate, only "visual" needs coalescing. Visual/debug
+            // still BUFFER for the coalescing flush (storm-bounded egress). Critical is never coalesced anyway,
+            // so emitting it now (vs after a <=50ms flush) changes nothing but the starvation exposure.
+            if class == "critical" {
+                let base = json!({"op":"EntityEvent","entity":eid,"event":event,"payload":payload,
+                    "sim_time":ev_sim,"gen":ev_gen,"class":class});
+                for wid2 in &target_wids {
+                    emit(state, wid2, base.clone());
+                }
+            } else {
+                state.event_outbox.push(BufferedEvent {
+                    target_wids,
+                    eid,
+                    event,
+                    payload,
+                    class,
+                    coalesce_key,
+                    sim_time: ev_sim,
+                    gen: ev_gen,
+                });
+            }
+        }
+        "CreateEntity" => {
+            let eid = match f.get("entity").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return,
+            };
+            // #3 GRACEFUL-DRAIN: a draining broker accepts NO new entities -- it is being decommissioned, so a new
+            // spawn must land on a live broker, not on one about to shut down (which would either lose it or force
+            // an immediate re-handoff). Reject cleanly with reason "draining" so the worker re-creates elsewhere.
+            // The hand-off of EXISTING entities (mesh_forward) continues; only NEW arrivals are refused.
+            if state.draining {
+                if let Some(req) = f.get("request_id") {
+                    emit(state, wid, json!({"op":"CreateEntityResponse","request_id":req,
+                        "entity":eid,"success":false,"reason":"draining"}));
+                } else {
+                    emit(state, wid, json!({"op":"UpdateRejected","entity":eid,"comp":"create",
+                        "reason":"draining"}));
+                }
+                return;
+            }
+            if state.deleted_entities.contains(&eid) {
+                if let Some(req) = f.get("request_id") {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"CreateEntityResponse","request_id":req,
+                        "entity":eid,"success":false,"reason":"entity tombstoned"}),
+                    );
+                } else {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":"create",
+                        "reason":"entity tombstoned"}),
+                    );
+                }
+                return;
+            }
+            let mut comps: Map<String, Value> = f
+                .get("components")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let p: Vec<f64> = comps
+                .get("pos")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_f64()).collect())
+                .unwrap_or_else(|| vec![0.0, 0.0, 0.0]);
+            let pos2 = if p.len() >= 3 {
+                [p[0], p[2]]
+            } else if p.len() == 2 {
+                [p[0], p[1]]
+            } else if p.len() == 1 {
+                [p[0], 0.0]
+            } else {
+                [0.0, 0.0]
+            };
+            // honor an initial "vel" component too (symmetric with pos): a body created already
+            // moving keeps that velocity. e.vel feeds the handoff continuity audit + the mesh carry,
+            // so a hardcoded [0,0] here silently zeroed the velocity of every freshly-spawned body.
+            let pv: Vec<f64> = comps
+                .get("vel")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_f64()).collect())
+                .unwrap_or_else(|| vec![0.0, 0.0]);
+            let vel2 = if pv.len() >= 3 {
+                [pv[0], pv[2]]
+            } else if pv.len() == 2 {
+                [pv[0], pv[1]]
+            } else if pv.len() == 1 {
+                [pv[0], 0.0]
+            } else {
+                [0.0, 0.0]
+            };
+            // pos/vel live authoritative TOP-LEVEL (e.pos / e.vel); drop the duplicates from the
+            // component map, else the checkout re-sends the STALE spawn-time pos AFTER the live one
+            // and overwrites every later UpdateComponent("pos") move in a viewer's view (entities
+            // never appear to move). Top-level is the single source of truth for pos/vel.
+            comps.remove("pos");
+            comps.remove("vel");
+            if comps.keys().any(|k| is_platform_reserved_component(k))
+                && !worker_has_attr(state, wid, "kernel_admin")
+            {
+                if let Some(req) = f.get("request_id") {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"CreateEntityResponse","request_id":req,
+                        "entity":eid,"success":false,
+                        "reason":"platform-reserved components require the 'kernel_admin' attribute"}),
+                    );
+                } else {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":"kernel",
+                        "reason":"platform-reserved components require the 'kernel_admin' attribute"}),
+                    );
+                }
+                return;
+            }
+            let created = !state.entities.contains_key(&eid);
+            if created {
+                let requested_region = f.get("region").and_then(|v| v.as_str());
+                spawn_in_region(state, &eid, pos2, vel2, comps, requested_region, None, None);
+            }
+            if let Some(req) = f.get("request_id") {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"CreateEntityResponse","request_id":req,
+                    "entity":eid,"success":created}),
+                );
+            }
+        }
+        "DeleteEntity" => {
+            let eid = match f.get("entity").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return,
+            };
+            let request_id = f.get("request_id").cloned();
+            if state.deleted_entities.contains(&eid) {
+                if let Some(req) = request_id {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"DeleteEntityResponse","request_id":req,
+                        "entity":eid,"success":true,"idempotent":true}),
+                    );
+                }
+                return;
+            }
+            if let Err(reason) = authoritative_entity_owner(state, wid, &eid) {
+                if let Some(req) = request_id {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"DeleteEntityResponse","request_id":req,
+                        "entity":eid,"success":false,"reason":reason}),
+                    );
+                } else {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":"delete","reason":reason}),
+                    );
+                }
+                return;
+            }
+            if reject_stale_authority_epoch(state, wid, &eid, "delete", f) {
+                return;
+            }
+            let delete_version = state
+                .entities
+                .get(&eid)
+                .map(|e| e.version.saturating_add(1))
+                .unwrap_or(0);
+            let _ = state.wal_append(&json!({
+                "kind":"delete_tombstone","entity":&eid,"version":delete_version,"writer":wid
+            }));
+            state.deleted_entities.insert(eid.clone());
+            let removed = state.entities.remove(&eid).is_some();
+            if removed {
+                let wids: Vec<String> = state.workers.keys().cloned().collect();
+                for wid2 in wids {
+                    if state.workers[&wid2].view.contains(&eid) {
+                        emit(state, &wid2, json!({"op":"RemoveEntity","entity":eid}));
+                        if let Some(w) = state.workers.get_mut(&wid2) {
+                            w.view.remove(&eid);
+                        }
+                    }
+                }
+            }
+            if let Some(req) = request_id {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"DeleteEntityResponse","request_id":req,
+                    "entity":eid,"success":removed}),
+                );
+            }
+        }
+        // ── Commands / RPC: caller -> authority holder -> response -> caller ──
+        "CommandRequest" => {
+            let eid = f
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let req_id = f
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let owner = state.entities.get(&eid).and_then(|e| {
+                // Route to the entity's CURRENT pos-authority owner so a command follows the
+                // auto-handoff across zones (fixes a commanded player losing input after crossing a
+                // seam). Fall back to the region's worker when no pos-owner is set.
+                e.authority
+                    .get("pos")
+                    .and_then(|ca| ca.owner.clone())
+                    .or_else(|| state.region_worker.get(&e.region).cloned())
+            });
+            match owner {
+                Some(ow) if state.workers.contains_key(&ow) => {
+                    state
+                        .pending_commands
+                        .insert(req_id.clone(), wid.to_string());
+                    emit(
+                        state,
+                        &ow,
+                        json!({"op":"CommandRequest","entity":eid,
+                        "command":f.get("command").cloned().unwrap_or(Value::Null),
+                        "payload":f.get("payload").cloned().unwrap_or(Value::Null),
+                        "request_id":req_id,"caller":wid}),
+                    );
+                }
+                _ => {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"CommandResponse","request_id":req_id,
+                        "success":false,"reason":"no authoritative worker for entity"}),
+                    );
+                }
+            }
+        }
+        "CommandResponse" => {
+            let req_id = f
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(requester) = state.pending_commands.remove(&req_id) {
+                if state.workers.contains_key(&requester) {
+                    emit(
+                        state,
+                        &requester,
+                        json!({"op":"CommandResponse","request_id":req_id,
+                        "success":f.get("success").cloned().unwrap_or(Value::Bool(true)),
+                        "payload":f.get("payload").cloned().unwrap_or(Value::Null)}),
+                    );
+                }
+            }
+        }
+        // ── EntityQuery: constraint -> matching entities ──
+        "EntityQuery" => {
+            let req_id = f
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let q = f
+                .get("query")
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"all"}));
+            let mut hits: Vec<Value> = Vec::new();
+            let worker = match state.workers.get(wid) {
+                Some(w) => w,
+                None => return,
+            };
+            let want_intent = f.get("include_handoff_intent").and_then(|v| v.as_bool()).unwrap_or(false);
+            let debug_ok = worker.attributes.iter().any(|a| a == "observer" || a == "debug");
+            for (eid, e) in state.entities.iter() {
+                if matches_query(e, &q) && visible(worker, e) {
+                    let mut row = json!({"entity":eid,"pos":[e.pos[0],e.pos[1]],
+                        "components":Value::Object(e.components.clone()),"region":e.region,
+                        "authority":authority_to_json(&e.authority)});
+                    if want_intent && debug_ok {
+                        if let Some(i) = state.pending_handoff_intent.get(eid) {
+                            row["handoff_intent"] = handoff_intent_to_json(i);
+                        }
+                    }
+                    hits.push(row);
+                }
+            }
+            // SEAM-INTEREST: ghosts (read-only neighbour-zone mirrors) are visible to a worker whose AOI covers
+            // them too, so the cross-seam battle renders (the observer's EntityQuery{all} picks them up) + a
+            // query-based targeter finds them. They carry a `ghost:true` + `owner_region` marker and NO authority
+            // (the row's `authority` is empty), so nothing can mistake a ghost for an authoritative entity.
+            for (eid, g) in state.ghosts.iter() {
+                if ghost_query_match(g, &q) && ghost_visible(worker, g) {
+                    let mut comps = g.components.clone();
+                    comps.insert("ghost".to_string(), json!(true));
+                    hits.push(json!({"entity":eid,"pos":[g.pos[0],g.pos[1]],
+                        "components":Value::Object(comps),"region":g.owner_region,
+                        "ghost":true,"owner_region":g.owner_region,"authority":json!({})}));
+                }
+            }
+            emit(
+                state,
+                wid,
+                json!({"op":"EntityQueryResponse","request_id":req_id,
+                "count":hits.len(),"entities":hits}),
+            );
+        }
+        // ── InspectorQuery: read-only whole-cluster TRUTH frame (Inspector-0, GPT-Pro spec). Gated by the
+        // "inspector" attr; POLLED (the Godot inspector polls at rate_hz). Reuses authority_to_json +
+        // handoff_intent_to_json; sources zones/workers/metrics/pending from live state. Entities capped so
+        // the Inspector never becomes the fan-out killer. ──
+        "InspectorQuery" => {
+            let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let worker = match state.workers.get(wid) { Some(w) => w, None => return };
+            if !worker.attributes.iter().any(|a| a == "inspector") {
+                emit(state, wid, json!({"op":"UpdateRejected","request_id":req_id,
+                    "reason":"InspectorQuery requires the inspector attribute"}));
+                return;
+            }
+            let cap = f.get("max_entities").and_then(|v| v.as_u64()).unwrap_or(1000) as usize;
+            // zones: region -> owning worker + last-reported load + dynamic split sub-boundaries
+            let zones: Vec<Value> = state.region_worker.iter().map(|(region, w)| {
+                json!({"region": region, "worker": w,
+                    "load": state.worker_load.get(w).copied().unwrap_or(0.0),
+                    "splits": state.splits.get(region)})
+            }).collect();
+            // workers: id -> region, view_count (interest-set size), attributes, load, out_queue.
+            // G4 backpressure: out_queue = the per-worker egress backlog depth (enqueued-by-emit minus
+            // dequeued-by-the-writer). The channel is still UNBOUNDED -- this makes the backlog VISIBLE
+            // (the next step bounds it: a bounded channel + drop-on-full once a real slow-consumer is seen).
+            let workers: Vec<Value> = state.workers.iter().map(|(id, w)| {
+                json!({"worker_id": id, "region": w.region, "view_count": w.view.len(),
+                    "attributes": w.attributes.iter().cloned().collect::<Vec<String>>(),
+                    "load": state.worker_load.get(id).copied().unwrap_or(0.0),
+                    "out_queue": w.out_queue.load(Ordering::Relaxed),
+                    "dropped": w.dropped.load(Ordering::Relaxed),
+                    "slow_consumer": w.out_queue.load(Ordering::Relaxed) > EGRESS_SOFT_CAP})
+            }).collect();
+            // entities: capped, each with per-component authority + handoff intent + the gen clock
+            let mut ents: Vec<Value> = Vec::new();
+            for (eid, e) in state.entities.iter() {
+                if ents.len() >= cap { break; }
+                let mut row = json!({"entity": eid, "region": e.region,
+                    "pos": [e.pos[0], e.pos[1]], "authority": authority_to_json(&e.authority)});
+                if let Some(g) = e.components.get("gen") { row["gen"] = g.clone(); }
+                if let Some(st) = e.components.get("sim_time") { row["sim_time"] = st.clone(); }
+                if let Some(i) = state.pending_handoff_intent.get(eid) {
+                    row["handoff_intent"] = handoff_intent_to_json(i);
+                }
+                ents.push(row);
+            }
+            // SEAM-INTEREST: include the read-only ghosts (tagged) so the Inspector shows the cross-seam mirrors
+            // a broker is holding. They carry `ghost:true` + `owner_region` and an EMPTY authority map (a ghost
+            // owns nothing) -- visibly distinct from an authoritative entity in the same frame.
+            for (eid, g) in state.ghosts.iter() {
+                if ents.len() >= cap { break; }
+                ents.push(json!({"entity": eid, "region": g.owner_region,
+                    "pos": [g.pos[0], g.pos[1]], "authority": json!({}),
+                    "ghost": true, "owner_region": g.owner_region}));
+            }
+            let frame = json!({
+                "op": "InspectorFrame",
+                "request_id": req_id,
+                "t_server": now_millis(),
+                "broker": {
+                    "entity_count": state.entities.len(),
+                    "handoffs": state.metrics.handoffs,
+                    "mesh_handoffs": state.metrics.mesh_handoffs, // CROSS-BROKER handoffs (entities forwarded across the process seam) -- previously invisible; `handoffs` counts only LOCAL same-broker transfers
+                    "applies": state.metrics.applies,
+                    "failovers": state.metrics.failovers,
+                    "boundary": state.boundary,
+                    "boundaries": state.boundaries.clone(), // N-ZONE: the full strip cut list (the inspector/gate reads the partition shape)
+                    "lock_max_hold_ms": state.lock_max_hold_ms,
+                    "lock_max_hold_path": state.lock_max_hold_path,
+                    "lock_last_hold_ms": state.lock_last_hold_ms,
+                    "load_level": state.load_level,
+                    // L6 lease-fenced registry: this broker's own region + the lease epoch it holds, the
+                    // epochs it knows for every region (registry-learned), whether it has been superseded
+                    // (self-fenced), and how many stale-incarnation handoffs it has rejected.
+                    "my_region": state.my_region,
+                    "region_lease_epoch": state.region_lease_epoch.iter().map(|(k,v)| (k.clone(), json!(v))).collect::<Map<String,Value>>(),
+                    "superseded_regions": state.superseded_regions.iter().cloned().collect::<Vec<String>>(),
+                    "fenced_stale_handoffs": state.metrics.fenced_stale_handoffs,
+                    // SEAM-INTEREST: how many cross-seam read-only ghosts this broker currently holds + the band.
+                    "ghosts": state.ghosts.len(),
+                    "interest_band": state.interest_band,
+                    // #3 OPS: the new health/metrics fields, also surfaced here so the Inspector and the Health
+                    // endpoint never diverge (both read the same state). tick_lag = monitor-cadence slip;
+                    // rss_bytes = this process's working set; draining = the graceful-drain state.
+                    "tick_lag_ms": state.tick_lag_ms,
+                    "rss_bytes": process_rss_bytes(),
+                    "wal_bytes": state.wal_bytes,
+                    "draining": state.draining,
+                    "pending_mesh": state.pending_mesh.len()
+                },
+                "zones": zones,
+                "workers": workers,
+                "entities": ents,
+                "entities_capped": state.entities.len() > cap,
+                "pending": {
+                    "mesh": state.pending_mesh.len(),
+                    "handoff_intent": state.pending_handoff_intent.len()
+                },
+                "recent_rejected": state.rejected.iter().rev().take(20).cloned().collect::<Vec<Value>>()
+            });
+            emit(state, wid, frame);
+        }
+        // ── #3 OPS: HEALTH/METRICS endpoint (Gemini's #2 blocker -- a scrapable live-metrics surface). UNGATED:
+        // a liveness/readiness prober (k8s, a load-balancer, an operator's curl-equivalent) holds NO inspector
+        // attribute, so health must be readable by any connected worker. Returns ONE HealthFrame over the existing
+        // length-prefixed-JSON wire -- no HTTP dep, no second port. The fields are the live state.metrics + RSS +
+        // tick-lag + WAL/ghost/pending sizes (health_snapshot), so this never diverges from the Inspector view. ──
+        "Health" => {
+            let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let mut snap = health_snapshot(state);
+            snap["op"] = json!("HealthFrame");
+            snap["request_id"] = json!(req_id);
+            emit(state, wid, snap);
+        }
+        // ── #3 OPS: GRACEFUL-DRAIN (rolling-deploy without kicking players). A `Drain` op flips this broker into
+        // the draining state: it (1) STOPS accepting new CreateEntity (rejected "draining" so the spawn lands on a
+        // live broker), and (2) hands EVERY entity it owns across the mesh to the neighbour owning where the entity
+        // is, via the PROVEN 2-phase mesh_forward (pending_mesh -> MeshAck -> exactly-once, conservation-EXACT). The
+        // monitor tick (drain progress) re-runs the hand-off until entities+pending_mesh are empty, then -- if
+        // drain_exit -- exits 0 (a clean deploy shutdown). GATED to an admin attribute (drain is a control action):
+        // kernel_admin OR inspector OR a worker carrying "ops". `exit` field overrides drain_exit per-call. ──
+        "Drain" => {
+            let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !worker_has_attr(state, wid, "kernel_admin")
+                && !worker_has_attr(state, wid, "inspector")
+                && !worker_has_attr(state, wid, "ops")
+            {
+                emit(state, wid, json!({"op":"UpdateRejected","request_id":req_id,
+                    "reason":"Drain requires the kernel_admin/inspector/ops attribute"}));
+                return;
+            }
+            if let Some(ex) = f.get("exit").and_then(|v| v.as_bool()) {
+                state.drain_exit = ex;
+            }
+            state.draining = true;
+            let dispatched = drain_handoff_owned(state); // kick off the hand-off immediately; the tick continues it
+            let remaining = state.entities.len();
+            let no_neighbour = state.mesh.is_empty();
+            eprintln!("[drain] DRAIN requested -- draining=true, dispatched {dispatched} entit(y/ies) to neighbour(s), {remaining} still local, pending_mesh={}{}",
+                state.pending_mesh.len(), if no_neighbour { " (NO mesh neighbour -- cannot drain, dead-end)" } else { "" });
+            emit(state, wid, json!({"op":"DrainAck","request_id":req_id,
+                "draining": true, "dispatched": dispatched, "remaining_local": remaining,
+                "pending_mesh": state.pending_mesh.len(), "drain_exit": state.drain_exit,
+                "no_neighbour": no_neighbour}));
+        }
+        // ── G2 SnapshotMarker: a coordinator records a consistent point-in-time cut (WAL offset + manifest) ──
+        "SnapshotMarker" => {
+            let req_id = f.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let snapshot_id = f.get("snapshot_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // gate: a snapshot reads the whole world -- require the snapshot/inspector/kernel_admin attribute
+            {
+                let worker = match state.workers.get(wid) {
+                    Some(w) => w,
+                    None => return,
+                };
+                if !worker.attributes.iter().any(|a| a == "snapshot" || a == "inspector" || a == "kernel_admin") {
+                    emit(state, wid, json!({"op":"UpdateRejected","request_id":req_id,
+                        "reason":"SnapshotMarker requires the snapshot/inspector/kernel_admin attribute"}));
+                    return;
+                }
+            }
+            // R0.3: a coordinated point-in-time snapshot was taken -> disable WAL compaction for this broker's
+            // lifetime, so a later GW_RESTORE_OFFSET cut against this WAL stays byte-valid (compaction would
+            // rewrite the file and invalidate the offset). The disk-fill scenario uses no SnapshotMarker.
+            state.snapshot_seen = true;
+            // record the marker in the WAL FIRST -> the restore replays UP TO this offset (the consistent cut)
+            let _ = state.wal_append(&json!({"kind":"snapshot_marker","snapshot_id":snapshot_id,"t":now_millis()}));
+            let wal_offset = state.wal_bytes;
+            let mut ids: Vec<String> = state.entities.keys().cloned().collect();
+            ids.sort();
+            // authority_hash (FNV-1a fold over (entity, pos-owner, pos-epoch)) -> a restore detects a divergent cut
+            let mut authority_hash: u64 = 0xcbf29ce484222325;
+            for eid in &ids {
+                for b in eid.bytes() {
+                    authority_hash = (authority_hash ^ b as u64).wrapping_mul(0x100000001b3);
+                }
+                if let Some(e) = state.entities.get(eid) {
+                    if let Some(ca) = e.authority.get("pos") {
+                        authority_hash = authority_hash.wrapping_add(ca.epoch);
+                        if let Some(o) = &ca.owner {
+                            for b in o.bytes() {
+                                authority_hash = (authority_hash ^ b as u64).wrapping_mul(0x100000001b3);
+                            }
+                        }
+                    }
+                }
+            }
+            let in_flight: Vec<Value> = state
+                .pending_mesh
+                .iter()
+                .map(|(eid, (_frame, _when, target))| json!({"entity": eid, "target": target, "type": "MeshHandoff"}))
+                .collect();
+            let broker_id = std::env::var("GW_BROKER_ID").unwrap_or_else(|_| "broker".to_string());
+            emit(state, wid, json!({
+                "op": "SnapshotManifest", "request_id": req_id, "snapshot_id": snapshot_id,
+                "broker_id": broker_id, "wal_offset": wal_offset, "entity_count": state.entities.len(),
+                "authority_hash": authority_hash.to_string(), "pending_mesh": state.pending_mesh.len(),
+                "in_flight": in_flight, "t_server": now_millis()
+            }));
+        }
+        // ── ReserveEntityIds: atomic id block ──
+        "ReserveEntityIds" => {
+            let req_id = f
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let n = f.get("count").and_then(|v| v.as_u64()).unwrap_or(1);
+            let first = state.entity_id_reservations;
+            state.entity_id_reservations += n;
+            emit(
+                state,
+                wid,
+                json!({"op":"ReserveEntityIdsResponse","request_id":req_id,
+                "first_id":first,"count":n}),
+            );
+        }
+        // ── dynamic components ──
+        "SetComponentAuthority" => {
+            let eid = f
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let comp = f
+                .get("comp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let request_id = f.get("request_id").cloned();
+            if !worker_has_attr(state, wid, "kernel_admin") {
+                let reason = "component authority changes require the 'kernel_admin' attribute";
+                if let Some(req) = request_id {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"SetComponentAuthorityResponse","request_id":req,
+                        "entity":eid,"comp":comp,"success":false,"reason":reason}),
+                    );
+                } else {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":comp,"reason":reason}),
+                    );
+                }
+                return;
+            }
+            let owner = f
+                .get("owner")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let mode = f
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .and_then(AuthorityMode::from_str);
+            let requested_epoch = frame_authority_epoch(f);
+            let (version, authority_epoch, mode_s) = if let Some(e) = state.entities.get_mut(&eid) {
+                ensure_component_authority(e, &comp);
+                let ca = e.authority.get_mut(&comp).unwrap();
+                if let Some(mode) = mode {
+                    ca.mode = mode;
+                }
+                ca.owner = owner.clone();
+                ca.epoch = requested_epoch.unwrap_or_else(|| ca.epoch.saturating_add(1));
+                let mode_s = ca.mode.as_str();
+                e.version += 1;
+                (e.version, ca.epoch, mode_s)
+            } else {
+                return;
+            };
+            let _ = state.wal_append(&json!({
+                "kind":"component_authority","entity":&eid,"version":version,
+                "writer":wid,"comp":&comp,"owner":owner.clone(),
+                "authority_epoch":authority_epoch,"mode":mode_s
+            }));
+            if let Some(owner_wid) = owner.as_deref() {
+                if state.workers.contains_key(owner_wid) {
+                    grant_authority(state, owner_wid, &eid, &comp);
+                }
+            }
+            if let Some(req) = request_id {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"SetComponentAuthorityResponse","request_id":req,
+                    "entity":eid,"comp":comp,"success":true,
+                    "owner":owner.clone(),"authority_epoch":authority_epoch,"mode":mode_s}),
+                );
+            }
+        }
+        "AddComponent" => {
+            let eid = f
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let comp = f
+                .get("comp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let value = f.get("value").cloned().unwrap_or(Value::Null);
+            // A1 + 5a: only this component's authority holder may add it. Region owner is the fallback
+            // for legacy components; explicit component leases can route add/remove to physics/logic.
+            if !state.entities.contains_key(&eid) {
+                return;
+            }
+            if let Err(reason) = authoritative_component_writer(state, wid, &eid, &comp) {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","entity":eid,"comp":comp,"reason":reason}),
+                );
+                return;
+            }
+            if comp == "acl"
+                && !state
+                    .workers
+                    .get(wid)
+                    .map(|w| w.attributes.iter().any(|a| a == "acl_admin"))
+                    .unwrap_or(false)
+            {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                    "reason":"acl requires the 'acl_admin' attribute"}),
+                );
+                return;
+            }
+            if reject_kernel_reserved_write(state, wid, &eid, &comp) {
+                return;
+            }
+            if reject_stale_authority_epoch(state, wid, &eid, &comp, f) {
+                return;
+            }
+            let exists = state
+                .entities
+                .get(&eid)
+                .map(|e| !e.components.contains_key(&comp))
+                .unwrap_or(false);
+            if exists {
+                let version = if let Some(e) = state.entities.get_mut(&eid) {
+                    e.components.insert(comp.clone(), value.clone());
+                    ensure_component_authority(e, &comp);
+                    e.version += 1;
+                    e.version
+                } else {
+                    return;
+                };
+                let _ = state.wal_append(&json!({
+                    "kind":"component_add","entity":&eid,"version":version,
+                    "writer":wid,"comp":&comp,"value":value.clone()
+                }));
+                let wids: Vec<String> = state.workers.keys().cloned().collect();
+                for w2 in wids {
+                    if state.workers[&w2].view.contains(&eid) {
+                        emit(
+                            state,
+                            &w2,
+                            json!({"op":"AddComponent","entity":eid,"comp":comp,"value":value}),
+                        );
+                    }
+                }
+            }
+        }
+        "RemoveComponent" => {
+            let eid = f
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let comp = f
+                .get("comp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // A1 + 5a: only this component's authority holder may remove it.
+            if !state.entities.contains_key(&eid) {
+                return;
+            }
+            if let Err(reason) = authoritative_component_writer(state, wid, &eid, &comp) {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","entity":eid,"comp":comp,"reason":reason}),
+                );
+                return;
+            }
+            if comp == "acl"
+                && !state
+                    .workers
+                    .get(wid)
+                    .map(|w| w.attributes.iter().any(|a| a == "acl_admin"))
+                    .unwrap_or(false)
+            {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                    "reason":"acl requires the 'acl_admin' attribute"}),
+                );
+                return;
+            }
+            if reject_kernel_reserved_write(state, wid, &eid, &comp) {
+                return;
+            }
+            if reject_stale_authority_epoch(state, wid, &eid, &comp, f) {
+                return;
+            }
+            let had = state
+                .entities
+                .get(&eid)
+                .map(|e| e.components.contains_key(&comp))
+                .unwrap_or(false);
+            if had {
+                let version = if let Some(e) = state.entities.get_mut(&eid) {
+                    e.components.remove(&comp);
+                    e.version += 1;
+                    e.version
+                } else {
+                    return;
+                };
+                let _ = state.wal_append(&json!({
+                    "kind":"component_remove","entity":&eid,"version":version,
+                    "writer":wid,"comp":&comp
+                }));
+                let wids: Vec<String> = state.workers.keys().cloned().collect();
+                for w2 in wids {
+                    if state.workers[&w2].view.contains(&eid) {
+                        emit(
+                            state,
+                            &w2,
+                            json!({"op":"RemoveComponent","entity":eid,"comp":comp}),
+                        );
+                    }
+                }
+            }
+        }
+        // ── threshold transactions (prepare/preload/commit/adopt/abort) ──
+        "ThresholdTx" => {
+            let eid = f
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tx_id = f
+                .get("tx_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let phase = f
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let request_id = f.get("request_id").cloned();
+            let allowed = matches!(
+                phase.as_str(),
+                "prepare" | "preload_ready" | "commit" | "adopt" | "abort"
+            );
+            if eid.is_empty() || tx_id.is_empty() || !allowed {
+                if let Some(req) = request_id {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"ThresholdTxResponse","request_id":req,
+                        "entity":eid,"tx_id":tx_id,"success":false,
+                        "reason":"invalid threshold transaction"}),
+                    );
+                }
+                return;
+            }
+            if state.deleted_entities.contains(&eid) {
+                if let Some(req) = request_id {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"ThresholdTxResponse","request_id":req,
+                        "entity":eid,"tx_id":tx_id,"phase":phase,
+                        "success":false,"reason":"entity tombstoned"}),
+                    );
+                } else {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,
+                        "comp":"threshold.tx","reason":"entity tombstoned"}),
+                    );
+                }
+                return;
+            }
+            if let Err(reason) = authoritative_entity_owner(state, wid, &eid) {
+                if let Some(req) = request_id {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"ThresholdTxResponse","request_id":req,
+                        "entity":eid,"tx_id":tx_id,"success":false,"reason":reason}),
+                    );
+                } else {
+                    emit(
+                        state,
+                        wid,
+                        json!({"op":"UpdateRejected","entity":eid,"comp":"threshold.tx","reason":reason}),
+                    );
+                }
+                return;
+            }
+            if reject_stale_authority_epoch(state, wid, &eid, "threshold.tx", f) {
+                return;
+            }
+            let from_value = f.get("from").cloned().unwrap_or(Value::Null);
+            let to_value = f.get("to").cloned().unwrap_or(Value::Null);
+            let ts_ms = now_millis();
+            let tx_value =
+                threshold_tx_value(&tx_id, &phase, from_value.clone(), to_value.clone(), ts_ms);
+            let commit_phase = phase == "commit";
+            let final_phase = matches!(phase.as_str(), "adopt" | "abort");
+            let old_owner = state
+                .entities
+                .get(&eid)
+                .and_then(|e| state.region_worker.get(&e.region).cloned());
+            let commit_target = if commit_phase {
+                to_value
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+            let new_owner = commit_target
+                .as_deref()
+                .and_then(|region| state.region_worker.get(region).cloned());
+            let (version, existed, authority_epoch, old_region, new_region, moved_comps, authority) =
+                if let Some(e) = state.entities.get_mut(&eid) {
+                    let existed = e.components.contains_key("threshold.tx");
+                    let old_region = e.region.clone();
+                    if final_phase {
+                        e.components.remove("threshold.tx");
+                    } else {
+                        e.components
+                            .insert("threshold.tx".to_string(), tx_value.clone());
+                    }
+                    if commit_phase {
+                        if let Some(to) = to_value.as_str().filter(|s| !s.is_empty()) {
+                            e.region = to.to_string();
+                        }
+                    }
+                    let (authority_epoch, moved_comps) = if commit_phase {
+                        advance_physics_island_authority(
+                            e,
+                            old_owner.as_deref(),
+                            new_owner.as_deref(),
+                        )
+                    } else {
+                        (component_authority_epoch(e, "pos"), Vec::new())
+                    };
+                    let new_region = e.region.clone();
+                    e.version += 1;
+                    (
+                        e.version,
+                        existed,
+                        authority_epoch,
+                        old_region,
+                        new_region,
+                        moved_comps,
+                        authority_to_json(&e.authority),
+                    )
+                } else {
+                    return;
+                };
+            let _ = state.wal_append(&json!({
+                "kind":format!("threshold_{}", phase),
+                "entity":&eid,"version":version,"writer":wid,
+                "tx_id":&tx_id,"authority_epoch":authority_epoch,
+                "authority":authority,
+                "components":moved_comps.clone(),
+                "from": from_value,
+                "to": to_value,
+                "ts_ms": ts_ms
+            }));
+            if commit_phase && old_region != new_region {
+                let old_wid = state.region_worker.get(&old_region).cloned();
+                let new_wid = state.region_worker.get(&new_region).cloned();
+                if let Some(ow) = old_wid {
+                    if state.workers.contains_key(&ow) {
+                        for comp in &moved_comps {
+                            revoke_authority(state, &ow, &eid, comp);
+                        }
+                    }
+                }
+                if let Some(nw) = new_wid {
+                    if state.workers.contains_key(&nw) {
+                        if !state.workers[&nw].view.contains(&eid) {
+                            send_full(state, &nw, &eid);
+                        }
+                        for comp in &moved_comps {
+                            grant_authority(state, &nw, &eid, comp);
+                        }
+                    }
+                }
+            }
+            let wids: Vec<String> = state.workers.keys().cloned().collect();
+            for w2 in wids {
+                if state.workers[&w2].view.contains(&eid) {
+                    if final_phase {
+                        emit(
+                            state,
+                            &w2,
+                            json!({"op":"RemoveComponent","entity":eid,"comp":"threshold.tx"}),
+                        );
+                    } else if existed {
+                        emit(
+                            state,
+                            &w2,
+                            json!({"op":"ComponentUpdate","entity":eid,"comp":"threshold.tx","value":tx_value}),
+                        );
+                    } else {
+                        emit(
+                            state,
+                            &w2,
+                            json!({"op":"AddComponent","entity":eid,"comp":"threshold.tx","value":tx_value}),
+                        );
+                    }
+                }
+            }
+            if let Some(req) = request_id {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"ThresholdTxResponse","request_id":req,
+                    "entity":eid,"tx_id":tx_id,"phase":phase,"success":true}),
+                );
+            }
+        }
+        // ── runtime flags (broadcast) ──
+        "FlagUpdate" => {
+            let flag = f
+                .get("flag")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let value = f.get("value").cloned().unwrap_or(Value::Null);
+            state.flags.insert(flag.clone(), value.clone());
+            let wids: Vec<String> = state.workers.keys().cloned().collect();
+            for w2 in wids {
+                emit(
+                    state,
+                    &w2,
+                    json!({"op":"FlagUpdate","flag":flag,"value":value}),
+                );
+            }
+        }
+        // ── metrics (load-aware LB input) ──
+        "Metrics" => {
+            let load = f.get("load").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            state.worker_load.insert(wid.to_string(), load);
+        }
+        // CROSS-BROKER MESH inbound: a neighbour broker handed us an entity -> adopt it locally
+        "MeshHandoff" => {
+            let eid = f
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if eid.is_empty() {
+                return;
+            }
+            // L6 LEASE FENCE (the authoritative split-brain reject): a MeshHandoff carries the SENDER's owned
+            // (src_region, lease_epoch). If the sender's epoch is STRICTLY LOWER than the epoch THIS broker
+            // knows for that region (learned from the registry: a newer incarnation took it over with a higher
+            // epoch), the sender is a STALE incarnation returned from a partition -> REFUSE it: do NOT adopt,
+            // do NOT MeshAck (so it stays parked in the stale owner's pending_mesh, never double-owned here).
+            // ADDITIVE/back-compat: a frame with NO lease_epoch (legacy single-incarnation tests) or one whose
+            // epoch is >= what we know is accepted unchanged.
+            if let (Some(src_region), Some(sender_epoch)) = (
+                f.get("src_region").and_then(|v| v.as_str()),
+                f.get("lease_epoch").and_then(|v| v.as_u64()),
+            ) {
+                if let Some(&known_epoch) = state.region_lease_epoch.get(src_region) {
+                    if sender_epoch < known_epoch {
+                        state.metrics.fenced_stale_handoffs += 1;
+                        let rec = json!({"reason":"stale lease epoch (fenced incarnation)",
+                            "entity":eid,"src_region":src_region,
+                            "sender_lease_epoch":sender_epoch,"known_lease_epoch":known_epoch});
+                        state.rejected.push(rec);
+                        if state.rejected.len() > 256 {
+                            let drop = state.rejected.len() - 256;
+                            state.rejected.drain(0..drop);
+                        }
+                        eprintln!(
+                            "[fence] REJECTED stale-epoch MeshHandoff for {eid} from region '{src_region}' lease_epoch={sender_epoch} < known {known_epoch} (returned-from-partition incarnation fenced; not adopted, not ACK'd)"
+                        );
+                        return;
+                    }
+                }
+            }
+            // G2.1d test: DROP the inbound handoff (no adopt, no ack) -> the wire-transit cut (A mesh_out'd,
+            // B never adopted). On restore the resolver rebuilds A.pending_mesh and resends -> exactly-once.
+            if state.mesh_adopt_drop {
+                return;
+            }
+            if state.deleted_entities.contains(&eid) {
+                emit(state, wid, json!({"op":"MeshAck","entity":eid}));
+                return;
+            }
+            // SEAM-INTEREST -> CROSS transition: this entity was being PROJECTED to us as a ghost (it was near
+            // the seam in the neighbour zone) and has now genuinely CROSSED. The real, authoritative entity is
+            // about to be adopted into `entities`; drop the read-only ghost first so the two never coexist (the
+            // ghost was the aim-point; now WE own the real thing). remove_ghost also clears it from worker views,
+            // and spawn_in_region below re-checks-it-out as a real (authoritative) entity.
+            if state.ghosts.contains_key(&eid) {
+                remove_ghost(state, &eid);
+            }
+            // adopt it if NEW; if we already have it this is a RE-SEND (our earlier MeshAck was lost) --
+            // don't double-spawn, but DO re-ACK below so the sender can release it. ACK in BOTH cases.
+            if !state.entities.contains_key(&eid) {
+                let pos = arr2(f.get("pos"));
+                let vel = arr2(f.get("vel")); // adopt the inbound velocity (hardcoded [0,0] -> C1 seam break)
+                let authority_epoch = f.get("authority_epoch").and_then(|v| v.as_u64());
+                let authority_snapshot = f.get("authority").cloned();
+                let comps: Map<String, Value> = f
+                    .get("components")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                // the zone this adopted entity now BELONGS to = one of THIS broker's owned regions (NOT a
+                // position-derive against our local W|E boundary, which mislabeled a Fold-into-ZB as "W").
+                let target = f.get("target").and_then(|v| v.as_str());
+                let adopt_region = receiving_region_for_adopt(state, pos, target);
+                spawn_in_region(
+                    state,
+                    &eid,
+                    pos,
+                    vel,
+                    comps,
+                    Some(adopt_region.as_str()),  // FIX: pass the receiving zone so the WORKER grant-loop inside
+                    authority_epoch,      // spawn_in_region uses the correct region (Z_i_j), not a pos-derived
+                    authority_snapshot,   // W/E. Without this the cross-broker-adopted bot was orphaned
+                );                        // (broker owned it, no worker simulated it) -> frozen at the seam.
+                // OVERRIDE the region spawn_in_region derived from position with the receiving zone's region
+                // (spawn_region re-derives W|E from x for the LOCAL create/split path; an inbound mesh adopt
+                // is the one case where the region is dictated by WHICH broker owns the entity now, not by x).
+                if let Some(e) = state.entities.get_mut(&eid) {
+                    if e.region != adopt_region {
+                        e.region = adopt_region.clone();
+                    }
+                }
+                eprintln!("[mesh] adopted {eid} (region '{adopt_region}'; vel {vel:?} carried; now ours)");
+            }
+            // confirm receipt to the sender (the mesh-link worker that delivered this) so it releases the
+            // parked entity from pending_mesh. Idempotent: re-sends are re-ACK'd, never double-adopted.
+            // G2.1c: GW_MESH_ACK_DROP holds the ack so the entity stays in-flight (A.pending + B.adopted).
+            if !state.mesh_ack_drop {
+                emit(state, wid, json!({"op":"MeshAck","entity":eid}));
+            }
+        }
+        // ── CROSS-BROKER SEAM-INTEREST inbound: a neighbour broker is projecting one of ITS near-seam entities
+        // to us as a READ-ONLY ghost (so OUR worker can see + target it across the seam). We store it in
+        // `ghosts` -- NEVER in `entities` -- so it is structurally non-authoritative: it can't be leased, can't
+        // be granted authority, and a write to it is rejected (validate_and_apply_nosync's not-in-`entities`
+        // gate). It is transient (no WAL): the source re-pushes it every tick; if the source stops, our TTL
+        // reaper drops it. The SAME eid the source uses is the key, so if the entity later genuinely CROSSES
+        // (a MeshHandoff for the same eid), the adopt removes the ghost and the real entity takes over (handled
+        // in the MeshHandoff arm above via the ghost-supersede below). ──
+        "MeshGhost" => {
+            let eid = match f.get("entity").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return,
+            };
+            // GUARD: if we ALREADY OWN this eid as a real entity (it lives in `entities` here -- e.g. it crossed
+            // to us, or the source is mislabeled), do NOT also ghost it. A real entity dominates its ghost: we
+            // are its authority now; a stale projection from the old owner must not shadow it.
+            if state.entities.contains_key(&eid) {
+                return;
+            }
+            let pos = arr2(f.get("pos"));
+            let vel = arr2(f.get("vel"));
+            let components: Map<String, Value> = f
+                .get("components")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let owner_region = f
+                .get("owner_region")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let first_time = !state.ghosts.contains_key(&eid);
+            state.ghosts.insert(
+                eid.clone(),
+                GhostEntity {
+                    pos,
+                    vel,
+                    components,
+                    owner_region,
+                    last_seen: Instant::now(),
+                },
+            );
+            // mirror it to the interested workers (AddEntity/ComponentUpdate stream; NEVER an AuthorityChange).
+            propagate_ghost(state, &eid, first_time);
+        }
+        // source proactively retracts a ghost (e.g. the underlying entity was deleted). Idempotent.
+        "MeshGhostRemove" => {
+            if let Some(eid) = f.get("entity").and_then(|v| v.as_str()) {
+                remove_ghost(state, eid);
+            }
+        }
+        _ => {}
+    }
+}
+
+// the GhostEntity analogue of matches_query (a ghost has pos + components + owner_region, no ACL/authority).
+fn ghost_query_match(g: &GhostEntity, q: &Value) -> bool {
+    match q.get("type").and_then(|v| v.as_str()).unwrap_or("all") {
+        "all" => true,
+        "sphere" => {
+            let c = q.get("center").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
+            let r = q.get("radius").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let dx = g.pos[0] - c[0];
+            let dy = g.pos[1] - c[1];
+            dx * dx + dy * dy <= r * r
+        }
+        "box" => {
+            let lo = q.get("min").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
+            let hi = q.get("max").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
+            g.pos[0] >= lo[0] && g.pos[0] <= hi[0] && g.pos[1] >= lo[1] && g.pos[1] <= hi[1]
+        }
+        "component" => {
+            let comp = q.get("comp").and_then(|v| v.as_str()).unwrap_or("");
+            g.components.contains_key(comp) || comp == "pos" || comp == "vel"
+        }
+        // a ghost's "region" is its OWNER region (the source zone); a region query matches on that.
+        "region" => q.get("region").and_then(|v| v.as_str()) == Some(g.owner_region.as_str()),
+        _ => false,
+    }
+}
+
+fn matches_query(e: &Entity, q: &Value) -> bool {
+    match q.get("type").and_then(|v| v.as_str()).unwrap_or("all") {
+        "all" => true,
+        "sphere" => {
+            let c = q.get("center").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
+            let r = q.get("radius").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let dx = e.pos[0] - c[0];
+            let dy = e.pos[1] - c[1];
+            dx * dx + dy * dy <= r * r
+        }
+        "box" => {
+            let lo = q.get("min").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
+            let hi = q.get("max").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
+            e.pos[0] >= lo[0] && e.pos[0] <= hi[0] && e.pos[1] >= lo[1] && e.pos[1] <= hi[1]
+        }
+        "component" => {
+            let comp = q.get("comp").and_then(|v| v.as_str()).unwrap_or("");
+            e.components.contains_key(comp) || comp == "pos" || comp == "vel"
+        }
+        "region" => q.get("region").and_then(|v| v.as_str()) == Some(e.region.as_str()),
+        _ => false,
+    }
+}
+
+// A2 thin-fill (2026-06-20): the frame length `n` is peer-controlled; `vec![0u8; n]` would alloc up
+// to 4 GiB on a single crafted frame = a one-packet remote OOM-DoS. Clamp before allocating.
+const MAX_FRAME: usize = 8 * 1024 * 1024; // 8 MiB -- generous vs any real op, rejects the DoS
+
+async fn read_frame<R: AsyncReadExt + Unpin>(rd: &mut R) -> Option<Value> {
+    let mut hdr = [0u8; 4];
+    rd.read_exact(&mut hdr).await.ok()?;
+    let n = u32::from_be_bytes(hdr) as usize;
+    if n > MAX_FRAME {
+        return None; // oversized frame -> drop the connection (the caller breaks on None)
+    }
+    let mut body = vec![0u8; n];
+    rd.read_exact(&mut body).await.ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
+async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>) {
+    sock.set_nodelay(true).ok();
+    let (mut rd, mut wr) = sock.into_split();
+
+    let first = match read_frame(&mut rd).await {
+        Some(f) => f,
+        None => return,
+    };
+    if first.get("op").and_then(|v| v.as_str()) != Some("WorkerConnect") {
+        return;
+    }
+    let wid = match first.get("worker_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let region = first
+        .get("region")
+        .and_then(|v| v.as_str())
+        .unwrap_or("OBS")
+        .to_string();
+    let attributes: HashSet<String> = first
+        .get("attributes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // L4 protocol-versioning: a peer MAY declare its wire-format version via `proto` (u64).
+    // ABSENT => legacy v0 (accepted, back-compat). PRESENT but outside [MIN_PROTO, PROTOCOL_VERSION]
+    // => reject with a clean VersionReject frame + close the connection BEFORE the worker registers,
+    // so a rolling broker upgrade can't let an incompatible peer corrupt the mesh.
+    if let Some(proto) = first.get("proto").and_then(|v| v.as_u64()) {
+        if proto < MIN_PROTO || proto > PROTOCOL_VERSION {
+            let rej = frame(&json!({
+                "op": "VersionReject",
+                "reason": "incompatible protocol version",
+                "peer_proto": proto,
+                "broker_proto": PROTOCOL_VERSION,
+                "min_proto": MIN_PROTO,
+            }));
+            let _ = wr.write_all(&rej).await;
+            println!("[broker] worker '{wid}' REJECTED -- incompatible proto {proto} (broker {PROTOCOL_VERSION}, min {MIN_PROTO})");
+            return; // do NOT register; the connection drops as wr/rd go out of scope
+        }
+    }
+
+    // T1: BOUNDED egress channel (capacity CHANNEL_CAP). A stuck consumer can hold AT MOST CHANNEL_CAP unsent
+    // frames; emit()'s try_send then fails Full and (for a critical frame) flags the worker for force-disconnect.
+    // The bound is the channel TYPE, not a flag -- the structural RAM cap on this consumer's egress.
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAP);
+    let out_queue = Arc::new(AtomicU64::new(0)); // G4 backpressure: per-worker egress backlog depth
+    let dropped = Arc::new(AtomicU64::new(0)); // G4 backpressure: degradable frames dropped under backpressure
+    let disconnect = Arc::new(AtomicBool::new(false)); // T1: set when the hard egress cap was hit on a critical frame
+    let disconnect_rd = disconnect.clone(); // T1: the read loop watches this to tear the conn down even if the client never sends/closes
+    let oq_writer = out_queue.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(buf) = rx.recv().await {
+            oq_writer.fetch_sub(1, Ordering::Relaxed); // dequeued -> about to write to the socket
+            if wr.write_all(&buf).await.is_err() {
+                break;
+            }
+        }
+        // rx closed (the WorkerHandle's tx was dropped -- normal disconnect OR a T1 force-disconnect via
+        // reap_disconnecting). Dropping `wr` here closes the socket's write half so the peer reads EOF.
+    });
+
+    {
+        let mut s = state.lock().await;
+        s.workers.insert(
+            wid.clone(),
+            WorkerHandle {
+                region: region.clone(),
+                attributes,
+                view: HashSet::new(),
+                authority_epochs: HashMap::new(),
+                aoi_center: None,
+                aoi_radius: None,
+                fidelity_full_radius: None,
+                fidelity_coarse_rate: 1,
+                fidelity_coarse_grid: 0.0,
+                fidelity_seq: HashMap::new(),
+                tx,
+                out_queue,
+                dropped,
+                disconnect,
+                grid_cells: Vec::new(),
+            },
+        );
+        update_interest_grid(&mut s, &wid); // Interest: default a fresh worker to global (no AOI yet); an Interest op re-indexes it
+        println!("[broker] worker '{wid}' connected as region '{region}'");
+        if region == "STANDBY" {
+            s.standbys.push(wid.clone()); // a hot spare for failover
+        } else if region != "OBS" && region != "MESH" {
+            // ANY real zone-region leases authority: W/E for the position-sharded seam, AND arbitrary
+            // open-world regions (planets / fold-targets like "MARS") so a PORTAL FOLD can hand authority
+            // to a non-adjacent zone. OBS (observer) + MESH (cross-broker link) are control-regions.
+            // A3 FENCING (resilience-#1, 2026-06-20): the insert WAS unconditional, so a reconnecting or
+            // attacker worker claiming an already-leased region would STEAL it (split-brain -- and would
+            // then PASS the authority check, defeating A1). Grant ONLY if the region is FREE or its lease
+            // has EXPIRED; if a DIFFERENT worker still holds a LIVE lease, refuse (this worker observes
+            // the region but owns nothing). A failover (expired lease) or a same-worker reconnect still grants.
+            let now = Instant::now();
+            let live_owner = s
+                .region_worker
+                .get(&region)
+                .cloned()
+                .filter(|owner| owner != &wid)
+                .filter(|_| {
+                    s.region_expires
+                        .get(&region)
+                        .map(|exp| *exp > now)
+                        .unwrap_or(false)
+                });
+            if let Some(held) = live_owner {
+                println!("[broker] worker '{wid}' REFUSED region '{region}' -- still held by a live lease ('{held}')");
+            } else {
+                let ttl = s.lease_ttl;
+                s.region_worker.insert(region.clone(), wid.clone());
+                s.region_expires
+                    .insert(region.clone(), now + Duration::from_secs_f64(ttl));
+                // start/renew the lease
+            }
+        }
+        checkout_all(&mut s, &wid);
+    }
+
+    loop {
+        // T1: race the next inbound frame against a short poll of the force-disconnect flag, so a consumer
+        // that hit the hard egress cap (set by emit/reaped in dispatch) is torn down within ~100ms EVEN IF it
+        // never sends or closes its own socket (a malicious "connect, never read, never write" client). The
+        // bounded channel already caps its RAM at CHANNEL_CAP; this guarantees the parked read task + socket
+        // are released too. Structural: the flag IS set by hitting the channel's capacity, not by any config.
+        let frame = tokio::select! {
+            f = read_frame(&mut rd) => f,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if disconnect_rd.load(Ordering::Relaxed) { break; }
+                continue;
+            }
+        };
+        match frame {
+            None => break,
+            Some(f) => {
+                if f.get("op").and_then(|v| v.as_str()) == Some("Disconnect") {
+                    break;
+                }
+                {
+                    let mut s = state.lock().await;
+                    // T1: measure the PER-FRAME dispatch lock-hold (the egress fan-out of a critical
+                    // EntityEvent to N observers happens here, inside this hold) so lock_max_hold_ms in the
+                    // InspectorFrame reflects the storm -- the monitor-tick instrumentation does NOT cover
+                    // this path. record_lock_hold keeps only a max (cheap), so it's safe at high op rates.
+                    let _t = Instant::now();
+                    dispatch(&mut s, &wid, &f);
+                    record_lock_hold(&mut s, "dispatch", _t.elapsed());
+                }
+                if disconnect_rd.load(Ordering::Relaxed) {
+                    break; // this consumer was force-disconnected during its own frame's fan-out
+                }
+            }
+        }
+    }
+
+    {
+        let mut s = state.lock().await;
+        remove_from_interest_grid(&mut s, &wid); // Interest: drop the worker's grid cells + global membership first
+        s.workers.remove(&wid);
+    }
+    writer.abort();
+}
+
+// L2 service-discovery: a SMALL registry (GW_REGISTRY=dir) -- each broker writes its OWN per-region file
+// {addr, hb_ms} (so two brokers never race on one file). registry_read merges all of them. The mesh link
+// resolves the neighbour addr FROM the registry each retry, so a replaced node (B -> B' at a NEW addr) is
+// followed automatically -- the L2 gap was the STATIC GW_MESH addr. NOT a k8s control-plane.
+fn registry_read(reg_dir: &str) -> Map<String, Value> {
+    let mut out = Map::new();
+    if let Ok(rd) = std::fs::read_dir(reg_dir) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let (Some(region), Ok(txt)) =
+                    (p.file_stem().and_then(|s| s.to_str()), std::fs::read_to_string(&p))
+                {
+                    if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                        out.insert(region.to_string(), v);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// L6 lease-fenced registry: the heartbeat also stamps the lease_epoch this incarnation holds for the region,
+// so a peer reading the registry learns the CURRENT owner's epoch (and a superseded incarnation is detectable
+// by a strictly higher epoch under a different addr). lease_epoch is additive: an old record without it reads
+// as None on the peer side -> legacy-accepted.
+//
+// REPLACE-IF-NEWER (GPT-5 Pro: "Registry writes are atomic replace-if-newer, not blind overwrite"): when two
+// incarnations both own region E (the split-brain window), a STALE incarnation's heartbeat must NOT clobber a
+// newer one's registry record. Only write if our lease_epoch is >= the epoch currently recorded -- so old-B@10
+// can never overwrite B'@11, and the highest-epoch holder wins the registry. A legacy record without an epoch
+// (None) is treated as 0 -> still overwritable by an epoch'd writer (back-compat upgrade path).
+fn registry_heartbeat(reg_dir: &str, region: &str, addr: &str, now_ms: u64, lease_epoch: u64) {
+    let path = std::path::Path::new(reg_dir).join(format!("{region}.json"));
+    let current = registry_lease_epoch(reg_dir, region).unwrap_or(0);
+    if lease_epoch < current {
+        return; // a newer incarnation owns this region in the registry -- do not clobber it (replace-if-newer)
+    }
+    if let Ok(s) =
+        serde_json::to_string(&json!({"addr": addr, "hb_ms": now_ms, "lease_epoch": lease_epoch}))
+    {
+        let _ = std::fs::write(path, s); // best-effort; replace-if-newer guards the cross-incarnation race
+    }
+}
+
+// L6: the lease_epoch currently recorded in the registry for `region` (0 / None if absent or legacy).
+fn registry_lease_epoch(reg_dir: &str, region: &str) -> Option<u64> {
+    registry_read(reg_dir)
+        .get(region)
+        .and_then(|e| e.get("lease_epoch"))
+        .and_then(|v| v.as_u64())
+}
+
+// L2: a mesh connect-loop that resolves the neighbour addr from the registry each retry (follows B -> B').
+// Mirrors the static GW_MESH connect-loop body but with dynamic addr resolution. The 2-phase handoff +
+// pending_mesh resend (unchanged) deliver across the gap; this just keeps the LINK pointed at the live node.
+fn spawn_mesh_link_dynamic(st: Arc<Mutex<ServerState>>, region: String, reg_dir: String) {
+    tokio::spawn(async move {
+        loop {
+            let addr = registry_read(&reg_dir)
+                .get(&region)
+                .and_then(|e| e.get("addr"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(addr) = addr {
+                if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
+                    stream.set_nodelay(true).ok();
+                    let (mut rd, mut wr) = stream.into_split();
+                    let hs = frame(&json!({"op":"WorkerConnect","worker_id":format!("mesh-link-{region}"),"region":"MESH","proto":PROTOCOL_VERSION}));
+                    if wr.write_all(&hs).await.is_ok() {
+                        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                        st.lock().await.mesh.insert(region.clone(), tx);
+                        println!("[mesh] DISCOVERED + linked region {region} @ {addr} (from registry)");
+                        let st_ack = st.clone();
+                        tokio::spawn(async move {
+                            while let Some(f) = read_frame(&mut rd).await {
+                                if f.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
+                                    if let Some(eid) = f.get("entity").and_then(|v| v.as_str()) {
+                                        let mut s = st_ack.lock().await;
+                                        s.pending_mesh.remove(eid);
+                                        let _ = s.wal_append(&json!({"kind":"mesh_acked","entity":eid}));
+                                    }
+                                }
+                            }
+                        });
+                        while let Some(buf) = rx.recv().await {
+                            if wr.write_all(&buf).await.is_err() {
+                                break; // link dropped -> fall through, re-resolve addr (follows a moved node)
+                            }
+                        }
+                        st.lock().await.mesh.remove(&region);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+}
+
+#[tokio::main]
+async fn main() {
+    let port: u16 = std::env::var("GW_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7777);
+    let lease_ttl: f64 = std::env::var("GW_LEASE_TTL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30.0);
+    let threshold_ttl_ms: u64 = std::env::var("GW_THRESHOLD_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000);
+
+    let mut state = ServerState::new(lease_ttl);
+    state.threshold_ttl = Duration::from_millis(threshold_ttl_ms);
+
+    // durability: recover the EXACT pre-crash store from the WAL alone, then continue logging
+    if let Ok(path) = std::env::var("GW_WAL") {
+        // G2: GW_RESTORE_OFFSET=<bytes> rolls the world back to a snapshot cut (else full recovery)
+        let restore_offset = std::env::var("GW_RESTORE_OFFSET").ok().and_then(|s| s.parse::<u64>().ok());
+        let (store, tombstones, topology, recovered_pending, report) =
+            recover_from_wal_report(&path, restore_offset);
+
+        // #2 RESTORE DRY-RUN: GW_RESTORE_DRYRUN=1 validates a WAL (version / corrupt-tail / content hash /
+        // entity_count) and EXITS WITHOUT serving, so an operator can vet a WAL before booting the broker on it.
+        if std::env::var("GW_RESTORE_DRYRUN").is_ok() {
+            let dry = json!({
+                "dry_run": true,
+                "wal": path,
+                "entity_count": store.len(),
+                "store_hash": format!("{:016x}", store_content_hash(&store)),
+                "wal_version": report.wal_version,
+                "truncated_tail_bytes": report.truncated_tail_bytes,
+                "error": report.error,
+            });
+            println!("{}", serde_json::to_string(&dry).unwrap());
+            // refuse => non-zero exit so a script can gate on it; clean => 0.
+            std::process::exit(if report.error.is_some() { 2 } else { 0 });
+        }
+
+        // not a dry-run: a refuse (mid-corruption / unknown version) must NOT serve partial state -> fail closed.
+        if let Some(err) = report.error {
+            eprintln!("[rust-broker] WAL recovery REFUSED — not serving: {}", err);
+            std::process::exit(2);
+        }
+        let n = store.len();
+        state.entities = store;
+        state.deleted_entities = tombstones;
+        // R0.2: restore the partition topology (boundary/splits/mesh) so the router matches recovered placement.
+        if let Some(pc) = topology {
+            if let Some(b) = pc.get("boundary").and_then(|v| v.as_f64()) {
+                state.boundary = b;
+            }
+            // N-ZONE: restore the full strip cut list so the router rebuilds the SAME N-way assignment. A WAL
+            // predating N-zone has no `boundaries` field -> fall back to the single restored `boundary` (the
+            // 1-element W|E list), so old WALs recover byte-for-byte.
+            if let Some(bs) = pc.get("boundaries").and_then(|v| v.as_array()) {
+                let v: Vec<f64> = bs.iter().filter_map(|x| x.as_f64()).collect();
+                if !v.is_empty() {
+                    state.boundaries = v;
+                }
+            } else {
+                state.boundaries = vec![state.boundary];
+            }
+            if let Some(splits) = pc.get("splits").and_then(|v| v.as_object()) {
+                state.splits = splits
+                    .iter()
+                    .filter_map(|(r, v)| {
+                        v.as_array()
+                            .map(|a| (r.clone(), a.iter().filter_map(|x| x.as_f64()).collect()))
+                    })
+                    .collect();
+            }
+            if let Some(mesh) = pc.get("mesh_regions").and_then(|v| v.as_array()) {
+                state.mesh_regions = mesh.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+            }
+            state.zone_topology_rev = pc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("[rust-broker] R0.2: restored partition_config boundary={} boundaries={:?} splits={} mesh={}",
+                state.boundary, state.boundaries, state.splits.len(), state.mesh_regions.len());
+        }
+        // G2.1d: an in-flight handoff (mesh_out without mesh_acked by the cut) is "in the channel" -> rebuild
+        // pending_mesh from the full mesh_out payload so startup/link-ready resends it and the target adopts
+        // it exactly once (the receiver adopt is idempotent). Closes the wire-transit snapshot-loss window.
+        for (eid, payload) in recovered_pending {
+            let target = payload.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let handoff = json!({"op":"MeshHandoff","entity":eid.clone(),"target":target.clone(),
+                "pos":payload.get("pos").cloned().unwrap_or(Value::Null),
+                "vel":payload.get("vel").cloned().unwrap_or(Value::Null),
+                "authority_epoch":payload.get("authority_epoch").cloned().unwrap_or(Value::Null),
+                "authority":payload.get("authority").cloned().unwrap_or(Value::Null),
+                "components":payload.get("components").cloned().unwrap_or(Value::Null)});
+            state.pending_mesh.insert(eid, (handoff, Instant::now(), target));
+        }
+        if !state.pending_mesh.is_empty() {
+            println!("[rust-broker] G2.1d: restored {} in-flight handoff(s) to pending_mesh -> will resend",
+                state.pending_mesh.len());
+        }
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("WAL open failed");
+        // #2: seed wal_bytes from the ACTUAL on-disk size so the compaction threshold + GW_RESTORE_OFFSET stay
+        // consistent AND ensure_wal_header correctly no-ops on a populated WAL (only a truly-empty file is
+        // header-stamped). Previously wal_bytes started at 0 even on a recovered (non-empty) WAL.
+        state.wal_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        state.wal = Some(f);
+        state.wal_path = path.clone(); // R0.3: the tick uses this to rewrite/rename the WAL on compaction
+        state.ensure_wal_header(); // stamp the v1 version header iff this is a brand-new (empty) WAL
+        println!(
+            "[rust-broker] WAL {path}: recovered {n} entities from the log (durable-recovery fix); wal_version={}, on-disk={} bytes; compaction threshold={} bytes (0=off)",
+            report.wal_version, state.wal_bytes, state.wal_compact_bytes
+        );
+    }
+
+    // #2 CROSS-MACHINE: the bind ADDRESS is config-driven (GW_BIND), default "127.0.0.1" so every existing
+    // localhost gate is byte-for-byte unchanged. The DIAL side was ALREADY host-agnostic -- GW_MESH="E=host:port"
+    // and the registry `addr` both feed TcpStream::connect(&addr), which takes any host:port (incl. a remote IP /
+    // DNS name). The one thing pinned to loopback was the LISTENER: bind(("127.0.0.1", port)) means a broker on
+    // machine A literally cannot accept a connection from machine B, so a cross-host mesh dial would refuse. Set
+    // GW_BIND=0.0.0.0 (all interfaces) -- or a specific NIC IP -- to let real remote peers reach this listener.
+    // Note: this is a config VALUE consumed exactly once at bind (no flag in any hot path, no second code branch);
+    // GW_MESH stays THE neighbour-address config (region=host:port), so there is no duplicate "GW_NEIGHBORS" knob
+    // -- the cross-host mesh is "dial GW_MESH host:port (already works) + listen on GW_BIND so the peer can dial back".
+    let bind_host = std::env::var("GW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let listener = TcpListener::bind((bind_host.as_str(), port))
+        .await
+        .unwrap_or_else(|e| panic!("bind {bind_host}:{port} failed: {e}"));
+    println!(
+        "[rust-broker] Godworks OS data-plane live @ {bind_host}:{port} (Rust/tokio; full reference-parity; lease_ttl={lease_ttl})"
+    );
+
+    let state = Arc::new(Mutex::new(state));
+
+    // liveness monitor (failover) + dynamic load-balancing monitor on the broker's clock
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let nominal = Duration::from_millis(300);
+            let mut tick = tokio::time::interval(nominal);
+            let mut last_wake = Instant::now();
+            loop {
+                tick.tick().await;
+                // #3 metrics: tick-lag = how much LATER this tick fired than the 300ms schedule (the broker's
+                // saturation signal -- a starved/locked-up broker can't keep its monitor cadence). >= 0; ~0 healthy.
+                let elapsed = last_wake.elapsed();
+                last_wake = Instant::now();
+                let lag = elapsed.as_secs_f64() * 1000.0 - nominal.as_secs_f64() * 1000.0;
+                let mut s = st.lock().await;
+                s.tick_lag_ms = if lag > 0.0 { lag } else { 0.0 };
+                let _t = Instant::now(); check_leases(&mut s); record_lock_hold(&mut s, "check_leases", _t.elapsed());
+                let _t = Instant::now(); rebalance(&mut s); record_lock_hold(&mut s, "rebalance", _t.elapsed());
+                let _t = Instant::now(); rebalance_2d(&mut s); record_lock_hold(&mut s, "rebalance_2d", _t.elapsed());
+                let _t = Instant::now(); maybe_split(&mut s); record_lock_hold(&mut s, "maybe_split", _t.elapsed());
+                let _t = Instant::now(); process_rebalance_jobs(&mut s); record_lock_hold(&mut s, "rebalance_jobs", _t.elapsed());
+                resend_pending_mesh(&mut s); // re-deliver any cross-broker handoff the neighbour hasn't ACK'd
+                push_border_ghosts(&mut s);  // CROSS-BROKER SEAM-INTEREST: project this broker's near-seam entities to the meshed neighbour(s) as read-only ghosts
+                reap_stale_ghosts(&mut s);   // drop ghosts whose source stopped refreshing (left the band / link dropped)
+                gc_threshold_timeouts(&mut s);
+                update_load_governor(&mut s); // L3: derive load_level from the egress backlog -> degradation keys off it
+                // #3 GRACEFUL-DRAIN progress: while draining, keep handing owned entities to neighbours (a body that
+                // arrived/was-created-pre-drain or whose first hand-off raced a momentarily-down link gets swept up
+                // here). When BOTH entities and pending_mesh are empty, every owned entity has been ACK'd onto a
+                // neighbour (conservation-exact via the mesh path) -> the drain is COMPLETE; exit 0 if drain_exit so a
+                // rolling deploy proceeds. drain_exit=false (a test) leaves it alive to be asserted against.
+                if s.draining {
+                    if !s.entities.is_empty() {
+                        let _ = drain_handoff_owned(&mut s);
+                    }
+                    if s.entities.is_empty() && s.pending_mesh.is_empty() && !s.mesh.is_empty() {
+                        if s.drain_exit {
+                            println!("[drain] COMPLETE -- all entities handed off + ACK'd by neighbour(s); exiting 0 (clean rolling-deploy shutdown)");
+                            std::process::exit(0);
+                        }
+                    }
+                }
+                // R0.3: bound the WAL on disk. Runs under THIS lock (no concurrent writer -> no torn-write race);
+                // a no-op until wal_bytes exceeds the threshold, so the per-tick cost is one comparison.
+                let _t = Instant::now(); s.maybe_compact_wal(); record_lock_hold(&mut s, "wal_compact", _t.elapsed());
+            }
+        });
+    }
+
+    // L1 event-storm: a fast event-flush tick (20Hz) coalesces the buffered EntityEvents (critical=all,
+    // visual=one-per-coalesce_key with a count, debug=dropped) so a 1000-event burst delivers bounded output.
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                tick.tick().await;
+                let mut s = st.lock().await;
+                flush_events(&mut s);
+            }
+        });
+    }
+
+    // OWNED-REGION IDENTITY from GW_ADVERTISE="REGION=host:port[@epoch]", parsed UNCONDITIONALLY at startup
+    // (NOT only inside the GW_REGISTRY discovery block below). A broker's advertised region IS the zone it
+    // owns, registry or no registry -- the static-GW_MESH topology (the advertise-topology's static
+    // peer) advertises a region but configures no registry, so my_region stayed EMPTY there and an inbound
+    // mesh adopt fell back to a POSITION-derive against the local W|E boundary -> the fold-into-ZB
+    // region mislabel ("W"/"E" instead of the owned zone). Setting my_region here makes receiving_region_for_adopt
+    // label an adopted entity with this broker's OWN zone. If GW_REGISTRY is also set, the block below re-sets
+    // my_region (identical value) + seeds the lease_epoch; ADDITIVE: no GW_ADVERTISE => my_region stays empty
+    // (mesh_soak / nzone) => adopt falls to the target-owned / position path exactly as before.
+    if state.lock().await.my_region.is_empty() {
+        if let Ok(advertise) = std::env::var("GW_ADVERTISE") {
+            if let Some((region, _rest)) = advertise.split_once('=') {
+                let region = region.trim().to_string();
+                if !region.is_empty() {
+                    state.lock().await.my_region = region;
+                }
+            }
+        }
+    }
+
+    // CROSS-BROKER MESH: connect (with retry) to each configured NEIGHBOUR broker, so entities crossing
+    // into a remote zone are handed across the PROCESS boundary to the broker owning it. Config:
+    // GW_MESH="E=host:port,MARS=host:port,..." (region=addr pairs); GW_MESH_EAST=addr is the legacy
+    // shorthand for "E=addr". N-neighbour = the open-universe-of-planets backbone (planet = zone-broker).
+    let mut mesh_cfg: Vec<(String, String)> = Vec::new();
+    if let Ok(addr) = std::env::var("GW_MESH_EAST") {
+        mesh_cfg.push(("E".to_string(), addr));
+    }
+    if let Ok(spec) = std::env::var("GW_MESH") {
+        for pair in spec.split(',') {
+            if let Some((r, a)) = pair.split_once('=') {
+                let (r, a) = (r.trim().to_string(), a.trim().to_string());
+                if !r.is_empty() && !a.is_empty() {
+                    mesh_cfg.push((r, a));
+                }
+            }
+        }
+    }
+    for (region, addr) in mesh_cfg {
+        state.lock().await.mesh_regions.insert(region.clone()); // route region-bound entities to the mesh even while the link reconnects
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
+                    stream.set_nodelay(true).ok();
+                    let (mut rd, mut wr) = stream.into_split();
+                    let hs = frame(
+                        &json!({"op":"WorkerConnect","worker_id":format!("mesh-link-{region}"),"region":"MESH","proto":PROTOCOL_VERSION}),
+                    );
+                    if wr.write_all(&hs).await.is_ok() {
+                        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                        {
+                            st.lock().await.mesh.insert(region.clone(), tx);
+                        }
+                        println!("[mesh] linked to neighbour broker for region {region} @ {addr}");
+                        let st_ack = st.clone();
+                        tokio::spawn(async move {
+                            // the only inbound on our OUTBOUND mesh link is the neighbour's MeshAck ->
+                            // release the parked entity from pending_mesh (the 2-phase handoff confirmed).
+                            while let Some(f) = read_frame(&mut rd).await {
+                                if f.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
+                                    if let Some(eid) = f.get("entity").and_then(|v| v.as_str()) {
+                                        let mut s = st_ack.lock().await;
+                                        s.pending_mesh.remove(eid);
+                                        // B2 recovery: record the confirmed departure so a crash-restart
+                                        // does not resurrect an entity that already landed on the neighbour.
+                                        let _ = s.wal_append(&json!({"kind":"mesh_acked","entity":eid}));
+                                    }
+                                }
+                            }
+                        });
+                        while let Some(buf) = rx.recv().await {
+                            if wr.write_all(&buf).await.is_err() {
+                                break;
+                            }
+                        }
+                        st.lock().await.mesh.remove(&region);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
+
+    // L2 service-discovery: if GW_REGISTRY (a dir) is set, self-register + heartbeat this broker's advertised
+    // region (GW_ADVERTISE="E=host:port") on a 1s tick, and DISCOVER neighbour brokers from the registry --
+    // spawning a dynamic-addr mesh link for each FRESH region != self. Replaces the static GW_MESH at scale;
+    // a replaced node is followed automatically. The static GW_MESH path above still works (back-compat).
+    if let Ok(reg_dir) = std::env::var("GW_REGISTRY") {
+        let advertise = std::env::var("GW_ADVERTISE").unwrap_or_default();
+        // L6 partition proxy (test hook): while GW_REG_FREEZE_FILE exists, this broker performs NO registry I/O
+        // (no read, no write) -- a faithful "partitioned from the shared registry store" model: it keeps
+        // SERVING with its last-known lease_epoch, cannot see it has been superseded, and stops advertising.
+        // Removing the file = the partition HEALS -> it resumes registry I/O and self-fences on seeing a higher
+        // epoch. Unset in production (no freeze) -> a plain no-op.
+        let freeze_file = std::env::var("GW_REG_FREEZE_FILE").unwrap_or_default();
+        let _ = std::fs::create_dir_all(&reg_dir);
+        // Parse "REGION=host:port[@epoch]". The optional @epoch lets a test pin the spec's 10 / 11; absent,
+        // the own epoch is the registry's CURRENT epoch for this region + 1 (so a takeover incarnation
+        // strictly out-epochs the last one) or 1 if the region is unclaimed.
+        let (my_region, my_addr, explicit_epoch) = {
+            if let Some((region, rest)) = advertise.split_once('=') {
+                let region = region.trim().to_string();
+                let (addr, epoch) = match rest.rsplit_once('@') {
+                    Some((a, ep)) => (a.trim().to_string(), ep.trim().parse::<u64>().ok()),
+                    None => (rest.trim().to_string(), None),
+                };
+                (region, addr, epoch)
+            } else {
+                (String::new(), String::new(), None)
+            }
+        };
+        // Establish THIS incarnation's lease_epoch for its own region, monotonically above whatever the
+        // registry currently shows, then publish it into state (mesh_forward stamps outbound handoffs with it).
+        let my_epoch = if my_region.is_empty() {
+            0
+        } else {
+            explicit_epoch.unwrap_or_else(|| registry_lease_epoch(&reg_dir, &my_region).map(|e| e + 1).unwrap_or(1))
+        };
+        if !my_region.is_empty() {
+            let mut s = state.lock().await;
+            s.my_region = my_region.clone();
+            s.region_lease_epoch.insert(my_region.clone(), my_epoch);
+        }
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(1000));
+            loop {
+                tick.tick().await;
+                // partition proxy: while frozen, do NO registry I/O at all (isolated from the store)
+                if !freeze_file.is_empty() && std::path::Path::new(&freeze_file).exists() {
+                    continue;
+                }
+                let now = now_millis();
+                if !my_region.is_empty() && !my_addr.is_empty() {
+                    registry_heartbeat(&reg_dir, &my_region, &my_addr, now, my_epoch); // heartbeat self + own epoch
+                }
+                for (region, entry) in registry_read(&reg_dir) {
+                    let hb = entry.get("hb_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let entry_epoch = entry.get("lease_epoch").and_then(|v| v.as_u64());
+                    let entry_addr = entry.get("addr").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    if region == my_region {
+                        // L6 SELF-FENCE: a STRICTLY HIGHER epoch for MY region held by a DIFFERENT addr means a
+                        // newer incarnation took over -> I am the stale owner. Mark superseded so mesh_forward
+                        // stops emitting ownership traffic for it. (Same addr at a higher epoch = me restarted,
+                        // not a supersession.)
+                        if let Some(ep) = entry_epoch {
+                            let other_addr = entry_addr.as_deref().map(|a| a != my_addr).unwrap_or(false);
+                            if ep > my_epoch && other_addr {
+                                let mut s = st.lock().await;
+                                if s.superseded_regions.insert(my_region.clone()) {
+                                    eprintln!(
+                                        "[fence] region '{my_region}' SUPERSEDED: registry shows lease_epoch={ep} (> mine {my_epoch}) at a different addr -- self-fencing this incarnation"
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if now.saturating_sub(hb) < 5000 {
+                        // L6: learn the peer region's CURRENT lease_epoch (monotonic max) so an inbound stale
+                        // handoff from a fenced incarnation of THAT region can be rejected on receipt here.
+                        if let Some(ep) = entry_epoch {
+                            let mut s = st.lock().await;
+                            let cur = s.region_lease_epoch.get(&region).copied().unwrap_or(0);
+                            if ep > cur {
+                                s.region_lease_epoch.insert(region.clone(), ep);
+                            }
+                        }
+                        // Spawn the dynamic mesh-link iff no link TASK is already running for this region THIS
+                        // lifetime (mesh_link_spawned), NOT iff mesh_regions lacks it. A WAL recovery restores
+                        // mesh_regions (so routing knows W is remote) but the OLD link task died in the crash --
+                        // gating on mesh_regions made a recovered broker believe it was linked while it had no
+                        // live link, so its recovered in-flight handoffs never resent (the churn pending-leak).
+                        // mesh_link_spawned starts empty every boot -> a recovered broker re-spawns the link once;
+                        // the task itself loops forever (reconnect-on-drop), so one spawn per region is enough.
+                        let need_spawn = {
+                            let mut s = st.lock().await;
+                            s.mesh_regions.insert(region.clone()); // routing: W is a remote meshed region
+                            if s.mesh_link_spawned.contains(&region) {
+                                false
+                            } else {
+                                s.mesh_link_spawned.insert(region.clone());
+                                true
+                            }
+                        };
+                        if need_spawn {
+                            spawn_mesh_link_dynamic(st.clone(), region.clone(), reg_dir.clone());
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    loop {
+        match listener.accept().await {
+            Ok((sock, _)) => {
+                let st = state.clone();
+                tokio::spawn(handle_conn(sock, st));
+            }
+            Err(_) => continue,
+        }
+    }
+}
