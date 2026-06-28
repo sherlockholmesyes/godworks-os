@@ -51,4 +51,4 @@ All passed locally. The leak scan returned no matches.
 
 ## Remaining Pressure
 
-This closes the first monitor work-queue reality gate. Remaining product/reality gaps are content package resolver and real Worlds Adrift client proof.
+This closes the first monitor work-queue reality gate. Remaining product/reality gaps are content package resolver and real legacy-client proof.

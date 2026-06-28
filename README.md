@@ -37,3 +37,21 @@ cargo build --release
 Business Source License 1.1 — free to read, modify, and use, with one restriction
 (no competing hosted service) that lapses on the Change Date, when it becomes Apache-2.0.
 For commercial or managed-hosting licensing, contact the Licensor.
+
+## Why BSL?
+
+Godworks OS is server-side multiplayer infrastructure. That is a different risk profile
+from an editor, an offline tool, or a client engine: the server runtime can be taken,
+closed, and resold as a competing managed backend, and the code carries a live
+network/security surface.
+
+BSL is the middle ground:
+
+- source-available now: you can read, audit, modify, run, and use the code;
+- production use is allowed under the Additional Use Grant in `LICENSE`;
+- the restriction is competing hosted/managed backend resale;
+- each release converts to Apache-2.0 on the Change Date.
+
+The SDK, examples, and protocol-level client code are intended to be Apache-2.0.
+This repository is the protected server runtime so the project can fund development
+without becoming a closed platform.
