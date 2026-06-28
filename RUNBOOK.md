@@ -27,7 +27,7 @@ cargo test -- --test-threads=1
 Expected current shape:
 
 - 29 unit tests in `src/main.rs`
-- 1 cross-broker runtime test in `tests/reality_loadgen_runtime.rs`
+- 2 broker runtime tests in `tests/reality_loadgen_runtime.rs`
 - 3 zone-worker runtime tests in `tests/zone_worker_runtime.rs`
 
 The current known warning is an unused helper in `zone_worker.rs`; it does not affect the runtime gates.
@@ -124,6 +124,21 @@ cargo test dense_seam_with_matching_e_worker_conserves_authority -- --nocapture
 The parseable result line exposes this as `handoff_probe_ok=<N>`, `handoff_probe_rejected=<N>`, `physics_payload_ok=<N>`, and `physics_clock_ok=<N>`.
 
 For manual experiments, run one broker per region and connect them with `GW_MESH` / `GW_ADVERTISE`. Keep broker and worker processes alive in foreground terminals or under a process manager; shell-backgrounded children may exit when their launcher exits.
+
+## Snapshot Restore Check
+
+The broker exposes a snapshot marker protocol for point-in-time rollback:
+
+1. a worker with the `snapshot`, `inspector`, or `kernel_admin` attribute sends `SnapshotMarker`;
+2. the broker appends a durable marker to the WAL;
+3. the broker returns `SnapshotManifest` with `wal_offset`, `entity_count`, `authority_hash`, `pending_mesh`, and `in_flight`;
+4. restarting the broker with the same `GW_WAL` and `GW_RESTORE_OFFSET=<wal_offset>` replays only the WAL prefix up to that cut.
+
+The runtime gate creates entities before and after the marker, restarts the broker from the marker offset, and asserts that post-cut entities are absent:
+
+```powershell
+cargo test snapshot_marker_restore_offset_rolls_back_post_cut_entities -- --nocapture
+```
 
 ## Runtime Notes
 
