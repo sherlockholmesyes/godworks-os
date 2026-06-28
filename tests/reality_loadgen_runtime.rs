@@ -332,6 +332,7 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         .env("GW_REQUIRE_WRITER_SWAP", "1")
         .env("GW_REQUIRE_PHYSICS_PAYLOAD", "1")
         .env("GW_REQUIRE_ASSET_MANIFEST", "1")
+        .env("GW_REQUIRE_SCHEMA_MANIFEST", "1")
         .env("GW_SLOW_VIEWER", "1")
         .output()
         .expect("run reality_loadgen");
@@ -387,6 +388,11 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         metric_u64(&metrics, "asset_manifest_ok"),
         4,
         "asset manifest did not carry every crossed body's visible dependencies: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "schema_manifest_ok"),
+        4,
+        "schema manifest did not carry every crossed body's component ABI: {metrics:?}"
     );
 }
 
@@ -664,4 +670,125 @@ fn entity_query_returns_asset_manifest_for_visible_dependencies_only() {
     assert!(entity_assets.contains_key("visible-ship"));
     assert!(entity_assets.contains_key("visible-crate"));
     assert!(!entity_assets.contains_key("far-tower"));
+}
+
+#[test]
+fn entity_query_returns_schema_manifest_for_visible_components_only() {
+    let port = free_port();
+    let mut broker = start_broker(port, "EARTH", None);
+    let mut owner = connect_worker(port, "earth-owner-schema", "EARTH", &["physics"]);
+
+    create_entity_with_components(
+        &mut owner,
+        "visible-probe",
+        "EARTH",
+        json!({
+            "pos": [1.0, 0.0],
+            "vel": [0.0, 0.0],
+            "physics": {
+                "pos": [1.0, 0.0, 0.0],
+                "rot": [0.0, 0.0, 0.0, 1.0],
+                "lin": [0.1, 0.0, 0.0],
+                "ang": [0.0, 0.0, 0.0],
+                "at_rest": false,
+                "gen": 7,
+                "t_server": 10,
+                "sim_time": 20
+            },
+            "asset": {"id": "mesh/probe", "uri": "res://probe.glb", "kind": "mesh"},
+            "asset_dependencies": [{"id": "mat/probe", "kind": "material"}]
+        }),
+    );
+    create_entity_with_components(
+        &mut owner,
+        "far-secret",
+        "EARTH",
+        json!({
+            "pos": [100.0, 0.0],
+            "vel": [0.0, 0.0],
+            "hidden_logic": {"script": "server-only"}
+        }),
+    );
+
+    let response = entity_query_with_query(
+        port,
+        "schema-interest",
+        json!({"type": "sphere", "center": [0.0, 0.0], "radius": 10.0}),
+    );
+    stop(&mut broker);
+
+    assert_eq!(response.get("count").and_then(Value::as_u64), Some(1));
+    let manifest = response
+        .get("schema_manifest")
+        .unwrap_or_else(|| panic!("EntityQueryResponse missing schema_manifest: {response}"));
+    assert_eq!(manifest.get("abi_version").and_then(Value::as_u64), Some(1));
+
+    let component_names: Vec<String> = manifest
+        .get("components")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("schema manifest missing components: {manifest}"))
+        .iter()
+        .filter_map(|component| {
+            component
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        component_names.contains(&"physics".to_string()),
+        "{component_names:?}"
+    );
+    assert!(
+        component_names.contains(&"asset".to_string()),
+        "{component_names:?}"
+    );
+    assert!(
+        component_names.contains(&"asset_dependencies".to_string()),
+        "{component_names:?}"
+    );
+    assert!(
+        !component_names.contains(&"hidden_logic".to_string()),
+        "schema manifest leaked a non-visible entity component: {component_names:?}"
+    );
+
+    let entity_components = manifest
+        .get("entity_components")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("schema manifest missing entity_components: {manifest}"));
+    let visible_components: Vec<String> = entity_components
+        .get("visible-probe")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing visible-probe components: {manifest}"))
+        .iter()
+        .filter_map(|component| component.as_str().map(str::to_string))
+        .collect();
+    assert!(visible_components.contains(&"physics".to_string()));
+    assert!(visible_components.contains(&"asset".to_string()));
+    assert!(!entity_components.contains_key("far-secret"));
+
+    let physics_schema = manifest
+        .get("components")
+        .and_then(Value::as_array)
+        .and_then(|components| {
+            components
+                .iter()
+                .find(|component| component.get("name").and_then(Value::as_str) == Some("physics"))
+        })
+        .and_then(|component| component.get("schemas"))
+        .and_then(Value::as_array)
+        .and_then(|schemas| schemas.first())
+        .unwrap_or_else(|| panic!("missing physics schema: {manifest}"));
+    let physics_fields = physics_schema
+        .get("fields")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("physics schema missing fields: {physics_schema}"));
+    for field in [
+        "pos", "rot", "lin", "ang", "at_rest", "gen", "t_server", "sim_time",
+    ] {
+        assert!(
+            physics_fields.contains_key(field),
+            "missing {field}: {physics_schema}"
+        );
+    }
 }

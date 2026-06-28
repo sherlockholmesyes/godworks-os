@@ -5426,6 +5426,8 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             let mut hits: Vec<Value> = Vec::new();
             let mut asset_index: HashMap<String, Value> = HashMap::new();
             let mut entity_assets: Map<String, Value> = Map::new();
+            let mut component_index: HashMap<String, ComponentSchemaDraft> = HashMap::new();
+            let mut entity_components: Map<String, Value> = Map::new();
             let worker = match state.workers.get(wid) {
                 Some(w) => w,
                 None => return,
@@ -5454,6 +5456,13 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                         eid,
                         &e.components,
                     );
+                    add_schema_manifest_refs(
+                        &mut component_index,
+                        &mut entity_components,
+                        eid,
+                        &e.components,
+                        Some(&e.authority),
+                    );
                     hits.push(row);
                 }
             }
@@ -5466,6 +5475,13 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     let mut comps = g.components.clone();
                     comps.insert("ghost".to_string(), json!(true));
                     add_asset_manifest_refs(&mut asset_index, &mut entity_assets, eid, &comps);
+                    add_schema_manifest_refs(
+                        &mut component_index,
+                        &mut entity_components,
+                        eid,
+                        &comps,
+                        None,
+                    );
                     hits.push(json!({"entity":eid,"pos":[g.pos[0],g.pos[1]],
                         "components":Value::Object(comps),"region":g.owner_region,
                         "ghost":true,"owner_region":g.owner_region,"authority":json!({})}));
@@ -5476,7 +5492,8 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 wid,
                 json!({"op":"EntityQueryResponse","request_id":req_id,
                 "count":hits.len(),"entities":hits,
-                "asset_manifest":build_asset_manifest(asset_index, entity_assets)}),
+                "asset_manifest":build_asset_manifest(asset_index, entity_assets),
+                "schema_manifest":build_schema_manifest(component_index, entity_components)}),
             );
         }
         // ── InspectorQuery: read-only whole-cluster truth frame. Gated by the
@@ -6644,6 +6661,111 @@ fn build_asset_manifest(
         "count": assets.len(),
         "assets": assets,
         "entity_assets": entity_assets,
+    })
+}
+
+#[derive(Default)]
+struct ComponentSchemaDraft {
+    schemas: HashMap<String, Value>,
+    modes: HashSet<String>,
+}
+
+fn infer_value_schema(v: &Value) -> Value {
+    match v {
+        Value::Null => json!({"type":"null"}),
+        Value::Bool(_) => json!({"type":"bool"}),
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                json!({"type":"integer"})
+            } else {
+                json!({"type":"number"})
+            }
+        }
+        Value::String(_) => json!({"type":"string"}),
+        Value::Array(items) => {
+            let mut item_schemas: HashMap<String, Value> = HashMap::new();
+            for item in items {
+                let schema = infer_value_schema(item);
+                if let Ok(sig) = serde_json::to_string(&schema) {
+                    item_schemas.entry(sig).or_insert(schema);
+                }
+            }
+            let mut schemas: Vec<Value> = item_schemas.into_values().collect();
+            schemas.sort_by_key(|schema| serde_json::to_string(schema).unwrap_or_default());
+            json!({"type":"array","len":items.len(),"items":schemas})
+        }
+        Value::Object(obj) => {
+            let mut fields = Map::new();
+            let mut keys: Vec<&String> = obj.keys().collect();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = obj.get(key) {
+                    fields.insert(key.clone(), infer_value_schema(value));
+                }
+            }
+            json!({"type":"object","fields":fields})
+        }
+    }
+}
+
+fn add_schema_manifest_refs(
+    component_index: &mut HashMap<String, ComponentSchemaDraft>,
+    entity_components: &mut Map<String, Value>,
+    eid: &str,
+    comps: &Map<String, Value>,
+    authority: Option<&HashMap<String, ComponentAuthority>>,
+) {
+    let mut names: Vec<String> = comps.keys().cloned().collect();
+    names.sort();
+    if names.is_empty() {
+        return;
+    }
+    for name in &names {
+        let Some(value) = comps.get(name) else {
+            continue;
+        };
+        let schema = infer_value_schema(value);
+        let sig = serde_json::to_string(&schema).unwrap_or_default();
+        let draft = component_index.entry(name.clone()).or_default();
+        draft.schemas.entry(sig).or_insert(schema);
+        let mode = authority
+            .and_then(|a| a.get(name))
+            .map(|a| a.mode.as_str())
+            .unwrap_or("ghost_readonly");
+        draft.modes.insert(mode.to_string());
+    }
+    entity_components.insert(eid.to_string(), json!(names));
+}
+
+fn build_schema_manifest(
+    component_index: HashMap<String, ComponentSchemaDraft>,
+    entity_components: Map<String, Value>,
+) -> Value {
+    let mut components: Vec<Value> = component_index
+        .into_iter()
+        .map(|(name, draft)| {
+            let mut schemas: Vec<Value> = draft.schemas.into_values().collect();
+            schemas.sort_by_key(|schema| serde_json::to_string(schema).unwrap_or_default());
+            let mut modes: Vec<String> = draft.modes.into_iter().collect();
+            modes.sort();
+            json!({
+                "name": name,
+                "version": 1,
+                "authority_modes": modes,
+                "schemas": schemas,
+            })
+        })
+        .collect();
+    components.sort_by(|a, b| {
+        let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        an.cmp(bn)
+    });
+    json!({
+        "abi_version": 1,
+        "component_count": components.len(),
+        "components": components,
+        "entity_components": entity_components,
     })
 }
 

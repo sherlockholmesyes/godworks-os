@@ -497,6 +497,73 @@ fn count_asset_manifest_ok(query: &Value, entities: u64) -> u64 {
     ok
 }
 
+fn count_schema_manifest_ok(query: &Value, entities: u64) -> u64 {
+    let Some(manifest) = query.get("schema_manifest") else {
+        return 0;
+    };
+    if manifest.get("abi_version").and_then(|v| v.as_u64()) != Some(1) {
+        return 0;
+    }
+    let Some(components) = manifest.get("components").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    let component_names: HashSet<String> = components
+        .iter()
+        .filter_map(|component| {
+            component
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    for required in ["asset", "asset_dependencies", "handoff_probe", "physics"] {
+        if !component_names.contains(required) {
+            return 0;
+        }
+    }
+    let Some(physics_schema) = components
+        .iter()
+        .find(|component| component.get("name").and_then(|v| v.as_str()) == Some("physics"))
+        .and_then(|component| component.get("schemas"))
+        .and_then(Value::as_array)
+        .and_then(|schemas| schemas.first())
+    else {
+        return 0;
+    };
+    let Some(physics_fields) = physics_schema.get("fields").and_then(Value::as_object) else {
+        return 0;
+    };
+    for field in [
+        "pos", "rot", "lin", "ang", "at_rest", "gen", "t_server", "sim_time",
+    ] {
+        if !physics_fields.contains_key(field) {
+            return 0;
+        }
+    }
+    let Some(entity_components) = manifest.get("entity_components").and_then(Value::as_object)
+    else {
+        return 0;
+    };
+    let mut ok = 0u64;
+    for i in 0..entities {
+        let eid = format!("rlg-body-{i}");
+        let Some(ids) = entity_components.get(&eid).and_then(Value::as_array) else {
+            continue;
+        };
+        let entity_set: HashSet<String> = ids
+            .iter()
+            .filter_map(|id| id.as_str().map(str::to_string))
+            .collect();
+        if ["asset", "asset_dependencies", "handoff_probe", "physics"]
+            .iter()
+            .all(|component| entity_set.contains(*component))
+        {
+            ok += 1;
+        }
+    }
+    ok
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let host = env::var("GW_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -523,6 +590,10 @@ async fn main() {
         .map(|v| v != "0")
         .unwrap_or(true);
     let require_asset_manifest = env::var("GW_REQUIRE_ASSET_MANIFEST")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(require_writer_swap);
+    let require_schema_manifest = env::var("GW_REQUIRE_SCHEMA_MANIFEST")
         .ok()
         .map(|v| v != "0")
         .unwrap_or(require_writer_swap);
@@ -726,6 +797,7 @@ async fn main() {
     let mut physics_payload_ok = 0u64;
     let mut physics_clock_ok = 0u64;
     let mut asset_manifest_ok = 0u64;
+    let mut schema_manifest_ok = 0u64;
     let mut handoff_probe_query_error: Option<String> = None;
     if require_writer_swap {
         let gained = wait_until(Duration::from_secs(3), || {
@@ -787,6 +859,7 @@ async fn main() {
                     physics_payload_ok = count_physics_payload_ok(&query, entities);
                     physics_clock_ok = count_physics_clock_ok(&query, entities);
                     asset_manifest_ok = count_asset_manifest_ok(&query, entities);
+                    schema_manifest_ok = count_schema_manifest_ok(&query, entities);
                 }
                 Err(e) => {
                     handoff_probe_query_error = Some(e.to_string());
@@ -863,11 +936,14 @@ async fn main() {
     if require_asset_manifest && asset_manifest_ok < entities {
         failures.push("asset_manifest_incomplete");
     }
+    if require_schema_manifest && schema_manifest_ok < entities {
+        failures.push("schema_manifest_incomplete");
+    }
 
     let result = if failures.is_empty() { "pass" } else { "fail" };
     let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} mesh_ghosts={} slow_viewer={} failures={}",
+        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} schema_manifest_ok={} mesh_ghosts={} slow_viewer={} failures={}",
         result,
         if cross_broker { "cross-broker" } else { "single-broker" },
         entities,
@@ -891,6 +967,7 @@ async fn main() {
         physics_payload_ok,
         physics_clock_ok,
         asset_manifest_ok,
+        schema_manifest_ok,
         Counters::get(&all.mesh_ghost) + Counters::get(&east.mesh_ghost),
         if enable_slow { 1 } else { 0 },
         if failures.is_empty() { "none".to_string() } else { failures.join(",") }
