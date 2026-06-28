@@ -114,6 +114,14 @@ cargo test cross_broker_reality_loadgen_requires_mesh_adoption -- --nocapture
 cargo test dense_seam_with_matching_e_worker_conserves_authority -- --nocapture
 ```
 
+`reality_loadgen` is stricter than a visibility check. In cross-broker mode it now proves the writer swap after handoff:
+
+- the E-side owner receives authority for every crossed entity;
+- the E-side owner writes `handoff_probe`, and a public `EntityQuery` sees that value;
+- the old W-side owner attempts the same write and receives `UpdateRejected`.
+
+The parseable result line exposes this as `handoff_probe_ok=<N>` and `handoff_probe_rejected=<N>`.
+
 For manual experiments, run one broker per region and connect them with `GW_MESH` / `GW_ADVERTISE`. Keep broker and worker processes alive in foreground terminals or under a process manager; shell-backgrounded children may exit when their launcher exits.
 
 ## Runtime Notes

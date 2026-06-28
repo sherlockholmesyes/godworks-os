@@ -105,6 +105,7 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         .env("GW_HZ", "35")
         .env("GW_EVENT_BURST", "6")
         .env("GW_REQUIRE_MESH", "1")
+        .env("GW_REQUIRE_WRITER_SWAP", "1")
         .env("GW_SLOW_VIEWER", "1")
         .output()
         .expect("run reality_loadgen");
@@ -135,5 +136,15 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
     assert!(
         metric_u64(&metrics, "east_visible") > 0,
         "east broker never saw the crossed bodies: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "handoff_probe_ok"),
+        4,
+        "new owner could not write a post-adopt component visible through query: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "handoff_probe_rejected"),
+        4,
+        "old owner was not fenced after adopt: {metrics:?}"
     );
 }

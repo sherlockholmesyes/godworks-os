@@ -60,6 +60,7 @@ struct Counters {
     authority_gain: AtomicU64,
     authority_loss: AtomicU64,
     update_rejected: AtomicU64,
+    handoff_probe_rejected: AtomicU64,
     entity_event: AtomicU64,
     visual_event: AtomicU64,
     command_request: AtomicU64,
@@ -98,6 +99,9 @@ impl Counters {
             }
             "UpdateRejected" => {
                 self.update_rejected.fetch_add(1, Ordering::Relaxed);
+                if f.get("comp").and_then(|v| v.as_str()) == Some("handoff_probe") {
+                    self.handoff_probe_rejected.fetch_add(1, Ordering::Relaxed);
+                }
             }
             "EntityEvent" => {
                 self.entity_event.fetch_add(1, Ordering::Relaxed);
@@ -237,6 +241,78 @@ fn env_f64(k: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+async fn wait_until<F>(timeout: Duration, mut pred: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if pred() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    pred()
+}
+
+async fn query_entities(host: &str, port: u16, request_id: &str) -> std::io::Result<Value> {
+    let mut stream = TcpStream::connect((host, port)).await?;
+    stream.set_nodelay(true).ok();
+    write_raw(
+        &mut stream,
+        &json!({"op":"WorkerConnect","worker_id":format!("rlg-query-{request_id}"),"region":"OBS","attributes":["observer"],"proto":1}),
+    )
+    .await?;
+    write_raw(
+        &mut stream,
+        &json!({"op":"Interest","center":[0.0,0.0],"radius":100.0}),
+    )
+    .await?;
+    write_raw(
+        &mut stream,
+        &json!({"op":"EntityQuery","request_id":request_id,"query":{"type":"sphere","center":[0.0,0.0],"radius":100.0}}),
+    )
+    .await?;
+    for _ in 0..256 {
+        if let Some(frame) = read_frame(&mut stream).await {
+            if frame.get("op").and_then(|v| v.as_str()) == Some("EntityQueryResponse")
+                && frame.get("request_id").and_then(|v| v.as_str()) == Some(request_id)
+            {
+                return Ok(frame);
+            }
+        } else {
+            break;
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "EntityQueryResponse not received",
+    ))
+}
+
+fn count_handoff_probe_ok(query: &Value, entities: u64) -> u64 {
+    let Some(rows) = query.get("entities").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    let mut ok = 0u64;
+    for i in 0..entities {
+        let eid = format!("rlg-body-{i}");
+        let matched = rows.iter().any(|row| {
+            row.get("entity").and_then(|v| v.as_str()) == Some(eid.as_str())
+                && row
+                    .get("components")
+                    .and_then(|c| c.get("handoff_probe"))
+                    .and_then(|p| p.get("writer"))
+                    .and_then(|v| v.as_str())
+                    == Some("E")
+        });
+        if matched {
+            ok += 1;
+        }
+    }
+    ok
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let host = env::var("GW_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -254,6 +330,10 @@ async fn main() {
         .ok()
         .map(|v| v != "0")
         .unwrap_or(port_e != port_w);
+    let require_writer_swap = env::var("GW_REQUIRE_WRITER_SWAP")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let cross_broker = port_e != port_w;
     let dt = Duration::from_secs_f64(1.0 / hz);
     let stop = Arc::new(AtomicBool::new(false));
@@ -447,6 +527,55 @@ async fn main() {
         tokio::time::sleep(dt).await;
     }
 
+    let mut handoff_probe_ok = 0u64;
+    let mut handoff_probe_query_error: Option<String> = None;
+    if require_writer_swap {
+        let gained = wait_until(Duration::from_secs(3), || {
+            Counters::get(&east.authority_gain) >= entities
+        })
+        .await;
+        if gained {
+            for i in 0..entities {
+                let eid = format!("rlg-body-{i}");
+                send_json(
+                    &owner_e_wr,
+                    &json!({
+                        "op":"UpdateComponent",
+                        "entity":eid,
+                        "comp":"handoff_probe",
+                        "value":{"writer":"E","seq":i}
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            for i in 0..entities {
+                let eid = format!("rlg-body-{i}");
+                send_json(
+                    &owner_w_wr,
+                    &json!({
+                        "op":"UpdateComponent",
+                        "entity":eid,
+                        "comp":"handoff_probe",
+                        "value":{"writer":"W_STALE","seq":i}
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            match query_entities(&host, port_e, "rlg-handoff-probe").await {
+                Ok(query) => {
+                    handoff_probe_ok = count_handoff_probe_ok(&query, entities);
+                }
+                Err(e) => {
+                    handoff_probe_query_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
     send_json(
         &viewer_w_wr,
         &json!({"op":"EntityQuery","request_id":"rlg-query-W","query":{"type":"sphere","center":[0.0,0.0],"radius":100.0}}),
@@ -471,6 +600,8 @@ async fn main() {
         Counters::get(&all.entity_query_response) + Counters::get(&east.entity_query_response);
     let east_visible = Counters::get(&east.add_entity) + Counters::get(&east.component_update);
     let east_authority_gain = Counters::get(&east.authority_gain);
+    let handoff_probe_rejected =
+        Counters::get(&all.handoff_probe_rejected) + Counters::get(&east.handoff_probe_rejected);
     let rejections = Counters::get(&all.update_rejected) + Counters::get(&east.update_rejected);
 
     let mut failures = Vec::new();
@@ -495,11 +626,20 @@ async fn main() {
     if require_mesh && east_authority_gain < entities {
         failures.push("no_east_authority_gain");
     }
+    if require_writer_swap && handoff_probe_ok < entities {
+        failures.push("post_adopt_e_write_not_visible");
+    }
+    if require_writer_swap && handoff_probe_rejected < entities {
+        failures.push("stale_w_writer_not_rejected");
+    }
+    if require_writer_swap && handoff_probe_query_error.is_some() {
+        failures.push("handoff_probe_query_failed");
+    }
 
     let result = if failures.is_empty() { "pass" } else { "fail" };
     let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} mesh_ghosts={} slow_viewer={} failures={}",
+        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} mesh_ghosts={} slow_viewer={} failures={}",
         result,
         if cross_broker { "cross-broker" } else { "single-broker" },
         entities,
@@ -518,6 +658,8 @@ async fn main() {
         Counters::get(&east.component_update),
         east_visible,
         east_authority_gain,
+        handoff_probe_ok,
+        handoff_probe_rejected,
         Counters::get(&all.mesh_ghost) + Counters::get(&east.mesh_ghost),
         if enable_slow { 1 } else { 0 },
         if failures.is_empty() { "none".to_string() } else { failures.join(",") }

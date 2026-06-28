@@ -4322,6 +4322,13 @@ fn prepare_update(
                 "reason":format!("ghost is read-only (non-authoritative; owned by zone '{}'); cannot claim authority over a cross-seam mirror", owner),
                 "ghost":true,"owner_region":owner}),
             );
+        } else {
+            emit(
+                state,
+                wid,
+                json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                "reason":"entity not found or no longer local; write not applied"}),
+            );
         }
         return None;
     }
