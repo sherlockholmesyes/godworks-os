@@ -13,14 +13,15 @@ In cross-broker mode, the harness now verifies the writer swap after a seam hand
 5. The old W-side owner attempts the same write and receives `UpdateRejected`.
 6. The E-side owner writes a full `physics` payload (`pos`, `rot`, `lin`, `ang`, `at_rest`, `gen`, `t_server`, `sim_time`).
 7. A public `EntityQuery` sees that payload and verifies broker-normalized monotonic clocks after handoff.
+8. The same public `EntityQuery` returns an `asset_manifest` for every visible crossed body, including deduped shared dependencies.
 
 The final line exposes the gate as:
 
 ```text
-handoff_probe_ok=<N> handoff_probe_rejected=<N> physics_payload_ok=<N> physics_clock_ok=<N>
+handoff_probe_ok=<N> handoff_probe_rejected=<N> physics_payload_ok=<N> physics_clock_ok=<N> asset_manifest_ok=<N>
 ```
 
-For a passing cross-broker run, all four values must match `entities`.
+For a passing cross-broker run, all five values must match `entities`.
 
 ## Broker Behavior Covered
 
@@ -36,6 +37,8 @@ when an update targets a missing non-ghost entity.
 
 The receiver must also carry the component bag across the seam and accept a post-adopt `physics` write from the new owner without losing payload fields or allowing `gen`, `sim_time`, or `t_server` to rewind.
 
+`EntityQueryResponse` derives `asset_manifest` from the visible entity rows. Asset references are ordinary components (`asset`, `assets`, `asset_ref`, `asset_refs`, `asset_dependency`, or `asset_dependencies`); the broker does not maintain a second persistent asset database. This keeps the content load plan tied to interest projection: non-visible entities do not leak dependencies, and shared dependencies are emitted once.
+
 ## Run
 
 ```powershell
@@ -45,4 +48,4 @@ cargo test -- --test-threads=1
 
 ## Still Out Of Scope
 
-This gate does not replace the later product gates for component/schema/content ABI, asset dependency interest, monitor work queues, snapshot artifact export, or a real Worlds Adrift client proof. It only closes the cross-broker writer-swap and product physics payload continuity checks.
+This gate does not replace the later product gates for full component/schema/content ABI, monitor work queues, snapshot artifact export, or a real Worlds Adrift client proof. It now closes the cross-broker writer-swap, product physics payload continuity, and the first asset dependency interest check.

@@ -5424,6 +5424,8 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .cloned()
                 .unwrap_or_else(|| json!({"type":"all"}));
             let mut hits: Vec<Value> = Vec::new();
+            let mut asset_index: HashMap<String, Value> = HashMap::new();
+            let mut entity_assets: Map<String, Value> = Map::new();
             let worker = match state.workers.get(wid) {
                 Some(w) => w,
                 None => return,
@@ -5446,6 +5448,12 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                             row["handoff_intent"] = handoff_intent_to_json(i);
                         }
                     }
+                    add_asset_manifest_refs(
+                        &mut asset_index,
+                        &mut entity_assets,
+                        eid,
+                        &e.components,
+                    );
                     hits.push(row);
                 }
             }
@@ -5457,6 +5465,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 if ghost_query_match(g, &q) && ghost_visible(worker, g) {
                     let mut comps = g.components.clone();
                     comps.insert("ghost".to_string(), json!(true));
+                    add_asset_manifest_refs(&mut asset_index, &mut entity_assets, eid, &comps);
                     hits.push(json!({"entity":eid,"pos":[g.pos[0],g.pos[1]],
                         "components":Value::Object(comps),"region":g.owner_region,
                         "ghost":true,"owner_region":g.owner_region,"authority":json!({})}));
@@ -5466,7 +5475,8 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 state,
                 wid,
                 json!({"op":"EntityQueryResponse","request_id":req_id,
-                "count":hits.len(),"entities":hits}),
+                "count":hits.len(),"entities":hits,
+                "asset_manifest":build_asset_manifest(asset_index, entity_assets)}),
             );
         }
         // ── InspectorQuery: read-only whole-cluster truth frame. Gated by the
@@ -6523,6 +6533,118 @@ fn ghost_query_match(g: &GhostEntity, q: &Value) -> bool {
         "region" => q.get("region").and_then(|v| v.as_str()) == Some(g.owner_region.as_str()),
         _ => false,
     }
+}
+
+fn normalized_asset_ref(v: &Value) -> Option<(String, Value)> {
+    match v {
+        Value::String(id) if !id.is_empty() => Some((id.clone(), json!({"id": id}))),
+        Value::Object(obj) => {
+            let id = obj
+                .get("id")
+                .or_else(|| obj.get("asset_id"))
+                .or_else(|| obj.get("uri"))
+                .or_else(|| obj.get("path"))
+                .and_then(|v| v.as_str())?
+                .to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let mut normalized = obj.clone();
+            normalized
+                .entry("id".to_string())
+                .or_insert_with(|| Value::String(id.clone()));
+            Some((id, Value::Object(normalized)))
+        }
+        _ => None,
+    }
+}
+
+fn collect_asset_refs_from_value(v: Option<&Value>, out: &mut Vec<(String, Value)>) {
+    let Some(value) = v else {
+        return;
+    };
+    if let Some(asset) = normalized_asset_ref(value) {
+        out.push(asset);
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_asset_refs_from_value(Some(item), out);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                if let Some((id, mut asset)) = normalized_asset_ref(item) {
+                    if let Value::Object(obj) = &mut asset {
+                        obj.entry("id".to_string())
+                            .or_insert_with(|| Value::String(key.clone()));
+                    }
+                    out.push((id, asset));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn asset_refs_from_components(comps: &Map<String, Value>) -> Vec<(String, Value)> {
+    let mut refs = Vec::new();
+    for key in [
+        "asset",
+        "assets",
+        "asset_ref",
+        "asset_refs",
+        "asset_dependency",
+        "asset_dependencies",
+    ] {
+        collect_asset_refs_from_value(comps.get(key), &mut refs);
+    }
+    refs
+}
+
+fn add_asset_manifest_refs(
+    asset_index: &mut HashMap<String, Value>,
+    entity_assets: &mut Map<String, Value>,
+    eid: &str,
+    comps: &Map<String, Value>,
+) {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for (id, asset) in asset_refs_from_components(comps) {
+        if seen.insert(id.clone()) {
+            ids.push(id.clone());
+        }
+        match asset_index.get(&id) {
+            Some(existing)
+                if existing.as_object().map_or(0, Map::len)
+                    >= asset.as_object().map_or(0, Map::len) => {}
+            _ => {
+                asset_index.insert(id, asset);
+            }
+        }
+    }
+    if !ids.is_empty() {
+        ids.sort();
+        entity_assets.insert(eid.to_string(), json!(ids));
+    }
+}
+
+fn build_asset_manifest(
+    asset_index: HashMap<String, Value>,
+    entity_assets: Map<String, Value>,
+) -> Value {
+    let mut assets: Vec<Value> = asset_index.into_values().collect();
+    assets.sort_by(|a, b| {
+        let ai = a.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let bi = b.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        ai.cmp(bi)
+    });
+    json!({
+        "count": assets.len(),
+        "assets": assets,
+        "entity_assets": entity_assets,
+    })
 }
 
 fn matches_query(e: &Entity, q: &Value) -> bool {

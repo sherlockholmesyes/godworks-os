@@ -166,6 +166,24 @@ fn wait_for_response(stream: &mut TcpStream, op: &str, request_id: &str) -> Valu
 }
 
 fn create_entity(stream: &mut TcpStream, eid: &str, region: &str, x: f64, tag: &str) {
+    create_entity_with_components(
+        stream,
+        eid,
+        region,
+        json!({
+            "pos": [x, 0.0],
+            "vel": [0.0, 0.0],
+            "kind": tag,
+        }),
+    );
+}
+
+fn create_entity_with_components(
+    stream: &mut TcpStream,
+    eid: &str,
+    region: &str,
+    components: Value,
+) {
     let request_id = format!("create-{eid}");
     stream
         .write_all(&frame(&json!({
@@ -173,11 +191,7 @@ fn create_entity(stream: &mut TcpStream, eid: &str, region: &str, x: f64, tag: &
             "request_id": request_id,
             "entity": eid,
             "region": region,
-            "components": {
-                "pos": [x, 0.0],
-                "vel": [0.0, 0.0],
-                "kind": tag,
-            },
+            "components": components,
         })))
         .expect("send CreateEntity");
     let response = wait_for_response(stream, "CreateEntityResponse", &request_id);
@@ -213,6 +227,10 @@ fn drain_broker(port: u16, request_id: &str) -> Value {
 }
 
 fn entity_query(port: u16, request_id: &str) -> Value {
+    entity_query_with_query(port, request_id, json!({"type": "all"}))
+}
+
+fn entity_query_with_query(port: u16, request_id: &str, query: Value) -> Value {
     let mut stream = connect_worker(
         port,
         &format!("observer-{request_id}"),
@@ -223,7 +241,7 @@ fn entity_query(port: u16, request_id: &str) -> Value {
         .write_all(&frame(&json!({
             "op": "EntityQuery",
             "request_id": request_id,
-            "query": {"type": "all"},
+            "query": query,
         })))
         .expect("send EntityQuery");
     wait_for_response(&mut stream, "EntityQueryResponse", request_id)
@@ -313,6 +331,7 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         .env("GW_REQUIRE_MESH", "1")
         .env("GW_REQUIRE_WRITER_SWAP", "1")
         .env("GW_REQUIRE_PHYSICS_PAYLOAD", "1")
+        .env("GW_REQUIRE_ASSET_MANIFEST", "1")
         .env("GW_SLOW_VIEWER", "1")
         .output()
         .expect("run reality_loadgen");
@@ -363,6 +382,11 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         metric_u64(&metrics, "physics_clock_ok"),
         4,
         "physics gen/sim_time/t_server were not monotonic after handoff: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "asset_manifest_ok"),
+        4,
+        "asset manifest did not carry every crossed body's visible dependencies: {metrics:?}"
     );
 }
 
@@ -539,4 +563,105 @@ fn snapshot_vector_restores_in_flight_mesh_handoff_exactly_once() {
         Some(0),
         "source kept a duplicate local entity after vector restore: {restored_query_w}"
     );
+}
+
+#[test]
+fn entity_query_returns_asset_manifest_for_visible_dependencies_only() {
+    let port = free_port();
+    let mut broker = start_broker(port, "EARTH", None);
+    let mut owner = connect_worker(port, "earth-owner-assets", "EARTH", &["physics"]);
+
+    create_entity_with_components(
+        &mut owner,
+        "visible-ship",
+        "EARTH",
+        json!({
+            "pos": [1.0, 0.0],
+            "vel": [0.0, 0.0],
+            "asset": {"id": "mesh/ship", "uri": "res://ships/ship.glb", "kind": "mesh", "hash": "sha256:ship"},
+            "asset_dependencies": [
+                {"id": "mat/shared", "uri": "res://materials/shared.tres", "kind": "material"},
+                {"id": "tex/ship", "uri": "res://textures/ship.png", "kind": "texture"}
+            ]
+        }),
+    );
+    create_entity_with_components(
+        &mut owner,
+        "visible-crate",
+        "EARTH",
+        json!({
+            "pos": [2.0, 0.0],
+            "vel": [0.0, 0.0],
+            "asset": {"id": "mesh/crate", "uri": "res://props/crate.glb", "kind": "mesh", "hash": "sha256:crate"},
+            "asset_dependencies": [
+                {"id": "mat/shared", "uri": "res://materials/shared.tres", "kind": "material"}
+            ]
+        }),
+    );
+    create_entity_with_components(
+        &mut owner,
+        "far-tower",
+        "EARTH",
+        json!({
+            "pos": [100.0, 0.0],
+            "vel": [0.0, 0.0],
+            "asset": {"id": "mesh/far-tower", "uri": "res://props/far_tower.glb", "kind": "mesh"}
+        }),
+    );
+
+    let response = entity_query_with_query(
+        port,
+        "asset-interest",
+        json!({"type": "sphere", "center": [0.0, 0.0], "radius": 10.0}),
+    );
+    stop(&mut broker);
+
+    assert_eq!(response.get("count").and_then(Value::as_u64), Some(2));
+    let manifest = response
+        .get("asset_manifest")
+        .unwrap_or_else(|| panic!("EntityQueryResponse missing asset_manifest: {response}"));
+    assert_eq!(
+        manifest.get("count").and_then(Value::as_u64),
+        Some(4),
+        "manifest must dedupe visible entity assets/deps only: {manifest}"
+    );
+    let asset_ids: Vec<String> = manifest
+        .get("assets")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("manifest missing assets: {manifest}"))
+        .iter()
+        .filter_map(|asset| asset.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    assert!(
+        asset_ids.contains(&"mesh/ship".to_string()),
+        "{asset_ids:?}"
+    );
+    assert!(
+        asset_ids.contains(&"mesh/crate".to_string()),
+        "{asset_ids:?}"
+    );
+    assert!(
+        asset_ids.contains(&"mat/shared".to_string()),
+        "{asset_ids:?}"
+    );
+    assert!(asset_ids.contains(&"tex/ship".to_string()), "{asset_ids:?}");
+    assert!(
+        !asset_ids.contains(&"mesh/far-tower".to_string()),
+        "asset interest leaked a non-query-visible entity dependency: {asset_ids:?}"
+    );
+    assert_eq!(
+        asset_ids
+            .iter()
+            .filter(|id| id.as_str() == "mat/shared")
+            .count(),
+        1,
+        "shared dependency must be manifest-deduped: {asset_ids:?}"
+    );
+    let entity_assets = manifest
+        .get("entity_assets")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("manifest missing entity_assets: {manifest}"));
+    assert!(entity_assets.contains_key("visible-ship"));
+    assert!(entity_assets.contains_key("visible-crate"));
+    assert!(!entity_assets.contains_key("far-tower"));
 }

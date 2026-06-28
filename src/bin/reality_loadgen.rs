@@ -13,6 +13,7 @@
 //! Parseable final line starts with:
 //!   reality_loadgen result=pass|fail ...
 
+use std::collections::HashSet;
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -357,6 +358,21 @@ fn e_physics_payload(i: u64, x: f64, y: f64) -> Value {
     })
 }
 
+fn asset_payload(i: u64) -> Value {
+    json!({
+        "id":format!("mesh/rlg-body-{i}"),
+        "uri":format!("res://rlg/body_{i}.glb"),
+        "kind":"mesh"
+    })
+}
+
+fn asset_dependencies_payload(i: u64) -> Value {
+    json!([
+        {"id":"mat/rlg-shared","uri":"res://rlg/shared.tres","kind":"material"},
+        {"id":format!("tex/rlg-body-{i}"),"uri":format!("res://rlg/body_{i}.png"),"kind":"texture"}
+    ])
+}
+
 fn value_f64_at(v: &Value, idx: usize) -> Option<f64> {
     v.as_array()?.get(idx)?.as_f64()
 }
@@ -438,6 +454,49 @@ fn count_physics_clock_ok(query: &Value, entities: u64) -> u64 {
     ok
 }
 
+fn count_asset_manifest_ok(query: &Value, entities: u64) -> u64 {
+    let Some(manifest) = query.get("asset_manifest") else {
+        return 0;
+    };
+    let Some(assets) = manifest.get("assets").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    let asset_ids: HashSet<String> = assets
+        .iter()
+        .filter_map(|asset| asset.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let Some(entity_assets) = manifest.get("entity_assets").and_then(|v| v.as_object()) else {
+        return 0;
+    };
+    let expected_count = entities * 2 + 1;
+    if manifest.get("count").and_then(|v| v.as_u64()) != Some(expected_count) {
+        return 0;
+    }
+    let mut ok = 0u64;
+    for i in 0..entities {
+        let eid = format!("rlg-body-{i}");
+        let expected = [
+            format!("mesh/rlg-body-{i}"),
+            "mat/rlg-shared".to_string(),
+            format!("tex/rlg-body-{i}"),
+        ];
+        let Some(ids) = entity_assets.get(&eid).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let entity_id_set: HashSet<String> = ids
+            .iter()
+            .filter_map(|id| id.as_str().map(str::to_string))
+            .collect();
+        if expected
+            .iter()
+            .all(|id| asset_ids.contains(id) && entity_id_set.contains(id))
+        {
+            ok += 1;
+        }
+    }
+    ok
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let host = env::var("GW_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -463,6 +522,10 @@ async fn main() {
         .ok()
         .map(|v| v != "0")
         .unwrap_or(true);
+    let require_asset_manifest = env::var("GW_REQUIRE_ASSET_MANIFEST")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(require_writer_swap);
     let cross_broker = port_e != port_w;
     let dt = Duration::from_secs_f64(1.0 / hz);
     let stop = Arc::new(AtomicBool::new(false));
@@ -576,6 +639,8 @@ async fn main() {
                     "mass":1.0 + (i % 3) as f64,
                     "contact_radius":0.75,
                     "physics":initial_physics_payload(i, -2.0, y),
+                    "asset":asset_payload(i),
+                    "asset_dependencies":asset_dependencies_payload(i),
                     "sim_time":0,
                     "gen":0
                 }
@@ -660,6 +725,7 @@ async fn main() {
     let mut handoff_probe_ok = 0u64;
     let mut physics_payload_ok = 0u64;
     let mut physics_clock_ok = 0u64;
+    let mut asset_manifest_ok = 0u64;
     let mut handoff_probe_query_error: Option<String> = None;
     if require_writer_swap {
         let gained = wait_until(Duration::from_secs(3), || {
@@ -720,6 +786,7 @@ async fn main() {
                     handoff_probe_ok = count_handoff_probe_ok(&query, entities);
                     physics_payload_ok = count_physics_payload_ok(&query, entities);
                     physics_clock_ok = count_physics_clock_ok(&query, entities);
+                    asset_manifest_ok = count_asset_manifest_ok(&query, entities);
                 }
                 Err(e) => {
                     handoff_probe_query_error = Some(e.to_string());
@@ -793,11 +860,14 @@ async fn main() {
     if require_physics_payload && physics_clock_ok < entities {
         failures.push("physics_clock_not_monotonic");
     }
+    if require_asset_manifest && asset_manifest_ok < entities {
+        failures.push("asset_manifest_incomplete");
+    }
 
     let result = if failures.is_empty() { "pass" } else { "fail" };
     let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} mesh_ghosts={} slow_viewer={} failures={}",
+        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} mesh_ghosts={} slow_viewer={} failures={}",
         result,
         if cross_broker { "cross-broker" } else { "single-broker" },
         entities,
@@ -820,6 +890,7 @@ async fn main() {
         handoff_probe_rejected,
         physics_payload_ok,
         physics_clock_ok,
+        asset_manifest_ok,
         Counters::get(&all.mesh_ghost) + Counters::get(&east.mesh_ghost),
         if enable_slow { 1 } else { 0 },
         if failures.is_empty() { "none".to_string() } else { failures.join(",") }
