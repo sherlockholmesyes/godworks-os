@@ -306,6 +306,82 @@ async fn query_entities_with_query(
     ))
 }
 
+async fn query_health(host: &str, port: u16, request_id: &str) -> std::io::Result<Value> {
+    let mut stream = TcpStream::connect((host, port)).await?;
+    stream.set_nodelay(true).ok();
+    write_raw(
+        &mut stream,
+        &json!({"op":"WorkerConnect","worker_id":format!("rlg-health-{request_id}"),"region":"OBS","attributes":["observer"],"proto":1}),
+    )
+    .await?;
+    write_raw(&mut stream, &json!({"op":"Health","request_id":request_id})).await?;
+    for _ in 0..64 {
+        match tokio::time::timeout(Duration::from_millis(750), read_frame(&mut stream)).await {
+            Ok(Some(frame))
+                if frame.get("op").and_then(|v| v.as_str()) == Some("HealthFrame")
+                    && frame.get("request_id").and_then(|v| v.as_str()) == Some(request_id) =>
+            {
+                return Ok(frame);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "HealthFrame not received",
+    ))
+}
+
+fn path_value<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut cur = value;
+    for key in path {
+        cur = cur.get(*key)?;
+    }
+    Some(cur)
+}
+
+fn path_u64(value: &Value, path: &[&str]) -> Option<u64> {
+    path_value(value, path).and_then(Value::as_u64)
+}
+
+fn path_f64(value: &Value, path: &[&str]) -> Option<f64> {
+    path_value(value, path).and_then(Value::as_f64)
+}
+
+fn health_status_ok(health: &Value) -> bool {
+    health.get("status").and_then(|v| v.as_str()) == Some("ok")
+        && path_u64(health, &["worker_count"]).unwrap_or(0) > 0
+        && health.get("queues").and_then(Value::as_object).is_some()
+        && health.get("egress").and_then(Value::as_object).is_some()
+}
+
+fn health_queue_backlog(health: &Value) -> u64 {
+    health
+        .get("queues")
+        .and_then(Value::as_object)
+        .map(|queues| queues.values().filter_map(Value::as_u64).sum())
+        .unwrap_or(u64::MAX)
+}
+
+fn health_tick_ok(health: &Value, max_tick_lag_ms: f64, max_lock_hold_ms: f64) -> bool {
+    let tick_lag = path_f64(health, &["tick_lag_ms"]);
+    let lock_hold = path_f64(health, &["lock_max_hold_ms"]);
+    path_u64(health, &["monitor_ticks"]).unwrap_or(0) > 0
+        && tick_lag
+            .map(|v| v.is_finite() && v <= max_tick_lag_ms)
+            .unwrap_or(false)
+        && lock_hold
+            .map(|v| v.is_finite() && v <= max_lock_hold_ms)
+            .unwrap_or(false)
+}
+
+fn health_queue_ok(health: &Value) -> bool {
+    health_queue_backlog(health) == 0
+        && path_u64(health, &["pending_mesh"]).unwrap_or(u64::MAX) == 0
+}
+
 fn qbi_ast_query() -> Value {
     json!({
         "type":"and",
@@ -659,7 +735,14 @@ async fn main() {
         .ok()
         .map(|v| v != "0")
         .unwrap_or(require_writer_swap);
+    let require_monitor_health = env::var("GW_REQUIRE_MONITOR_HEALTH")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let max_tick_lag_ms = env_f64("GW_MAX_TICK_LAG_MS", 2_500.0).max(1.0);
+    let max_lock_hold_ms = env_f64("GW_MAX_LOCK_HOLD_MS", 2_500.0).max(1.0);
     let cross_broker = port_e != port_w;
+    let expected_health = if cross_broker { 2 } else { 1 };
     let dt = Duration::from_secs_f64(1.0 / hz);
     let stop = Arc::new(AtomicBool::new(false));
     let all = Arc::new(Counters::default());
@@ -981,6 +1064,52 @@ async fn main() {
     .unwrap();
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let mut health_ok = 0u64;
+    let mut monitor_tick_ok = 0u64;
+    let mut monitor_queue_ok = 0u64;
+    let mut health_queue_backlog_total = 0u64;
+    let mut health_egress_max = 0u64;
+    let mut health_max_tick_lag_ms = 0.0f64;
+    let mut health_max_lock_ms = 0.0f64;
+    let mut health_query_error: Option<String> = None;
+    if require_monitor_health {
+        let mut targets = vec![("W", port_w)];
+        if port_e != port_w {
+            targets.push(("E", port_e));
+        }
+        for (label, port) in targets {
+            match query_health(&host, port, &format!("rlg-health-{label}")).await {
+                Ok(health) => {
+                    let queue_backlog = health_queue_backlog(&health);
+                    health_queue_backlog_total =
+                        health_queue_backlog_total.saturating_add(queue_backlog);
+                    health_egress_max = health_egress_max
+                        .max(path_u64(&health, &["egress", "out_queue_max"]).unwrap_or(0));
+                    health_max_tick_lag_ms = health_max_tick_lag_ms
+                        .max(path_f64(&health, &["tick_lag_ms"]).unwrap_or(0.0));
+                    health_max_lock_ms = health_max_lock_ms
+                        .max(path_f64(&health, &["lock_max_hold_ms"]).unwrap_or(0.0));
+                    let status_ok = health_status_ok(&health);
+                    let tick_ok = health_tick_ok(&health, max_tick_lag_ms, max_lock_hold_ms);
+                    let queue_ok = health_queue_ok(&health);
+                    if tick_ok {
+                        monitor_tick_ok += 1;
+                    }
+                    if queue_ok {
+                        monitor_queue_ok += 1;
+                    }
+                    if status_ok && tick_ok && queue_ok {
+                        health_ok += 1;
+                    }
+                }
+                Err(e) => {
+                    health_query_error = Some(format!("{label}:{e}"));
+                }
+            }
+        }
+    }
+
     stop.store(true, Ordering::Relaxed);
 
     let add_total = Counters::get(&all.add_entity) + Counters::get(&east.add_entity);
@@ -1041,11 +1170,23 @@ async fn main() {
     if require_qbi_ast && qbi_ast_ok < entities {
         failures.push("qbi_ast_incomplete");
     }
+    if require_monitor_health && health_query_error.is_some() {
+        failures.push("health_query_failed");
+    }
+    if require_monitor_health && health_ok < expected_health {
+        failures.push("monitor_health_not_ok");
+    }
+    if require_monitor_health && monitor_tick_ok < expected_health {
+        failures.push("monitor_tick_not_observed");
+    }
+    if require_monitor_health && monitor_queue_ok < expected_health {
+        failures.push("monitor_queues_not_drained");
+    }
 
     let result = if failures.is_empty() { "pass" } else { "fail" };
     let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} schema_manifest_ok={} qbi_ast_ok={} mesh_ghosts={} slow_viewer={} failures={}",
+        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} schema_manifest_ok={} qbi_ast_ok={} health_ok={} monitor_tick_ok={} monitor_queue_ok={} health_queue_backlog={} health_egress_max={} health_max_tick_lag_ms={:.2} health_max_lock_ms={:.2} mesh_ghosts={} slow_viewer={} failures={}",
         result,
         if cross_broker { "cross-broker" } else { "single-broker" },
         entities,
@@ -1071,6 +1212,13 @@ async fn main() {
         asset_manifest_ok,
         schema_manifest_ok,
         qbi_ast_ok,
+        health_ok,
+        monitor_tick_ok,
+        monitor_queue_ok,
+        health_queue_backlog_total,
+        health_egress_max,
+        health_max_tick_lag_ms,
+        health_max_lock_ms,
         Counters::get(&all.mesh_ghost) + Counters::get(&east.mesh_ghost),
         if enable_slow { 1 } else { 0 },
         if failures.is_empty() { "none".to_string() } else { failures.join(",") }

@@ -16,14 +16,15 @@ In cross-broker mode, the harness now verifies the writer swap after a seam hand
 8. The same public `EntityQuery` returns an `asset_manifest` for every visible crossed body, including deduped shared dependencies.
 9. The same public `EntityQuery` returns a `schema_manifest` for visible components, including the `physics` field shape.
 10. A nested `and` / `or` / `not` `EntityQuery` constraint AST selects the crossed bodies by component payload value and excludes an in-radius decoy with the same broad components.
+11. The harness reads public `HealthFrame` snapshots from every participating broker after the load window and requires the monitor loop to have ticked and all monitor work queues to have drained.
 
 The final line exposes the gate as:
 
 ```text
-handoff_probe_ok=<N> handoff_probe_rejected=<N> physics_payload_ok=<N> physics_clock_ok=<N> asset_manifest_ok=<N> schema_manifest_ok=<N> qbi_ast_ok=<N>
+handoff_probe_ok=<N> handoff_probe_rejected=<N> physics_payload_ok=<N> physics_clock_ok=<N> asset_manifest_ok=<N> schema_manifest_ok=<N> qbi_ast_ok=<N> health_ok=<B> monitor_tick_ok=<B> monitor_queue_ok=<B> health_queue_backlog=<Q>
 ```
 
-For a passing cross-broker run, all seven values must match `entities`.
+For a passing cross-broker run, all entity values must match `entities`, and the health values must match the broker count (`B=2` in cross-broker mode) with `health_queue_backlog=0`.
 
 ## Broker Behavior Covered
 
@@ -45,6 +46,14 @@ The receiver must also carry the component bag across the seam and accept a post
 
 `EntityQuery` supports a constraint AST over the same row source: `and`, `or`, `not`, `sphere`, `box`, `component`, `region`, `entity`, and component value predicates. The runtime gate includes an in-radius decoy with `physics` and `handoff_probe`, but with `physics.writer != "E"`, so a broad query or component-only query cannot pass.
 
+`HealthFrame` now exposes monitor liveness and work queues from the same broker state the Inspector reads:
+
+- `monitor_ticks` proves the 300ms monitor loop actually ran.
+- `queues` contains `pending_updates`, `pending_handoffs`, `pending_failovers`, `pending_block_migrations`, `pending_commands`, `pending_handoff_intents`, `rebalance_jobs`, `event_outbox`, and `pending_mesh`.
+- `egress` contains per-worker output backlog totals and drops.
+
+The runtime gate waits for a stable post-load cut, then requires each broker to return `status=ok`, finite tick/lock metrics, `monitor_ticks>0`, and zero monitor queue backlog. This makes the monitor tick a product ruler rather than a passive debug endpoint.
+
 ## Run
 
 ```powershell
@@ -54,4 +63,4 @@ cargo test -- --test-threads=1
 
 ## Still Out Of Scope
 
-This gate does not replace the later product gates for a full content package resolver, monitor work queues, snapshot artifact export, or a real Worlds Adrift client proof. It now closes the cross-broker writer-swap, product physics payload continuity, first asset dependency interest check, first component/schema ABI discovery check, and the first query-constraint AST check.
+This gate does not replace the later product gates for a full content package resolver or a real Worlds Adrift client proof. It now closes the cross-broker writer-swap, product physics payload continuity, first asset dependency interest check, first component/schema ABI discovery check, first query-constraint AST check, and first monitor work-queue runtime check.

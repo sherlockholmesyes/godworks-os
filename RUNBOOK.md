@@ -123,8 +123,11 @@ cargo test dense_seam_with_matching_e_worker_conserves_authority -- --nocapture
 - the public `EntityQuery` also returns an `asset_manifest` for visible crossed bodies, with shared dependencies deduped and non-visible dependencies excluded.
 - the public `EntityQuery` also returns a `schema_manifest` for visible crossed components, including the `physics` field shape.
 - a nested query constraint AST selects the crossed bodies by component payload value and excludes an in-radius decoy with the same broad components.
+- each broker returns a `HealthFrame` proving the monitor loop ticked and the monitor work queues drained after the load window.
 
-The parseable result line exposes this as `handoff_probe_ok=<N>`, `handoff_probe_rejected=<N>`, `physics_payload_ok=<N>`, `physics_clock_ok=<N>`, `asset_manifest_ok=<N>`, `schema_manifest_ok=<N>`, and `qbi_ast_ok=<N>`.
+The parseable result line exposes this as `handoff_probe_ok=<N>`, `handoff_probe_rejected=<N>`, `physics_payload_ok=<N>`, `physics_clock_ok=<N>`, `asset_manifest_ok=<N>`, `schema_manifest_ok=<N>`, `qbi_ast_ok=<N>`, `health_ok=<B>`, `monitor_tick_ok=<B>`, `monitor_queue_ok=<B>`, and `health_queue_backlog=<Q>`.
+
+The monitor health assertion is enabled by default. `GW_REQUIRE_MONITOR_HEALTH=0` disables it for compatibility probes; `GW_MAX_TICK_LAG_MS` and `GW_MAX_LOCK_HOLD_MS` tune the runtime thresholds.
 
 For manual experiments, run one broker per region and connect them with `GW_MESH` / `GW_ADVERTISE`. Keep broker and worker processes alive in foreground terminals or under a process manager; shell-backgrounded children may exit when their launcher exits.
 

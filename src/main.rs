@@ -1500,6 +1500,7 @@ struct ServerState {
     // (AddEntity + the component stream) and a client re-checks-out from the neighbour (checkout_all), so no view is lost.
     draining: bool,
     drain_exit: bool, // when a completed drain should std::process::exit(0) (a real rolling deploy); a test can drain-without-exit to assert conservation against the still-running neighbour.
+    monitor_ticks: u64, // #3 metrics: completed 300ms monitor ticks; proves the monitor loop is alive, not just that a health field exists.
     tick_lag_ms: f64, // #3 metrics: how late the 300ms monitor tick actually fired vs schedule (the broker's saturation signal -- a healthy broker is ~0, a CPU-starved one lags). Measured in the monitor loop.
 }
 
@@ -1588,6 +1589,7 @@ impl ServerState {
             // metrics + assert the neighbour absorbed every entity. Both ADDITIVE: unset => no drain => unchanged.
             draining: std::env::var("GW_DRAIN_ON_START").is_ok(),
             drain_exit: std::env::var("GW_DRAIN_NO_EXIT").is_err(),
+            monitor_ticks: 0,
             tick_lag_ms: 0.0,
         }
     }
@@ -1896,6 +1898,52 @@ fn process_rss_bytes() -> u64 {
     0
 }
 
+fn monitor_queues_snapshot(state: &ServerState) -> Value {
+    json!({
+        "pending_updates": state.pending_updates.len(),
+        "pending_handoffs": state.pending_handoffs.len(),
+        "pending_failovers": state.pending_failovers.len(),
+        "pending_block_migrations": state.pending_block_migrations.len(),
+        "pending_commands": state.pending_commands.len(),
+        "pending_handoff_intents": state.pending_handoff_intent.len(),
+        "rebalance_jobs": state.rebalance_jobs.len(),
+        "event_outbox": state.event_outbox.len(),
+        "pending_mesh": state.pending_mesh.len(),
+    })
+}
+
+fn egress_snapshot(state: &ServerState) -> Value {
+    let out_queue_total: u64 = state
+        .workers
+        .values()
+        .map(|w| w.out_queue.load(Ordering::Relaxed))
+        .sum();
+    let out_queue_max: u64 = state
+        .workers
+        .values()
+        .map(|w| w.out_queue.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0);
+    let dropped_total: u64 = state
+        .workers
+        .values()
+        .map(|w| w.dropped.load(Ordering::Relaxed))
+        .sum();
+    let slow_workers = state
+        .workers
+        .values()
+        .filter(|w| w.out_queue.load(Ordering::Relaxed) > EGRESS_SOFT_CAP)
+        .count();
+    json!({
+        "out_queue_total": out_queue_total,
+        "out_queue_max": out_queue_max,
+        "dropped_total": dropped_total,
+        "slow_workers": slow_workers,
+        "soft_cap": EGRESS_SOFT_CAP,
+        "channel_cap": CHANNEL_CAP,
+    })
+}
+
 // #3 OPS: the live broker health/metrics snapshot, as a plain JSON object over the EXISTING length-prefixed wire
 // (no HTTP stack pulled in, no second port to secure). Carries the runtime fields needed for liveness checks:
 // entity_count, mesh_handoffs, tick-lag, RSS, WAL size, ghost count -- plus the liveness-relevant rest. Built from
@@ -1916,8 +1964,11 @@ fn health_snapshot(state: &ServerState) -> Value {
         "fenced_stale_handoffs": state.metrics.fenced_stale_handoffs,
         "wal_compactions": state.metrics.wal_compactions,
         "pending_mesh": state.pending_mesh.len(),
+        "monitor_ticks": state.monitor_ticks,
         "tick_lag_ms": state.tick_lag_ms,
         "lock_max_hold_ms": state.lock_max_hold_ms,
+        "queues": monitor_queues_snapshot(state),
+        "egress": egress_snapshot(state),
         "rss_bytes": process_rss_bytes(),
         "wal_bytes": state.wal_bytes,
         "load_level": state.load_level,
@@ -5608,7 +5659,10 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     // #3 OPS: the new health/metrics fields, also surfaced here so the Inspector and the Health
                     // endpoint never diverge (both read the same state). tick_lag = monitor-cadence slip;
                     // rss_bytes = this process's working set; draining = the graceful-drain state.
+                    "monitor_ticks": state.monitor_ticks,
                     "tick_lag_ms": state.tick_lag_ms,
+                    "queues": monitor_queues_snapshot(state),
+                    "egress": egress_snapshot(state),
                     "rss_bytes": process_rss_bytes(),
                     "wal_bytes": state.wal_bytes,
                     "draining": state.draining,
@@ -8777,6 +8831,7 @@ async fn main() {
                 last_wake = Instant::now();
                 let lag = elapsed.as_secs_f64() * 1000.0 - nominal.as_secs_f64() * 1000.0;
                 let mut s = st.lock().await;
+                s.monitor_ticks = s.monitor_ticks.saturating_add(1);
                 s.tick_lag_ms = if lag > 0.0 { lag } else { 0.0 };
                 let _t = Instant::now();
                 check_leases(&mut s);

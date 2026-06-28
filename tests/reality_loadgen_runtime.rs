@@ -120,6 +120,14 @@ fn metric_u64(metrics: &HashMap<String, String>, key: &str) -> u64 {
         .unwrap_or_else(|_| panic!("bad integer metric {key}: {metrics:?}"))
 }
 
+fn metric_f64(metrics: &HashMap<String, String>, key: &str) -> f64 {
+    metrics
+        .get(key)
+        .unwrap_or_else(|| panic!("missing metric {key}: {metrics:?}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("bad float metric {key}: {metrics:?}"))
+}
+
 fn frame(value: &Value) -> Vec<u8> {
     let body = serde_json::to_vec(value).expect("json frame body");
     let mut out = Vec::with_capacity(4 + body.len());
@@ -334,6 +342,7 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         .env("GW_REQUIRE_ASSET_MANIFEST", "1")
         .env("GW_REQUIRE_SCHEMA_MANIFEST", "1")
         .env("GW_REQUIRE_QBI_AST", "1")
+        .env("GW_REQUIRE_MONITOR_HEALTH", "1")
         .env("GW_SLOW_VIEWER", "1")
         .output()
         .expect("run reality_loadgen");
@@ -399,6 +408,34 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         metric_u64(&metrics, "qbi_ast_ok"),
         4,
         "QBI boolean AST did not select exactly the crossed bodies: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "health_ok"),
+        2,
+        "both brokers must expose healthy runtime snapshots after the cross-broker load: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "monitor_tick_ok"),
+        2,
+        "both brokers must prove the monitor loop ticked during the load: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "monitor_queue_ok"),
+        2,
+        "monitor work queues must drain after the handoff/load window: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "health_queue_backlog"),
+        0,
+        "runtime health queues were not empty at the stable post-load cut: {metrics:?}"
+    );
+    assert!(
+        metric_f64(&metrics, "health_max_tick_lag_ms").is_finite(),
+        "tick lag must be a finite runtime metric: {metrics:?}"
+    );
+    assert!(
+        metric_f64(&metrics, "health_max_lock_ms").is_finite(),
+        "max lock hold must be a finite runtime metric: {metrics:?}"
     );
 }
 
