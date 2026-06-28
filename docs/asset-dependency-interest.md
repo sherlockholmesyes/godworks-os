@@ -30,8 +30,8 @@ Example:
 {
   "asset": {"id": "mesh/ship", "uri": "res://ships/ship.glb", "kind": "mesh"},
   "asset_dependencies": [
-    {"id": "mat/shared", "uri": "res://materials/shared.tres", "kind": "material"},
-    {"id": "tex/ship", "uri": "res://textures/ship.png", "kind": "texture"}
+    {"id": "mat/shared", "uri": "res://materials/shared.tres", "kind": "material", "package": "common/materials"},
+    {"id": "tex/ship", "uri": "res://textures/ship.png", "kind": "texture", "package": "ships/base"}
   ]
 }
 ```
@@ -60,7 +60,8 @@ The broker emits:
 
 ```powershell
 cargo test entity_query_returns_asset_manifest_for_visible_dependencies_only -- --nocapture
+cargo test entity_query_returns_content_manifest_package_plan_for_visible_assets_only -- --nocapture
 cargo test cross_broker_reality_loadgen_requires_mesh_adoption -- --nocapture
 ```
 
-The first test proves the direct `EntityQuery` contract. The second proves that asset dependencies survive a cross-broker handoff and remain visible through the product runtime gate.
+The first test proves the direct `EntityQuery` contract. The second proves the package resolver derived from the same visible assets. The cross-broker test proves that asset dependencies and package load plans survive a handoff and remain visible through the product runtime gate.

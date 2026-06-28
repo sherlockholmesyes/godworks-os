@@ -496,14 +496,16 @@ fn asset_payload(i: u64) -> Value {
     json!({
         "id":format!("mesh/rlg-body-{i}"),
         "uri":format!("res://rlg/body_{i}.glb"),
-        "kind":"mesh"
+        "kind":"mesh",
+        "package":"pkg/rlg-bodies",
+        "hash":format!("sha256:mesh-{i}")
     })
 }
 
 fn asset_dependencies_payload(i: u64) -> Value {
     json!([
-        {"id":"mat/rlg-shared","uri":"res://rlg/shared.tres","kind":"material"},
-        {"id":format!("tex/rlg-body-{i}"),"uri":format!("res://rlg/body_{i}.png"),"kind":"texture"}
+        {"id":"mat/rlg-shared","uri":"res://rlg/shared.tres","kind":"material","package":"pkg/rlg-shared","hash":"sha256:shared-material"},
+        {"id":format!("tex/rlg-body-{i}"),"uri":format!("res://rlg/body_{i}.png"),"kind":"texture","package":"pkg/rlg-bodies","hash":format!("sha256:tex-{i}")}
     ])
 }
 
@@ -631,6 +633,88 @@ fn count_asset_manifest_ok(query: &Value, entities: u64) -> u64 {
     ok
 }
 
+fn package_by_id<'a>(manifest: &'a Value, id: &str) -> Option<&'a Value> {
+    manifest
+        .get("packages")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|package| package.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn package_asset_ids(package: &Value) -> HashSet<String> {
+    package
+        .get("assets")
+        .and_then(Value::as_array)
+        .map(|assets| {
+            assets
+                .iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn count_content_manifest_ok(query: &Value, entities: u64) -> u64 {
+    let Some(manifest) = query.get("content_manifest") else {
+        return 0;
+    };
+    if manifest.get("version").and_then(Value::as_u64) != Some(1) {
+        return 0;
+    }
+    if manifest.get("asset_count").and_then(Value::as_u64) != Some(entities * 2 + 1) {
+        return 0;
+    }
+    if manifest.get("package_count").and_then(Value::as_u64) != Some(2) {
+        return 0;
+    }
+    let Some(body_pkg) = package_by_id(manifest, "pkg/rlg-bodies") else {
+        return 0;
+    };
+    let Some(shared_pkg) = package_by_id(manifest, "pkg/rlg-shared") else {
+        return 0;
+    };
+    if body_pkg.get("asset_count").and_then(Value::as_u64) != Some(entities * 2) {
+        return 0;
+    }
+    if shared_pkg.get("asset_count").and_then(Value::as_u64) != Some(1) {
+        return 0;
+    }
+    let body_assets = package_asset_ids(body_pkg);
+    let shared_assets = package_asset_ids(shared_pkg);
+    if !shared_assets.contains("mat/rlg-shared") {
+        return 0;
+    }
+    let Some(body_hashes) = body_pkg.get("hashes").and_then(Value::as_object) else {
+        return 0;
+    };
+    let Some(entity_packages) = manifest.get("entity_packages").and_then(Value::as_object) else {
+        return 0;
+    };
+    let mut ok = 0u64;
+    for i in 0..entities {
+        let eid = format!("rlg-body-{i}");
+        let mesh = format!("mesh/rlg-body-{i}");
+        let tex = format!("tex/rlg-body-{i}");
+        let Some(packages) = entity_packages.get(&eid).and_then(Value::as_array) else {
+            continue;
+        };
+        let package_set: HashSet<String> = packages
+            .iter()
+            .filter_map(|id| id.as_str().map(str::to_string))
+            .collect();
+        if body_assets.contains(&mesh)
+            && body_assets.contains(&tex)
+            && body_hashes.contains_key(&mesh)
+            && body_hashes.contains_key(&tex)
+            && package_set.contains("pkg/rlg-bodies")
+            && package_set.contains("pkg/rlg-shared")
+        {
+            ok += 1;
+        }
+    }
+    ok
+}
+
 fn count_schema_manifest_ok(query: &Value, entities: u64) -> u64 {
     let Some(manifest) = query.get("schema_manifest") else {
         return 0;
@@ -727,6 +811,10 @@ async fn main() {
         .ok()
         .map(|v| v != "0")
         .unwrap_or(require_writer_swap);
+    let require_content_manifest = env::var("GW_REQUIRE_CONTENT_MANIFEST")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(require_asset_manifest);
     let require_schema_manifest = env::var("GW_REQUIRE_SCHEMA_MANIFEST")
         .ok()
         .map(|v| v != "0")
@@ -970,6 +1058,7 @@ async fn main() {
     let mut physics_payload_ok = 0u64;
     let mut physics_clock_ok = 0u64;
     let mut asset_manifest_ok = 0u64;
+    let mut content_manifest_ok = 0u64;
     let mut schema_manifest_ok = 0u64;
     let mut qbi_ast_ok = 0u64;
     let mut handoff_probe_query_error: Option<String> = None;
@@ -1033,6 +1122,7 @@ async fn main() {
                     physics_payload_ok = count_physics_payload_ok(&query, entities);
                     physics_clock_ok = count_physics_clock_ok(&query, entities);
                     asset_manifest_ok = count_asset_manifest_ok(&query, entities);
+                    content_manifest_ok = count_content_manifest_ok(&query, entities);
                     schema_manifest_ok = count_schema_manifest_ok(&query, entities);
                 }
                 Err(e) => {
@@ -1164,6 +1254,9 @@ async fn main() {
     if require_asset_manifest && asset_manifest_ok < entities {
         failures.push("asset_manifest_incomplete");
     }
+    if require_content_manifest && content_manifest_ok < entities {
+        failures.push("content_manifest_incomplete");
+    }
     if require_schema_manifest && schema_manifest_ok < entities {
         failures.push("schema_manifest_incomplete");
     }
@@ -1186,7 +1279,7 @@ async fn main() {
     let result = if failures.is_empty() { "pass" } else { "fail" };
     let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} schema_manifest_ok={} qbi_ast_ok={} health_ok={} monitor_tick_ok={} monitor_queue_ok={} health_queue_backlog={} health_egress_max={} health_max_tick_lag_ms={:.2} health_max_lock_ms={:.2} mesh_ghosts={} slow_viewer={} failures={}",
+        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} content_manifest_ok={} schema_manifest_ok={} qbi_ast_ok={} health_ok={} monitor_tick_ok={} monitor_queue_ok={} health_queue_backlog={} health_egress_max={} health_max_tick_lag_ms={:.2} health_max_lock_ms={:.2} mesh_ghosts={} slow_viewer={} failures={}",
         result,
         if cross_broker { "cross-broker" } else { "single-broker" },
         entities,
@@ -1210,6 +1303,7 @@ async fn main() {
         physics_payload_ok,
         physics_clock_ok,
         asset_manifest_ok,
+        content_manifest_ok,
         schema_manifest_ok,
         qbi_ast_ok,
         health_ok,

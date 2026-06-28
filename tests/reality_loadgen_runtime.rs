@@ -340,6 +340,7 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         .env("GW_REQUIRE_WRITER_SWAP", "1")
         .env("GW_REQUIRE_PHYSICS_PAYLOAD", "1")
         .env("GW_REQUIRE_ASSET_MANIFEST", "1")
+        .env("GW_REQUIRE_CONTENT_MANIFEST", "1")
         .env("GW_REQUIRE_SCHEMA_MANIFEST", "1")
         .env("GW_REQUIRE_QBI_AST", "1")
         .env("GW_REQUIRE_MONITOR_HEALTH", "1")
@@ -398,6 +399,11 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         metric_u64(&metrics, "asset_manifest_ok"),
         4,
         "asset manifest did not carry every crossed body's visible dependencies: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "content_manifest_ok"),
+        4,
+        "content manifest did not produce a package load plan for every crossed body: {metrics:?}"
     );
     assert_eq!(
         metric_u64(&metrics, "schema_manifest_ok"),
@@ -713,6 +719,129 @@ fn entity_query_returns_asset_manifest_for_visible_dependencies_only() {
     assert!(entity_assets.contains_key("visible-ship"));
     assert!(entity_assets.contains_key("visible-crate"));
     assert!(!entity_assets.contains_key("far-tower"));
+}
+
+#[test]
+fn entity_query_returns_content_manifest_package_plan_for_visible_assets_only() {
+    let port = free_port();
+    let mut broker = start_broker(port, "EARTH", None);
+    let mut owner = connect_worker(port, "earth-owner-content", "EARTH", &["physics"]);
+
+    create_entity_with_components(
+        &mut owner,
+        "visible-ship",
+        "EARTH",
+        json!({
+            "pos": [1.0, 0.0],
+            "vel": [0.0, 0.0],
+            "asset": {"id": "mesh/ship", "uri": "res://ships/ship.glb", "kind": "mesh", "package": "ships/base", "hash": "sha256:ship"},
+            "asset_dependencies": [
+                {"id": "mat/shared", "uri": "res://materials/shared.tres", "kind": "material", "package": "common/materials", "hash": "sha256:shared"},
+                {"id": "tex/ship", "uri": "res://textures/ship.png", "kind": "texture", "package": "ships/base", "hash": "sha256:shiptex"}
+            ]
+        }),
+    );
+    create_entity_with_components(
+        &mut owner,
+        "visible-crate",
+        "EARTH",
+        json!({
+            "pos": [2.0, 0.0],
+            "vel": [0.0, 0.0],
+            "asset": {"id": "mesh/crate", "uri": "res://props/crate.glb", "kind": "mesh", "package": "props/base", "hash": "sha256:crate"},
+            "asset_dependencies": [
+                {"id": "mat/shared", "uri": "res://materials/shared.tres", "kind": "material", "package": "common/materials", "hash": "sha256:shared"}
+            ]
+        }),
+    );
+    create_entity_with_components(
+        &mut owner,
+        "far-secret",
+        "EARTH",
+        json!({
+            "pos": [100.0, 0.0],
+            "vel": [0.0, 0.0],
+            "asset": {"id": "mesh/secret", "uri": "res://secret/secret.glb", "kind": "mesh", "package": "secret/pkg"}
+        }),
+    );
+
+    let response = entity_query_with_query(
+        port,
+        "content-interest",
+        json!({"type": "sphere", "center": [0.0, 0.0], "radius": 10.0}),
+    );
+    stop(&mut broker);
+
+    assert_eq!(response.get("count").and_then(Value::as_u64), Some(2));
+    let manifest = response
+        .get("content_manifest")
+        .unwrap_or_else(|| panic!("EntityQueryResponse missing content_manifest: {response}"));
+    assert_eq!(manifest.get("version").and_then(Value::as_u64), Some(1));
+    assert_eq!(manifest.get("asset_count").and_then(Value::as_u64), Some(4));
+    assert_eq!(
+        manifest.get("package_count").and_then(Value::as_u64),
+        Some(3)
+    );
+
+    let packages = manifest
+        .get("packages")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("content manifest missing packages: {manifest}"));
+    let package_ids: Vec<String> = packages
+        .iter()
+        .filter_map(|pkg| pkg.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    for required in ["common/materials", "props/base", "ships/base"] {
+        assert!(
+            package_ids.contains(&required.to_string()),
+            "missing package {required}: {manifest}"
+        );
+    }
+    assert!(
+        !package_ids.contains(&"secret/pkg".to_string()),
+        "content manifest leaked a non-visible package: {manifest}"
+    );
+
+    let ships_pkg = packages
+        .iter()
+        .find(|pkg| pkg.get("id").and_then(Value::as_str) == Some("ships/base"))
+        .unwrap_or_else(|| panic!("missing ships/base package: {manifest}"));
+    assert_eq!(
+        ships_pkg.get("asset_count").and_then(Value::as_u64),
+        Some(2)
+    );
+    let ship_assets: Vec<String> = ships_pkg
+        .get("assets")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("ships/base missing assets: {ships_pkg}"))
+        .iter()
+        .filter_map(|asset| asset.as_str().map(str::to_string))
+        .collect();
+    assert!(ship_assets.contains(&"mesh/ship".to_string()));
+    assert!(ship_assets.contains(&"tex/ship".to_string()));
+    assert!(
+        ships_pkg
+            .get("hashes")
+            .and_then(Value::as_object)
+            .map(|hashes| hashes.contains_key("mesh/ship"))
+            .unwrap_or(false),
+        "package plan must carry asset hashes when present: {ships_pkg}"
+    );
+
+    let entity_packages = manifest
+        .get("entity_packages")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("content manifest missing entity_packages: {manifest}"));
+    let ship_packages: Vec<String> = entity_packages
+        .get("visible-ship")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing visible-ship packages: {manifest}"))
+        .iter()
+        .filter_map(|package| package.as_str().map(str::to_string))
+        .collect();
+    assert!(ship_packages.contains(&"common/materials".to_string()));
+    assert!(ship_packages.contains(&"ships/base".to_string()));
+    assert!(!entity_packages.contains_key("far-secret"));
 }
 
 #[test]

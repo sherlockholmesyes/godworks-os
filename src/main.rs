@@ -16,7 +16,7 @@
 //!                  as the honest no-spare dead-end; metrics{handoffs,applies,failovers}.
 //! the reference is the conformance oracle; this is the runtime (no GC, real threads, ARM).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -5538,13 +5538,17 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                         "ghost":true,"owner_region":g.owner_region,"authority":json!({})}));
                 }
             }
+            let asset_manifest = build_asset_manifest(asset_index, entity_assets);
+            let content_manifest = build_content_manifest(&asset_manifest);
+            let schema_manifest = build_schema_manifest(component_index, entity_components);
             emit(
                 state,
                 wid,
                 json!({"op":"EntityQueryResponse","request_id":req_id,
                 "count":hits.len(),"entities":hits,
-                "asset_manifest":build_asset_manifest(asset_index, entity_assets),
-                "schema_manifest":build_schema_manifest(component_index, entity_components)}),
+                "asset_manifest":asset_manifest,
+                "content_manifest":content_manifest,
+                "schema_manifest":schema_manifest}),
             );
         }
         // ── InspectorQuery: read-only whole-cluster truth frame. Gated by the
@@ -6863,6 +6867,139 @@ fn build_asset_manifest(
         "count": assets.len(),
         "assets": assets,
         "entity_assets": entity_assets,
+    })
+}
+
+fn package_parent_from_path(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((parent, _leaf)) = trimmed.rsplit_once('/') {
+        if !parent.is_empty() {
+            return Some(parent.to_string());
+        }
+    }
+    if let Some((parent, _leaf)) = trimmed.rsplit_once('\\') {
+        if !parent.is_empty() {
+            return Some(parent.to_string());
+        }
+    }
+    trimmed
+        .split_once(':')
+        .and_then(|(scheme, _)| (!scheme.is_empty()).then(|| scheme.to_string()))
+}
+
+fn asset_package_id(asset: &Value) -> String {
+    for key in [
+        "package",
+        "package_id",
+        "bundle",
+        "bundle_id",
+        "content_package",
+        "content_package_id",
+    ] {
+        if let Some(id) = asset.get(key).and_then(Value::as_str) {
+            let id = id.trim();
+            if !id.is_empty() {
+                return id.to_string();
+            }
+        }
+    }
+    asset
+        .get("uri")
+        .and_then(Value::as_str)
+        .and_then(package_parent_from_path)
+        .or_else(|| {
+            asset
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(package_parent_from_path)
+        })
+        .unwrap_or_else(|| "default".to_string())
+}
+
+#[derive(Default)]
+struct ContentPackageDraft {
+    assets: BTreeSet<String>,
+    uris: Map<String, Value>,
+    hashes: Map<String, Value>,
+}
+
+fn build_content_manifest(asset_manifest: &Value) -> Value {
+    let mut asset_to_package: HashMap<String, String> = HashMap::new();
+    let mut packages: HashMap<String, ContentPackageDraft> = HashMap::new();
+    if let Some(assets) = asset_manifest.get("assets").and_then(Value::as_array) {
+        for asset in assets {
+            let Some(asset_id) = asset.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if asset_id.is_empty() {
+                continue;
+            }
+            let package_id = asset_package_id(asset);
+            asset_to_package.insert(asset_id.to_string(), package_id.clone());
+            let draft = packages.entry(package_id).or_default();
+            draft.assets.insert(asset_id.to_string());
+            if let Some(uri) = asset.get("uri").or_else(|| asset.get("path")) {
+                draft.uris.insert(asset_id.to_string(), uri.clone());
+            }
+            if let Some(hash) = asset.get("hash").or_else(|| asset.get("sha256")) {
+                draft.hashes.insert(asset_id.to_string(), hash.clone());
+            }
+        }
+    }
+
+    let mut entity_packages = Map::new();
+    if let Some(entity_assets) = asset_manifest
+        .get("entity_assets")
+        .and_then(Value::as_object)
+    {
+        let mut entity_ids: Vec<&String> = entity_assets.keys().collect();
+        entity_ids.sort();
+        for eid in entity_ids {
+            let mut package_ids = BTreeSet::new();
+            if let Some(ids) = entity_assets.get(eid).and_then(Value::as_array) {
+                for id in ids.iter().filter_map(Value::as_str) {
+                    if let Some(package_id) = asset_to_package.get(id) {
+                        package_ids.insert(package_id.clone());
+                    }
+                }
+            }
+            if !package_ids.is_empty() {
+                entity_packages.insert(
+                    eid.clone(),
+                    Value::Array(package_ids.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+    }
+
+    let mut package_rows: Vec<Value> = packages
+        .into_iter()
+        .map(|(id, draft)| {
+            let assets: Vec<Value> = draft.assets.into_iter().map(Value::String).collect();
+            json!({
+                "id": id,
+                "asset_count": assets.len(),
+                "assets": assets,
+                "uris": draft.uris,
+                "hashes": draft.hashes,
+            })
+        })
+        .collect();
+    package_rows.sort_by(|a, b| {
+        let ai = a.get("id").and_then(Value::as_str).unwrap_or("");
+        let bi = b.get("id").and_then(Value::as_str).unwrap_or("");
+        ai.cmp(bi)
+    });
+
+    json!({
+        "version": 1,
+        "asset_count": asset_to_package.len(),
+        "package_count": package_rows.len(),
+        "packages": package_rows,
+        "entity_packages": entity_packages,
     })
 }
 
