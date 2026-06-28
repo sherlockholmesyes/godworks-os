@@ -27,7 +27,7 @@ cargo test -- --test-threads=1
 Expected current shape:
 
 - 29 unit tests in `src/main.rs`
-- 5 broker runtime tests in `tests/reality_loadgen_runtime.rs`
+- 6 broker runtime tests in `tests/reality_loadgen_runtime.rs`
 - 3 zone-worker runtime tests in `tests/zone_worker_runtime.rs`
 
 The current known warning is an unused helper in `zone_worker.rs`; it does not affect the runtime gates.
@@ -122,8 +122,9 @@ cargo test dense_seam_with_matching_e_worker_conserves_authority -- --nocapture
 - the E-side owner writes a full `physics` payload (`pos`, `rot`, `lin`, `ang`, `at_rest`, `gen`, `t_server`, `sim_time`) and a public `EntityQuery` sees the post-handoff value with monotonic clocks.
 - the public `EntityQuery` also returns an `asset_manifest` for visible crossed bodies, with shared dependencies deduped and non-visible dependencies excluded.
 - the public `EntityQuery` also returns a `schema_manifest` for visible crossed components, including the `physics` field shape.
+- a nested query constraint AST selects the crossed bodies and excludes an in-radius decoy.
 
-The parseable result line exposes this as `handoff_probe_ok=<N>`, `handoff_probe_rejected=<N>`, `physics_payload_ok=<N>`, `physics_clock_ok=<N>`, `asset_manifest_ok=<N>`, and `schema_manifest_ok=<N>`.
+The parseable result line exposes this as `handoff_probe_ok=<N>`, `handoff_probe_rejected=<N>`, `physics_payload_ok=<N>`, `physics_clock_ok=<N>`, `asset_manifest_ok=<N>`, `schema_manifest_ok=<N>`, and `qbi_ast_ok=<N>`.
 
 For manual experiments, run one broker per region and connect them with `GW_MESH` / `GW_ADVERTISE`. Keep broker and worker processes alive in foreground terminals or under a process manager; shell-backgrounded children may exit when their launcher exits.
 

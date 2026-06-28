@@ -333,6 +333,7 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         .env("GW_REQUIRE_PHYSICS_PAYLOAD", "1")
         .env("GW_REQUIRE_ASSET_MANIFEST", "1")
         .env("GW_REQUIRE_SCHEMA_MANIFEST", "1")
+        .env("GW_REQUIRE_QBI_AST", "1")
         .env("GW_SLOW_VIEWER", "1")
         .output()
         .expect("run reality_loadgen");
@@ -393,6 +394,11 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         metric_u64(&metrics, "schema_manifest_ok"),
         4,
         "schema manifest did not carry every crossed body's component ABI: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "qbi_ast_ok"),
+        4,
+        "QBI boolean AST did not select exactly the crossed bodies: {metrics:?}"
     );
 }
 
@@ -791,4 +797,67 @@ fn entity_query_returns_schema_manifest_for_visible_components_only() {
             "missing {field}: {physics_schema}"
         );
     }
+}
+
+#[test]
+fn entity_query_supports_qbi_boolean_constraint_ast() {
+    let port = free_port();
+    let mut broker = start_broker(port, "EARTH", None);
+    let mut owner = connect_worker(port, "earth-owner-qbi", "EARTH", &["physics"]);
+
+    create_entity_with_components(
+        &mut owner,
+        "target-ore",
+        "EARTH",
+        json!({
+            "pos": [2.0, 1.0],
+            "vel": [0.0, 0.0],
+            "ore_resource": {"tier": 5},
+            "asset": {"id": "ore/metal", "kind": "ore"}
+        }),
+    );
+    create_entity_with_components(
+        &mut owner,
+        "wrong-component",
+        "EARTH",
+        json!({
+            "pos": [1.0, 1.0],
+            "vel": [0.0, 0.0],
+            "hidden_logic": {"script": "server-only"}
+        }),
+    );
+    create_entity_with_components(
+        &mut owner,
+        "far-ore",
+        "EARTH",
+        json!({
+            "pos": [50.0, 0.0],
+            "vel": [0.0, 0.0],
+            "ore_resource": {"tier": 5}
+        }),
+    );
+
+    let response = entity_query_with_query(
+        port,
+        "qbi-ast",
+        json!({
+            "type": "and",
+            "constraints": [
+                {"type": "sphere", "center": [0.0, 0.0], "radius": 5.0},
+                {
+                    "type": "or",
+                    "constraints": [
+                        {"type": "component", "comp": "ore_resource"},
+                        {"type": "entity", "entity": "target-ore"}
+                    ]
+                },
+                {"type": "not", "constraint": {"type": "component", "comp": "hidden_logic"}},
+                {"type": "region", "region": "EARTH"}
+            ]
+        }),
+    );
+    stop(&mut broker);
+
+    assert_eq!(response.get("count").and_then(Value::as_u64), Some(1));
+    assert_eq!(entity_ids(&response), vec!["target-ore".to_string()]);
 }

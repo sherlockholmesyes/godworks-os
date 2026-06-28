@@ -5441,7 +5441,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .iter()
                 .any(|a| a == "observer" || a == "debug");
             for (eid, e) in state.entities.iter() {
-                if matches_query(e, &q) && visible(worker, e) {
+                if matches_query(eid, e, &q) && visible(worker, e) {
                     let mut row = json!({"entity":eid,"pos":[e.pos[0],e.pos[1]],
                         "components":Value::Object(e.components.clone()),"region":e.region,
                         "authority":authority_to_json(&e.authority)});
@@ -5471,7 +5471,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             // query-based targeter finds them. They carry a `ghost:true` + `owner_region` marker and NO authority
             // (the row's `authority` is empty), so nothing can mistake a ghost for an authoritative entity.
             for (eid, g) in state.ghosts.iter() {
-                if ghost_query_match(g, &q) && ghost_visible(worker, g) {
+                if ghost_query_match(eid, g, &q) && ghost_visible(worker, g) {
                     let mut comps = g.components.clone();
                     comps.insert("ghost".to_string(), json!(true));
                     add_asset_manifest_refs(&mut asset_index, &mut entity_assets, eid, &comps);
@@ -6526,28 +6526,81 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
     }
 }
 
+const MAX_QUERY_DEPTH: usize = 32;
+
 // the GhostEntity analogue of matches_query (a ghost has pos + components + owner_region, no ACL/authority).
-fn ghost_query_match(g: &GhostEntity, q: &Value) -> bool {
+fn ghost_query_match(eid: &str, g: &GhostEntity, q: &Value) -> bool {
+    matches_query_parts(eid, g.pos, &g.components, &g.owner_region, q, 0)
+}
+
+fn qbi_children<'a>(q: &'a Value, primary: &str, fallback: &str) -> &'a [Value] {
+    q.get(primary)
+        .or_else(|| q.get(fallback))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn qbi_child<'a>(q: &'a Value, primary: &str, fallback: &str) -> Option<&'a Value> {
+    q.get(primary).or_else(|| q.get(fallback))
+}
+
+fn qbi_component_name(q: &Value) -> &str {
+    q.get("comp")
+        .or_else(|| q.get("component"))
+        .or_else(|| q.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn qbi_entity_id(q: &Value) -> &str {
+    q.get("entity")
+        .or_else(|| q.get("entity_id"))
+        .or_else(|| q.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn matches_query_parts(
+    eid: &str,
+    pos: [f64; 2],
+    components: &Map<String, Value>,
+    region: &str,
+    q: &Value,
+    depth: usize,
+) -> bool {
+    if depth > MAX_QUERY_DEPTH {
+        return false;
+    }
     match q.get("type").and_then(|v| v.as_str()).unwrap_or("all") {
         "all" => true,
+        "and" => qbi_children(q, "constraints", "all_of")
+            .iter()
+            .all(|child| matches_query_parts(eid, pos, components, region, child, depth + 1)),
+        "or" => qbi_children(q, "constraints", "any_of")
+            .iter()
+            .any(|child| matches_query_parts(eid, pos, components, region, child, depth + 1)),
+        "not" => qbi_child(q, "constraint", "query")
+            .map(|child| !matches_query_parts(eid, pos, components, region, child, depth + 1))
+            .unwrap_or(false),
+        "entity" | "entity_id" => qbi_entity_id(q) == eid,
         "sphere" => {
             let c = q.get("center").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
             let r = q.get("radius").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let dx = g.pos[0] - c[0];
-            let dy = g.pos[1] - c[1];
+            let dx = pos[0] - c[0];
+            let dy = pos[1] - c[1];
             dx * dx + dy * dy <= r * r
         }
         "box" => {
             let lo = q.get("min").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
             let hi = q.get("max").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
-            g.pos[0] >= lo[0] && g.pos[0] <= hi[0] && g.pos[1] >= lo[1] && g.pos[1] <= hi[1]
+            pos[0] >= lo[0] && pos[0] <= hi[0] && pos[1] >= lo[1] && pos[1] <= hi[1]
         }
         "component" => {
-            let comp = q.get("comp").and_then(|v| v.as_str()).unwrap_or("");
-            g.components.contains_key(comp) || comp == "pos" || comp == "vel"
+            let comp = qbi_component_name(q);
+            components.contains_key(comp) || comp == "pos" || comp == "vel"
         }
-        // a ghost's "region" is its OWNER region (the source zone); a region query matches on that.
-        "region" => q.get("region").and_then(|v| v.as_str()) == Some(g.owner_region.as_str()),
+        "region" => q.get("region").and_then(|v| v.as_str()) == Some(region),
         _ => false,
     }
 }
@@ -6769,28 +6822,8 @@ fn build_schema_manifest(
     })
 }
 
-fn matches_query(e: &Entity, q: &Value) -> bool {
-    match q.get("type").and_then(|v| v.as_str()).unwrap_or("all") {
-        "all" => true,
-        "sphere" => {
-            let c = q.get("center").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
-            let r = q.get("radius").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let dx = e.pos[0] - c[0];
-            let dy = e.pos[1] - c[1];
-            dx * dx + dy * dy <= r * r
-        }
-        "box" => {
-            let lo = q.get("min").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
-            let hi = q.get("max").map(|v| arr2(Some(v))).unwrap_or([0.0, 0.0]);
-            e.pos[0] >= lo[0] && e.pos[0] <= hi[0] && e.pos[1] >= lo[1] && e.pos[1] <= hi[1]
-        }
-        "component" => {
-            let comp = q.get("comp").and_then(|v| v.as_str()).unwrap_or("");
-            e.components.contains_key(comp) || comp == "pos" || comp == "vel"
-        }
-        "region" => q.get("region").and_then(|v| v.as_str()) == Some(e.region.as_str()),
-        _ => false,
-    }
+fn matches_query(eid: &str, e: &Entity, q: &Value) -> bool {
+    matches_query_parts(eid, e.pos, &e.components, &e.region, q, 0)
 }
 
 // A2 thin-fill (2026-06-20): the frame length `n` is peer-controlled; `vec![0u8; n]` would alloc up

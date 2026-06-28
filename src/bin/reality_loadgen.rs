@@ -257,6 +257,21 @@ where
 }
 
 async fn query_entities(host: &str, port: u16, request_id: &str) -> std::io::Result<Value> {
+    query_entities_with_query(
+        host,
+        port,
+        request_id,
+        json!({"type":"sphere","center":[0.0,0.0],"radius":100.0}),
+    )
+    .await
+}
+
+async fn query_entities_with_query(
+    host: &str,
+    port: u16,
+    request_id: &str,
+    query: Value,
+) -> std::io::Result<Value> {
     let mut stream = TcpStream::connect((host, port)).await?;
     stream.set_nodelay(true).ok();
     write_raw(
@@ -271,7 +286,7 @@ async fn query_entities(host: &str, port: u16, request_id: &str) -> std::io::Res
     .await?;
     write_raw(
         &mut stream,
-        &json!({"op":"EntityQuery","request_id":request_id,"query":{"type":"sphere","center":[0.0,0.0],"radius":100.0}}),
+        &json!({"op":"EntityQuery","request_id":request_id,"query":query}),
     )
     .await?;
     for _ in 0..256 {
@@ -289,6 +304,24 @@ async fn query_entities(host: &str, port: u16, request_id: &str) -> std::io::Res
         std::io::ErrorKind::TimedOut,
         "EntityQueryResponse not received",
     ))
+}
+
+fn qbi_ast_query() -> Value {
+    json!({
+        "type":"and",
+        "constraints":[
+            {"type":"sphere","center":[0.0,0.0],"radius":100.0},
+            {"type":"component","comp":"physics"},
+            {
+                "type":"or",
+                "constraints":[
+                    {"type":"component","comp":"handoff_probe"},
+                    {"type":"component","comp":"asset"}
+                ]
+            },
+            {"type":"not","constraint":{"type":"component","comp":"control_decoy"}}
+        ]
+    })
 }
 
 fn count_handoff_probe_ok(query: &Value, entities: u64) -> u64 {
@@ -310,6 +343,29 @@ fn count_handoff_probe_ok(query: &Value, entities: u64) -> u64 {
         if matched {
             ok += 1;
         }
+    }
+    ok
+}
+
+fn count_qbi_ast_ok(query: &Value, entities: u64) -> u64 {
+    let Some(rows) = query.get("entities").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    let mut ok = 0u64;
+    for i in 0..entities {
+        let eid = format!("rlg-body-{i}");
+        if rows
+            .iter()
+            .any(|row| row.get("entity").and_then(|v| v.as_str()) == Some(eid.as_str()))
+        {
+            ok += 1;
+        }
+    }
+    if rows
+        .iter()
+        .any(|row| row.get("entity").and_then(|v| v.as_str()) == Some("rlg-qbi-decoy"))
+    {
+        return 0;
     }
     ok
 }
@@ -597,6 +653,10 @@ async fn main() {
         .ok()
         .map(|v| v != "0")
         .unwrap_or(require_writer_swap);
+    let require_qbi_ast = env::var("GW_REQUIRE_QBI_AST")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(require_writer_swap);
     let cross_broker = port_e != port_w;
     let dt = Duration::from_secs_f64(1.0 / hz);
     let stop = Arc::new(AtomicBool::new(false));
@@ -721,6 +781,23 @@ async fn main() {
         .unwrap();
     }
 
+    send_json(
+        &owner_e_wr,
+        &json!({
+            "op":"CreateEntity",
+            "request_id":"create-qbi-decoy",
+            "entity":"rlg-qbi-decoy",
+            "region":"E",
+            "components":{
+                "pos":[3.0,0.0],
+                "vel":[0.0,0.0],
+                "control_decoy":true
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     send_json(
@@ -798,6 +875,7 @@ async fn main() {
     let mut physics_clock_ok = 0u64;
     let mut asset_manifest_ok = 0u64;
     let mut schema_manifest_ok = 0u64;
+    let mut qbi_ast_ok = 0u64;
     let mut handoff_probe_query_error: Option<String> = None;
     if require_writer_swap {
         let gained = wait_until(Duration::from_secs(3), || {
@@ -860,6 +938,14 @@ async fn main() {
                     physics_clock_ok = count_physics_clock_ok(&query, entities);
                     asset_manifest_ok = count_asset_manifest_ok(&query, entities);
                     schema_manifest_ok = count_schema_manifest_ok(&query, entities);
+                }
+                Err(e) => {
+                    handoff_probe_query_error = Some(e.to_string());
+                }
+            }
+            match query_entities_with_query(&host, port_e, "rlg-qbi-ast", qbi_ast_query()).await {
+                Ok(query) => {
+                    qbi_ast_ok = count_qbi_ast_ok(&query, entities);
                 }
                 Err(e) => {
                     handoff_probe_query_error = Some(e.to_string());
@@ -939,11 +1025,14 @@ async fn main() {
     if require_schema_manifest && schema_manifest_ok < entities {
         failures.push("schema_manifest_incomplete");
     }
+    if require_qbi_ast && qbi_ast_ok < entities {
+        failures.push("qbi_ast_incomplete");
+    }
 
     let result = if failures.is_empty() { "pass" } else { "fail" };
     let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} schema_manifest_ok={} mesh_ghosts={} slow_viewer={} failures={}",
+        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} schema_manifest_ok={} qbi_ast_ok={} mesh_ghosts={} slow_viewer={} failures={}",
         result,
         if cross_broker { "cross-broker" } else { "single-broker" },
         entities,
@@ -968,6 +1057,7 @@ async fn main() {
         physics_clock_ok,
         asset_manifest_ok,
         schema_manifest_ok,
+        qbi_ast_ok,
         Counters::get(&all.mesh_ghost) + Counters::get(&east.mesh_ghost),
         if enable_slow { 1 } else { 0 },
         if failures.is_empty() { "none".to_string() } else { failures.join(",") }
