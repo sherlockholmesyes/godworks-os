@@ -119,8 +119,9 @@ cargo test dense_seam_with_matching_e_worker_conserves_authority -- --nocapture
 - the E-side owner receives authority for every crossed entity;
 - the E-side owner writes `handoff_probe`, and a public `EntityQuery` sees that value;
 - the old W-side owner attempts the same write and receives `UpdateRejected`.
+- the E-side owner writes a full `physics` payload (`pos`, `rot`, `lin`, `ang`, `at_rest`, `gen`, `t_server`, `sim_time`) and a public `EntityQuery` sees the post-handoff value with monotonic clocks.
 
-The parseable result line exposes this as `handoff_probe_ok=<N>` and `handoff_probe_rejected=<N>`.
+The parseable result line exposes this as `handoff_probe_ok=<N>`, `handoff_probe_rejected=<N>`, `physics_payload_ok=<N>`, and `physics_clock_ok=<N>`.
 
 For manual experiments, run one broker per region and connect them with `GW_MESH` / `GW_ADVERTISE`. Keep broker and worker processes alive in foreground terminals or under a process manager; shell-backgrounded children may exit when their launcher exits.
 

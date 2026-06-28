@@ -313,6 +313,131 @@ fn count_handoff_probe_ok(query: &Value, entities: u64) -> u64 {
     ok
 }
 
+fn body_y(i: u64) -> f64 {
+    (i as f64 % 8.0) * 0.35 - 1.2
+}
+
+fn initial_physics_gen(i: u64) -> u64 {
+    10 + i
+}
+
+fn initial_physics_sim_time(i: u64) -> u64 {
+    1_000 + i
+}
+
+fn initial_physics_t_server(i: u64) -> u64 {
+    100 + i
+}
+
+fn initial_physics_payload(i: u64, x: f64, y: f64) -> Value {
+    json!({
+        "pos":[x, y, 0.0],
+        "rot":[0.0, 0.0, 0.0, 1.0],
+        "lin":[0.08, 0.0, 0.0],
+        "ang":[0.0, 0.0, 0.0],
+        "at_rest":false,
+        "gen":initial_physics_gen(i),
+        "t_server":initial_physics_t_server(i),
+        "sim_time":initial_physics_sim_time(i),
+        "writer":"W_INIT"
+    })
+}
+
+fn e_physics_payload(i: u64, x: f64, y: f64) -> Value {
+    json!({
+        "pos":[x, y, 0.0],
+        "rot":[0.0, 0.0, 0.70710678, 0.70710678],
+        "lin":[0.08, 0.01 * i as f64, 0.0],
+        "ang":[0.0, 0.25, 0.0],
+        "at_rest":false,
+        "gen":0,
+        "t_server":0,
+        "sim_time":0,
+        "writer":"E"
+    })
+}
+
+fn value_f64_at(v: &Value, idx: usize) -> Option<f64> {
+    v.as_array()?.get(idx)?.as_f64()
+}
+
+fn approx(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 0.000001
+}
+
+fn array_matches(actual: Option<&Value>, expected: &[f64]) -> bool {
+    let Some(actual) = actual else {
+        return false;
+    };
+    expected.iter().enumerate().all(|(idx, want)| {
+        value_f64_at(actual, idx)
+            .map(|got| approx(got, *want))
+            .unwrap_or(false)
+    })
+}
+
+fn count_physics_payload_ok(query: &Value, entities: u64) -> u64 {
+    let Some(rows) = query.get("entities").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    let mut ok = 0u64;
+    for i in 0..entities {
+        let eid = format!("rlg-body-{i}");
+        let y = body_y(i);
+        let x = 3.25 + i as f64 * 0.01;
+        let matched = rows.iter().any(|row| {
+            if row.get("entity").and_then(|v| v.as_str()) != Some(eid.as_str()) {
+                return false;
+            }
+            let Some(physics) = row.get("components").and_then(|c| c.get("physics")) else {
+                return false;
+            };
+            physics.get("writer").and_then(|v| v.as_str()) == Some("E")
+                && physics.get("at_rest").and_then(|v| v.as_bool()) == Some(false)
+                && array_matches(physics.get("pos"), &[x, y, 0.0])
+                && array_matches(physics.get("rot"), &[0.0, 0.0, 0.70710678, 0.70710678])
+                && array_matches(physics.get("lin"), &[0.08, 0.01 * i as f64, 0.0])
+                && array_matches(physics.get("ang"), &[0.0, 0.25, 0.0])
+        });
+        if matched {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+fn count_physics_clock_ok(query: &Value, entities: u64) -> u64 {
+    let Some(rows) = query.get("entities").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    let mut ok = 0u64;
+    for i in 0..entities {
+        let eid = format!("rlg-body-{i}");
+        let matched = rows.iter().any(|row| {
+            if row.get("entity").and_then(|v| v.as_str()) != Some(eid.as_str()) {
+                return false;
+            }
+            let Some(physics) = row.get("components").and_then(|c| c.get("physics")) else {
+                return false;
+            };
+            let gen_ok =
+                physics.get("gen").and_then(|v| v.as_u64()) == Some(initial_physics_gen(i) + 1);
+            let sim_ok = physics.get("sim_time").and_then(|v| v.as_u64())
+                == Some(initial_physics_sim_time(i) + 16);
+            let t_server_ok = physics
+                .get("t_server")
+                .and_then(|v| v.as_u64())
+                .map(|v| v > initial_physics_t_server(i))
+                .unwrap_or(false);
+            gen_ok && sim_ok && t_server_ok
+        });
+        if matched {
+            ok += 1;
+        }
+    }
+    ok
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let host = env::var("GW_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -331,6 +456,10 @@ async fn main() {
         .map(|v| v != "0")
         .unwrap_or(port_e != port_w);
     let require_writer_swap = env::var("GW_REQUIRE_WRITER_SWAP")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let require_physics_payload = env::var("GW_REQUIRE_PHYSICS_PAYLOAD")
         .ok()
         .map(|v| v != "0")
         .unwrap_or(true);
@@ -432,7 +561,7 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     for i in 0..entities {
-        let y = (i as f64 % 8.0) * 0.35 - 1.2;
+        let y = body_y(i);
         let eid = format!("rlg-body-{i}");
         send_json(
             &owner_w_wr,
@@ -446,6 +575,7 @@ async fn main() {
                     "vel":[0.08,0.0],
                     "mass":1.0 + (i % 3) as f64,
                     "contact_radius":0.75,
+                    "physics":initial_physics_payload(i, -2.0, y),
                     "sim_time":0,
                     "gen":0
                 }
@@ -506,7 +636,7 @@ async fn main() {
         let mut pos_updates = Vec::with_capacity(entities as usize);
         let mut vel_updates = Vec::with_capacity(entities as usize);
         for i in 0..entities {
-            let y = (i as f64 % 8.0) * 0.35 - 1.2;
+            let y = body_y(i);
             let eid = format!("rlg-body-{i}");
             pos_updates.push(json!([eid, [x, y]]));
             let eid = format!("rlg-body-{i}");
@@ -528,6 +658,8 @@ async fn main() {
     }
 
     let mut handoff_probe_ok = 0u64;
+    let mut physics_payload_ok = 0u64;
+    let mut physics_clock_ok = 0u64;
     let mut handoff_probe_query_error: Option<String> = None;
     if require_writer_swap {
         let gained = wait_until(Duration::from_secs(3), || {
@@ -535,6 +667,24 @@ async fn main() {
         })
         .await;
         if gained {
+            if require_physics_payload {
+                for i in 0..entities {
+                    let eid = format!("rlg-body-{i}");
+                    let y = body_y(i);
+                    send_json(
+                        &owner_e_wr,
+                        &json!({
+                            "op":"UpdateComponent",
+                            "entity":eid,
+                            "comp":"physics",
+                            "value":e_physics_payload(i, 3.25 + i as f64 * 0.01, y)
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
             for i in 0..entities {
                 let eid = format!("rlg-body-{i}");
                 send_json(
@@ -568,6 +718,8 @@ async fn main() {
             match query_entities(&host, port_e, "rlg-handoff-probe").await {
                 Ok(query) => {
                     handoff_probe_ok = count_handoff_probe_ok(&query, entities);
+                    physics_payload_ok = count_physics_payload_ok(&query, entities);
+                    physics_clock_ok = count_physics_clock_ok(&query, entities);
                 }
                 Err(e) => {
                     handoff_probe_query_error = Some(e.to_string());
@@ -635,11 +787,17 @@ async fn main() {
     if require_writer_swap && handoff_probe_query_error.is_some() {
         failures.push("handoff_probe_query_failed");
     }
+    if require_physics_payload && physics_payload_ok < entities {
+        failures.push("physics_payload_not_visible");
+    }
+    if require_physics_payload && physics_clock_ok < entities {
+        failures.push("physics_clock_not_monotonic");
+    }
 
     let result = if failures.is_empty() { "pass" } else { "fail" };
     let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} mesh_ghosts={} slow_viewer={} failures={}",
+        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} mesh_ghosts={} slow_viewer={} failures={}",
         result,
         if cross_broker { "cross-broker" } else { "single-broker" },
         entities,
@@ -660,6 +818,8 @@ async fn main() {
         east_authority_gain,
         handoff_probe_ok,
         handoff_probe_rejected,
+        physics_payload_ok,
+        physics_clock_ok,
         Counters::get(&all.mesh_ghost) + Counters::get(&east.mesh_ghost),
         if enable_slow { 1 } else { 0 },
         if failures.is_empty() { "none".to_string() } else { failures.join(",") }

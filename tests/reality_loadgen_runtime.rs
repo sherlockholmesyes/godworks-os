@@ -106,6 +106,7 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         .env("GW_EVENT_BURST", "6")
         .env("GW_REQUIRE_MESH", "1")
         .env("GW_REQUIRE_WRITER_SWAP", "1")
+        .env("GW_REQUIRE_PHYSICS_PAYLOAD", "1")
         .env("GW_SLOW_VIEWER", "1")
         .output()
         .expect("run reality_loadgen");
@@ -146,5 +147,15 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         metric_u64(&metrics, "handoff_probe_rejected"),
         4,
         "old owner was not fenced after adopt: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "physics_payload_ok"),
+        4,
+        "full physics payload did not survive cross-broker handoff and E-side write: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "physics_clock_ok"),
+        4,
+        "physics gen/sim_time/t_server were not monotonic after handoff: {metrics:?}"
     );
 }
