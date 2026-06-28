@@ -51,6 +51,17 @@ fn start_broker_with_wal(
     wal: String,
     restore_offset: Option<u64>,
 ) -> Child {
+    start_broker_with_wal_and_env(port, region, mesh, wal, restore_offset, &[])
+}
+
+fn start_broker_with_wal_and_env(
+    port: u16,
+    region: &str,
+    mesh: Option<(String, u16)>,
+    wal: String,
+    restore_offset: Option<u64>,
+    extra_env: &[(&str, &str)],
+) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_godworks_broker"));
     cmd.env("GW_HOST", "127.0.0.1")
         .env("GW_PORT", port.to_string())
@@ -58,6 +69,8 @@ fn start_broker_with_wal(
         .env("GW_DURABLE_FLUSH_MS", "5")
         .env("GW_ADVERTISE", format!("{region}=127.0.0.1:{port}"))
         .env_remove("GW_MESH_EAST")
+        .env_remove("GW_MESH_ACK_DROP")
+        .env_remove("GW_MESH_ADOPT_DROP")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some((target_region, target_port)) = mesh {
@@ -72,6 +85,9 @@ fn start_broker_with_wal(
         cmd.env("GW_RESTORE_OFFSET", offset.to_string());
     } else {
         cmd.env_remove("GW_RESTORE_OFFSET");
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
     }
     let child = cmd.spawn().expect("spawn broker");
     wait_for_port(port);
@@ -185,6 +201,17 @@ fn snapshot_marker(port: u16, snapshot_id: &str) -> Value {
     wait_for_response(&mut stream, "SnapshotManifest", &request_id)
 }
 
+fn drain_broker(port: u16, request_id: &str) -> Value {
+    let mut stream = connect_worker(port, &format!("drain-{request_id}"), "OBS", &["inspector"]);
+    stream
+        .write_all(&frame(&json!({
+            "op": "Drain",
+            "request_id": request_id,
+        })))
+        .expect("send Drain");
+    wait_for_response(&mut stream, "DrainAck", request_id)
+}
+
 fn entity_query(port: u16, request_id: &str) -> Value {
     let mut stream = connect_worker(
         port,
@@ -202,6 +229,31 @@ fn entity_query(port: u16, request_id: &str) -> Value {
     wait_for_response(&mut stream, "EntityQueryResponse", request_id)
 }
 
+fn inspector_query(port: u16, request_id: &str) -> Value {
+    let mut stream = connect_worker(
+        port,
+        &format!("inspector-{request_id}"),
+        "OBS",
+        &["inspector"],
+    );
+    stream
+        .write_all(&frame(&json!({
+            "op": "InspectorQuery",
+            "request_id": request_id,
+            "max_entities": 100,
+        })))
+        .expect("send InspectorQuery");
+    wait_for_response(&mut stream, "InspectorFrame", request_id)
+}
+
+fn broker_u64(frame: &Value, field: &str) -> u64 {
+    frame
+        .get("broker")
+        .and_then(|v| v.get(field))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing broker.{field} in frame: {frame}"))
+}
+
 fn entity_ids(frame: &Value) -> Vec<String> {
     let mut ids: Vec<String> = frame
         .get("entities")
@@ -216,6 +268,28 @@ fn entity_ids(frame: &Value) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+fn wait_for_broker_state(
+    port: u16,
+    label: &str,
+    expected_entities: u64,
+    expected_pending_mesh: u64,
+) -> Value {
+    let mut last = Value::Null;
+    for i in 0..80 {
+        let frame = inspector_query(port, &format!("{label}-{i}"));
+        if broker_u64(&frame, "entity_count") == expected_entities
+            && broker_u64(&frame, "pending_mesh") == expected_pending_mesh
+        {
+            return frame;
+        }
+        last = frame;
+        sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "broker {label} never reached entity_count={expected_entities}, pending_mesh={expected_pending_mesh}; last={last}"
+    );
 }
 
 #[test]
@@ -351,5 +425,118 @@ fn snapshot_marker_restore_offset_rolls_back_post_cut_entities() {
     assert!(
         !restored_ids.iter().any(|eid| eid.starts_with("post-")),
         "post-cut entities survived GW_RESTORE_OFFSET rollback: {restored_ids:?}"
+    );
+}
+
+#[test]
+fn snapshot_vector_restores_in_flight_mesh_handoff_exactly_once() {
+    let port_w = free_port();
+    let port_e = free_port();
+    assert_ne!(port_w, port_e);
+    let wal_w = unique_wal("snapshot_vector_w");
+    let wal_e = unique_wal("snapshot_vector_e");
+
+    let mut broker_e = start_broker_with_wal_and_env(
+        port_e,
+        "E",
+        None,
+        wal_e.clone(),
+        None,
+        &[("GW_MESH_ADOPT_DROP", "1")],
+    );
+    let mut broker_w = start_broker_with_wal(
+        port_w,
+        "W",
+        Some(("E".to_string(), port_e)),
+        wal_w.clone(),
+        None,
+    );
+    sleep(Duration::from_millis(900));
+
+    let mut owner_w = connect_worker(port_w, "w-owner", "W", &["physics"]);
+    create_entity(&mut owner_w, "in-flight-ship", "W", -1.0, "pre-handoff");
+    assert_eq!(
+        entity_query(port_w, "pre-handoff")
+            .get("count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+
+    let drain = drain_broker(port_w, "send-in-flight");
+    assert_eq!(
+        drain.get("no_neighbour").and_then(Value::as_bool),
+        Some(false),
+        "source broker had no mesh neighbour: {drain}"
+    );
+    wait_for_broker_state(port_w, "source-in-flight", 0, 1);
+    wait_for_broker_state(port_e, "target-pre-adopt", 0, 0);
+
+    let manifest_w = snapshot_marker(port_w, "vector-source");
+    let manifest_e = snapshot_marker(port_e, "vector-target");
+    assert_eq!(
+        manifest_w.get("entity_count").and_then(Value::as_u64),
+        Some(0),
+        "source cut still had a local entity instead of an in-flight handoff: {manifest_w}"
+    );
+    assert_eq!(
+        manifest_w.get("pending_mesh").and_then(Value::as_u64),
+        Some(1),
+        "source cut did not name the in-flight handoff: {manifest_w}"
+    );
+    assert_eq!(
+        manifest_e.get("entity_count").and_then(Value::as_u64),
+        Some(0),
+        "target adopted despite GW_MESH_ADOPT_DROP: {manifest_e}"
+    );
+    let offset_w = manifest_w
+        .get("wal_offset")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("source manifest missing wal_offset: {manifest_w}"));
+    let offset_e = manifest_e
+        .get("wal_offset")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("target manifest missing wal_offset: {manifest_e}"));
+
+    drop(owner_w);
+    stop(&mut broker_w);
+    stop(&mut broker_e);
+
+    let mut restored_e = start_broker_with_wal(port_e, "E", None, wal_e.clone(), Some(offset_e));
+    let mut restored_w = start_broker_with_wal(
+        port_w,
+        "W",
+        Some(("E".to_string(), port_e)),
+        wal_w.clone(),
+        Some(offset_w),
+    );
+
+    let restored_e_frame = wait_for_broker_state(port_e, "target-restored", 1, 0);
+    let restored_w_frame = wait_for_broker_state(port_w, "source-acked", 0, 0);
+    let restored_query_e = entity_query(port_e, "target-restored-query");
+    let restored_query_w = entity_query(port_w, "source-restored-query");
+
+    stop(&mut restored_w);
+    stop(&mut restored_e);
+    let _ = std::fs::remove_file(&wal_w);
+    let _ = std::fs::remove_file(&wal_e);
+
+    assert_eq!(
+        broker_u64(&restored_e_frame, "entity_count") + broker_u64(&restored_w_frame, "entity_count"),
+        1,
+        "restored vector did not conserve the in-flight entity exactly once: W={restored_w_frame}, E={restored_e_frame}"
+    );
+    assert_eq!(
+        restored_query_e.get("count").and_then(Value::as_u64),
+        Some(1),
+        "target did not receive the restored in-flight handoff: {restored_query_e}"
+    );
+    assert!(
+        entity_ids(&restored_query_e).contains(&"in-flight-ship".to_string()),
+        "target restored a different entity: {restored_query_e}"
+    );
+    assert_eq!(
+        restored_query_w.get("count").and_then(Value::as_u64),
+        Some(0),
+        "source kept a duplicate local entity after vector restore: {restored_query_w}"
     );
 }

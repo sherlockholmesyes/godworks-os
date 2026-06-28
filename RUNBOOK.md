@@ -27,7 +27,7 @@ cargo test -- --test-threads=1
 Expected current shape:
 
 - 29 unit tests in `src/main.rs`
-- 2 broker runtime tests in `tests/reality_loadgen_runtime.rs`
+- 3 broker runtime tests in `tests/reality_loadgen_runtime.rs`
 - 3 zone-worker runtime tests in `tests/zone_worker_runtime.rs`
 
 The current known warning is an unused helper in `zone_worker.rs`; it does not affect the runtime gates.
@@ -138,6 +138,12 @@ The runtime gate creates entities before and after the marker, restarts the brok
 
 ```powershell
 cargo test snapshot_marker_restore_offset_rolls_back_post_cut_entities -- --nocapture
+```
+
+The multi-broker vector gate snapshots a handoff that is already durable on the source broker but has not yet been adopted by the target broker. After restoring both brokers from their offsets, the source resends the pending handoff and the target adopts exactly one entity:
+
+```powershell
+cargo test snapshot_vector_restores_in_flight_mesh_handoff_exactly_once -- --nocapture
 ```
 
 ## Runtime Notes
