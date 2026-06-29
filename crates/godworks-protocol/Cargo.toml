@@ -1,0 +1,12 @@
+[package]
+name = "godworks-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Godworks OS wire protocol model and codec boundary."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+godworks-core = { path = "../godworks-core" }
