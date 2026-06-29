@@ -41,7 +41,9 @@ use std::time::{Duration, Instant};
 
 use godworks_core::Position2;
 use godworks_protocol::json::encode_json_value;
-use godworks_protocol::{AuthorityChange, BatchUpdate, Op, UpdateRejected};
+use godworks_protocol::{
+    AddEntity, AuthorityChange, BatchUpdate, ComponentUpdate, Op, UpdateRejected,
+};
 use godworks_worker_sdk::{
     batch_entry, circle_interest, create_entity_op, disconnect_op, fold_op, heartbeat_op,
     legacy_worker_connect_op, read_op, write_op,
@@ -310,6 +312,10 @@ async fn main() {
         // (1) drain + apply all pending ops at the tick boundary (game-loop discipline)
         while let Ok(op) = rx.try_recv() {
             match &op {
+                Op::AddEntity(add) => apply_add_entity(add, &mut view_pos, &mut view_vel),
+                Op::ComponentUpdate(update) => {
+                    apply_component_update(update, &mut view_pos, &mut view_vel);
+                }
                 Op::AuthorityChange(change) => apply_authority_change(
                     change,
                     &region,
@@ -539,6 +545,49 @@ fn apply_update_rejected(rejected: &UpdateRejected, region: &str, rejects: &mut 
     eprintln!("{}", update_rejected_log_line(region, rejected));
 }
 
+fn apply_add_entity(
+    add: &AddEntity,
+    view_pos: &mut HashMap<String, [f32; 2]>,
+    view_vel: &mut HashMap<String, [f32; 2]>,
+) {
+    let eid = add.entity.as_ref();
+    if eid.is_empty() {
+        return;
+    }
+    // carried components may ride on AddEntity (send_full) -- stash pos/vel for adoption.
+    if let Some(components) = &add.components {
+        if let Some(p) = arr2(components.get("pos")) {
+            view_pos.insert(eid.to_string(), p);
+        }
+        if let Some(v) = arr2(components.get("vel")) {
+            view_vel.insert(eid.to_string(), v);
+        }
+    }
+    view_pos.entry(eid.to_string()).or_insert([0.0, 0.0]);
+}
+
+fn component_update_field<'a>(update: &'a ComponentUpdate, key: &str) -> Option<&'a str> {
+    update.fields.fields.get(key).and_then(Value::as_str)
+}
+
+fn apply_component_update(
+    update: &ComponentUpdate,
+    view_pos: &mut HashMap<String, [f32; 2]>,
+    view_vel: &mut HashMap<String, [f32; 2]>,
+) {
+    let eid = component_update_field(update, "entity").unwrap_or("");
+    let comp = component_update_field(update, "comp")
+        .or_else(|| component_update_field(update, "component"))
+        .unwrap_or("");
+    if let Some(p) = arr2(update.fields.fields.get("value")) {
+        if comp == "pos" {
+            view_pos.insert(eid.to_string(), p);
+        } else if comp == "vel" {
+            view_vel.insert(eid.to_string(), p);
+        }
+    }
+}
+
 fn authority_extra<'a>(change: &'a AuthorityChange, key: &str) -> Option<&'a str> {
     change.fields.fields.get(key).and_then(Value::as_str)
 }
@@ -621,47 +670,13 @@ fn apply_op(
     mjoints: &mut MultibodyJointSet,
 ) {
     let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
-    match op {
-        "AddEntity" => {
-            let eid = f
-                .get("entity")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if eid.is_empty() {
-                return;
-            }
-            // carried components may ride on AddEntity (send_full) — stash pos/vel for adoption
-            if let Some(c) = f.get("components") {
-                if let Some(p) = arr2(c.get("pos")) {
-                    view_pos.insert(eid.clone(), p);
-                }
-                if let Some(v) = arr2(c.get("vel")) {
-                    view_vel.insert(eid.clone(), v);
-                }
-            }
-            view_pos.entry(eid).or_insert([0.0, 0.0]);
+    if op == "RemoveEntity" {
+        let eid = f.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+        view_pos.remove(eid);
+        view_vel.remove(eid);
+        if let Some(bot) = bots.remove(eid) {
+            destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
         }
-        "ComponentUpdate" => {
-            let eid = f.get("entity").and_then(|v| v.as_str()).unwrap_or("");
-            let comp = f.get("comp").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(p) = arr2(f.get("value")) {
-                if comp == "pos" {
-                    view_pos.insert(eid.to_string(), p);
-                } else if comp == "vel" {
-                    view_vel.insert(eid.to_string(), p);
-                }
-            }
-        }
-        "RemoveEntity" => {
-            let eid = f.get("entity").and_then(|v| v.as_str()).unwrap_or("");
-            view_pos.remove(eid);
-            view_vel.remove(eid);
-            if let Some(bot) = bots.remove(eid) {
-                destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -688,6 +703,117 @@ mod tests {
         let handle = bodies.insert(RigidBodyBuilder::dynamic().build());
         bots.insert(eid.to_string(), Bot { handle, epoch });
         handle
+    }
+
+    fn component_update(entity: &str, comp: &str, value: Value) -> ComponentUpdate {
+        let mut fields = Map::new();
+        fields.insert("entity".to_string(), json!(entity));
+        fields.insert("comp".to_string(), json!(comp));
+        fields.insert("value".to_string(), value);
+        ComponentUpdate {
+            fields: JsonFields { fields },
+        }
+    }
+
+    #[test]
+    fn typed_carried_state_pair_feeds_authority_adoption() {
+        let mut view_pos = HashMap::new();
+        let mut view_vel = HashMap::new();
+
+        apply_add_entity(
+            &AddEntity {
+                entity: "ship".into(),
+                components: Some(json!({"pos":[1.0,2.0],"vel":[3.0,4.0]})),
+            },
+            &mut view_pos,
+            &mut view_vel,
+        );
+        apply_component_update(
+            &component_update("ship", "pos", json!([5.0, 6.0])),
+            &mut view_pos,
+            &mut view_vel,
+        );
+        apply_component_update(
+            &component_update("ship", "vel", json!([7.0, 8.0])),
+            &mut view_pos,
+            &mut view_vel,
+        );
+
+        let mut bots = HashMap::new();
+        let mut bodies = RigidBodySet::new();
+        let mut islands = IslandManager::new();
+        let mut colliders = ColliderSet::new();
+        let mut ijoints = ImpulseJointSet::new();
+        let mut mjoints = MultibodyJointSet::new();
+        let change = AuthorityChange {
+            entity: "ship".into(),
+            component: "pos".into(),
+            authoritative: true,
+            authority_epoch: 11,
+            mode: "server_physics_island".to_string(),
+            fields: JsonFields { fields: Map::new() },
+        };
+
+        apply_authority_change(
+            &change,
+            "E",
+            &mut view_pos,
+            &mut view_vel,
+            &mut bots,
+            &mut bodies,
+            &mut islands,
+            &mut colliders,
+            &mut ijoints,
+            &mut mjoints,
+            0.5,
+            0.9,
+        );
+
+        let bot = bots.get("ship").expect("ship adopted");
+        assert_eq!(bot.epoch, 11);
+        assert_eq!(body_state(&bodies, bot.handle), (5.0, 6.0, 7.0, 8.0));
+    }
+
+    #[test]
+    fn json_fallback_no_longer_handles_carried_state_ops() {
+        let mut view_pos = HashMap::new();
+        let mut view_vel = HashMap::new();
+        let mut bots = HashMap::new();
+        let mut bodies = RigidBodySet::new();
+        let mut islands = IslandManager::new();
+        let mut colliders = ColliderSet::new();
+        let mut ijoints = ImpulseJointSet::new();
+        let mut mjoints = MultibodyJointSet::new();
+
+        apply_op(
+            &json!({
+                "op":"AddEntity",
+                "entity":"raw-ship",
+                "components":{"pos":[1.0,2.0],"vel":[3.0,4.0]}
+            }),
+            &mut view_pos,
+            &mut view_vel,
+            &mut bots,
+            &mut bodies,
+            &mut islands,
+            &mut colliders,
+            &mut ijoints,
+            &mut mjoints,
+        );
+        apply_op(
+            &json!({"op":"ComponentUpdate","entity":"raw-ship","comp":"pos","value":[9.0,10.0]}),
+            &mut view_pos,
+            &mut view_vel,
+            &mut bots,
+            &mut bodies,
+            &mut islands,
+            &mut colliders,
+            &mut ijoints,
+            &mut mjoints,
+        );
+
+        assert!(view_pos.is_empty());
+        assert!(view_vel.is_empty());
     }
 
     #[test]
