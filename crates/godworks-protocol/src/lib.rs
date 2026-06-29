@@ -51,7 +51,14 @@ pub enum Op {
     Disconnect,
     Heartbeat(Heartbeat),
     Interest(Interest),
+    CriticalSection(CriticalSection),
+    AddEntity(AddEntity),
+    RemoveEntity(RemoveEntity),
     CreateEntity(CreateEntity),
+    DeleteEntity(DeleteEntity),
+    ReserveEntityIds(ReserveEntityIds),
+    AddComponent(AddComponent),
+    RemoveComponent(RemoveComponent),
     UpdateComponent(UpdateComponent),
     BatchUpdate(BatchUpdate),
     AuthorityChange(AuthorityChange),
@@ -103,12 +110,57 @@ impl Default for Interest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CriticalSection {
+    pub phase: String,
+    pub entity: Option<EntityId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AddEntity {
+    pub entity: EntityId,
+    pub components: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoveEntity {
+    pub entity: EntityId,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateEntity {
     pub entity: EntityId,
     pub requested_region: Option<RegionId>,
     pub pos: Position2,
     pub vel: Velocity2,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteEntity {
+    pub entity: EntityId,
+    pub request_id: Option<String>,
+    pub authority_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReserveEntityIds {
+    pub request_id: Option<String>,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AddComponent {
+    pub entity: EntityId,
+    pub component: ComponentName,
+    pub value: Value,
+    pub authority_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoveComponent {
+    pub entity: EntityId,
+    pub component: ComponentName,
+    pub authority_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
