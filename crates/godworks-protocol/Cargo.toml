@@ -10,3 +10,4 @@ path = "src/lib.rs"
 
 [dependencies]
 godworks-core = { path = "../godworks-core" }
+serde_json = { version = "1", features = ["preserve_order"] }
