@@ -4,7 +4,6 @@
 //! protocol. The existing broker still owns runtime dispatch; future hardening
 //! PRs should migrate raw JSON construction into this crate and then add codecs.
 
-#[rustfmt::skip]
 pub mod json;
 
 use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId, Velocity2};
