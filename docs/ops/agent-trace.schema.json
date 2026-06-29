@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "required": [
+    "trace_version",
+    "task_id",
+    "date",
+    "agent_role",
+    "repo_ref",
+    "intent",
+    "invariant",
+    "inputs",
+    "actions",
+    "verification",
+    "decision"
+  ],
+  "fields": {
+    "trace_version": "integer",
+    "task_id": "string",
+    "date": "YYYY-MM-DD",
+    "agent_role": "string",
+    "repo_ref": "string",
+    "prompt_versions": "object",
+    "intent": "string",
+    "invariant": "string",
+    "inputs": {
+      "files": "array<string>",
+      "notes": "array<string>"
+    },
+    "actions": "array<object>",
+    "verification": {
+      "commands": "array<string>",
+      "runtime_gates": "array<string>",
+      "ci": "string"
+    },
+    "failure_tags": "array<string>",
+    "decision": "accept|revise|reject|park",
+    "promotion_candidate": "boolean",
+    "links": "array<string>"
+  }
+}
