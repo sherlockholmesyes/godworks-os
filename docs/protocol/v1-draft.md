@@ -32,6 +32,15 @@ Workers should connect with:
 
 The broker must reject peers outside its supported protocol range and return a structured protocol rejection.
 
+When `GW_AUTH_TOKEN` is configured on the broker, `WorkerConnect` must include
+the matching `auth_token` string. A missing or mismatched token receives:
+
+```json
+{"op":"AuthReject","worker_id":"worker-1","error":"auth_error","reason":"authentication required"}
+```
+
+The peer is not registered and does not claim region ownership.
+
 ## Operation groups
 
 ### Connection and liveness
@@ -39,6 +48,7 @@ The broker must reject peers outside its supported protocol range and return a s
 | Op | Direction | Persistent | Purpose |
 |---|---|---:|---|
 | `WorkerConnect` | peer -> broker | no | Register a worker/client/mesh connection. |
+| `AuthReject` | broker -> peer | no | Reject a connection before registration when connect auth fails. |
 | `Disconnect` | peer -> broker | no | Graceful connection close. |
 | `Heartbeat` | worker -> broker | no | Renew region lease for owned regions. |
 | `Health` | peer -> broker | no | Request liveness/health snapshot. |

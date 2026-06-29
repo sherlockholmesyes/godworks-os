@@ -44,7 +44,8 @@ The product is a server-side spatial backend plus SDKs and tooling, not a full r
 
 - Frame size limits.
 - Basic broker ingress frame rate limits.
-- Worker/client auth.
+- Basic WorkerConnect auth.
+- Stronger worker/client identity model.
 - Mesh auth.
 - Broader per-principal rate-limit policy.
 - Metrics exporter.

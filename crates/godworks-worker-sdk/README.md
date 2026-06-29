@@ -7,6 +7,8 @@ The SDK does not change broker runtime behavior. It wraps the existing length-pr
 ## What this MVP supports
 
 - Register a worker with `WorkerConnect`.
+- Forward an optional connect `auth_token` when the broker is configured with
+  `GW_AUTH_TOKEN`.
 - Send `Interest` / AOI updates.
 - Create entities with typed SDK helpers while preserving component payloads such as `pos`, `vel`, and `mass`.
 - Receive and classify checkout, entity, component, event, authority, rejection, command, and mesh handoff frames.
