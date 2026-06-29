@@ -1,0 +1,40 @@
+name: Product hardening task
+description: Track work required to turn Godworks OS into a product-quality spatial backend.
+title: "[hardening] "
+labels: []
+body:
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: What product/runtime capability should exist when this is done?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is included and explicitly excluded?
+    validations:
+      required: true
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Implementation notes
+      description: High-level design or file/module areas expected to change.
+    validations:
+      required: false
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Tests, smoke runs, load gates, or recovery drills required.
+    validations:
+      required: true
+  - type: textarea
+    id: definition_of_done
+    attributes:
+      label: Definition of done
+      description: Concrete end state.
+    validations:
+      required: true
