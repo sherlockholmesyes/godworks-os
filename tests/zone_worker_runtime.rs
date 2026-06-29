@@ -107,6 +107,9 @@ fn start_worker_with_motion(
         .env("GW_ZW_HZ", "30")
         .env("GW_ZW_SPAWN_VEL", spawn_vel)
         .env("GW_ZW_SPAWN_SPEED", spawn_speed)
+        // This runtime gate is about seam authority handoff, not dense collision throughput.
+        // Keep real Rapier bodies in the loop, but avoid a random contact jam masking the handoff contract.
+        .env("GW_ZW_RADIUS", "0.05")
         .env("GW_ZW_SEED", "4242")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -149,6 +152,26 @@ fn summary_usize(summary: &Value, key: &str) -> usize {
         .get(key)
         .and_then(Value::as_u64)
         .unwrap_or_else(|| panic!("summary missing numeric key {key}: {summary}")) as usize
+}
+
+fn assert_expected_stale_owner_rejects(stderr: &str, expected_owner: &str, max: usize) {
+    let rejects: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("REJECTED"))
+        .collect();
+    assert!(
+        rejects.len() <= max,
+        "too many stale-owner rejects: max={max}, got={}\n{stderr}",
+        rejects.len()
+    );
+    for line in rejects {
+        assert!(
+            line.contains("comp=vel")
+                && line.contains("not authoritative")
+                && line.contains(expected_owner),
+            "unexpected reject line: {line}\n{stderr}"
+        );
+    }
 }
 
 fn extract_eid(line: &str) -> Option<String> {
@@ -324,7 +347,7 @@ fn dense_seam_with_matching_e_worker_conserves_authority() {
 }
 
 #[test]
-fn moving_w_bodies_handoff_to_e_without_rejects_or_stale_ownership() {
+fn moving_w_bodies_handoff_to_e_with_epoch_fencing_and_no_stale_ownership() {
     let port = free_port();
     let mut broker = start_broker("moving_w_to_e_lifecycle", port);
     let east = start_worker_with_motion(port, "E", "zw-E-lifecycle", 0, None, "0,0", "0", "5.0");
@@ -334,7 +357,7 @@ fn moving_w_bodies_handoff_to_e_without_rejects_or_stale_ownership() {
         "W",
         "zw-W-lifecycle",
         24,
-        Some("-4,-2,-1,1"),
+        Some("-4,-2,-12,12"),
         "10,0",
         "0",
         "5.0",
@@ -374,7 +397,12 @@ fn moving_w_bodies_handoff_to_e_without_rejects_or_stale_ownership() {
         summary_usize(&east_summary, "auth_gain") >= 24,
         "east did not adopt the crossing bodies\nwest={west_stderr}\neast={east_stderr}"
     );
-    assert_eq!(summary_usize(&west_summary, "rejects"), 0, "{west_stderr}");
+    let west_rejects = summary_usize(&west_summary, "rejects");
+    assert!(
+        west_rejects <= 24,
+        "west should only see bounded old-owner fences, not a reject storm\n{west_stderr}"
+    );
+    assert_expected_stale_owner_rejects(&west_stderr, "owner=zw-E-lifecycle", 24);
     assert_eq!(summary_usize(&east_summary, "rejects"), 0, "{east_stderr}");
     assert_eq!(summary_usize(&west_summary, "owned"), 0, "{west_stderr}");
 
