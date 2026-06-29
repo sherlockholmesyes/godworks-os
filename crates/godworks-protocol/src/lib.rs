@@ -7,7 +7,7 @@
 pub mod json;
 
 use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId, Velocity2};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Current broker protocol version.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -55,16 +55,37 @@ pub enum Op {
     AddEntity(AddEntity),
     RemoveEntity(RemoveEntity),
     CreateEntity(CreateEntity),
+    CreateEntityResponse(CreateEntityResponse),
     DeleteEntity(DeleteEntity),
+    DeleteEntityResponse(DeleteEntityResponse),
     ReserveEntityIds(ReserveEntityIds),
+    ReserveEntityIdsResponse(ReserveEntityIdsResponse),
     AddComponent(AddComponent),
     RemoveComponent(RemoveComponent),
     UpdateComponent(UpdateComponent),
     BatchUpdate(BatchUpdate),
+    SetComponentAuthority(SetComponentAuthority),
+    SetComponentAuthorityResponse(SetComponentAuthorityResponse),
     AuthorityChange(AuthorityChange),
     UpdateRejected(UpdateRejected),
+    Fold(Fold),
+    ThresholdTx(ThresholdTx),
+    ThresholdTxResponse(ThresholdTxResponse),
+    EntityQuery(EntityQuery),
+    EntityQueryResponse(EntityQueryResponse),
+    InspectorQuery(InspectorQuery),
+    InspectorFrame(InspectorFrame),
+    CommandRequest(CommandRequest),
+    CommandResponse(CommandResponse),
+    EntityEvent(EntityEvent),
+    FlagUpdate(FlagUpdate),
+    Metrics(Metrics),
+    SnapshotMarker(SnapshotMarker),
     MeshHandoff(MeshHandoff),
     MeshAck(MeshAck),
+    MeshGhost(MeshGhost),
+    MeshGhostRemove(MeshGhostRemove),
+    LogMessage(LogMessage),
     Health,
 }
 
@@ -110,6 +131,11 @@ impl Default for Interest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct JsonFields {
+    pub fields: Map<String, Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CriticalSection {
     pub phase: String,
@@ -135,6 +161,11 @@ pub struct CreateEntity {
     pub components: Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateEntityResponse {
+    pub fields: JsonFields,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteEntity {
     pub entity: EntityId,
@@ -142,10 +173,20 @@ pub struct DeleteEntity {
     pub authority_epoch: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeleteEntityResponse {
+    pub fields: JsonFields,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReserveEntityIds {
     pub request_id: Option<String>,
     pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReserveEntityIdsResponse {
+    pub fields: JsonFields,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -184,6 +225,16 @@ pub struct BatchUpdateEntry {
     pub authority_epoch: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetComponentAuthority {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetComponentAuthorityResponse {
+    pub fields: JsonFields,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityChange {
     pub entity: EntityId,
@@ -201,6 +252,71 @@ pub struct UpdateRejected {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Fold {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThresholdTx {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThresholdTxResponse {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityQuery {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityQueryResponse {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InspectorQuery {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InspectorFrame {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandRequest {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommandResponse {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityEvent {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FlagUpdate {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Metrics {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotMarker {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MeshHandoff {
     pub entity: EntityId,
     pub source_region: Option<RegionId>,
@@ -215,6 +331,21 @@ pub struct MeshHandoff {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MeshAck {
     pub entity: EntityId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshGhost {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshGhostRemove {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogMessage {
+    pub fields: JsonFields,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
