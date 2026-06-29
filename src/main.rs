@@ -125,16 +125,15 @@ fn parse_boundaries() -> Vec<f64> {
 // the broker auto-hands-off by 2D cell (per-axis hysteresis, mirroring region_after's W|E band). Absent
 // => None => the 1D-strip path is byte-for-byte unchanged. Note: CONFIG (a partition MODEL choice, like
 // GW_BOUNDARIES), not a per-call flag -- the handoff stays automatic + structural.
-fn parse_grid2d() -> Option<(usize, usize, f64, f64)> {
-    let spec = std::env::var("GW_GRID2D").ok()?;
+fn parse_grid2d_values(spec: &str, arena: Option<&str>) -> Option<(usize, usize, f64, f64)> {
     let (cs, rs) = spec.split_once('x')?;
     let cols: usize = cs.trim().parse().ok()?;
     let rows: usize = rs.trim().parse().ok()?;
     if cols == 0 || rows == 0 {
         return None;
     }
-    let arena = std::env::var("GW_ARENA").ok().unwrap_or_default();
     let mut it = arena
+        .unwrap_or_default()
         .split(',')
         .filter_map(|s| s.trim().parse::<f64>().ok());
     let aw = it.next().unwrap_or(5000.0);
@@ -148,6 +147,12 @@ fn parse_grid2d() -> Option<(usize, usize, f64, f64)> {
         return None;
     }
     Some((cols, rows, cw, ch))
+}
+
+fn parse_grid2d() -> Option<(usize, usize, f64, f64)> {
+    let spec = std::env::var("GW_GRID2D").ok()?;
+    let arena = std::env::var("GW_ARENA").ok();
+    parse_grid2d_values(&spec, arena.as_deref())
 }
 
 // The 2D cell name "Z<col>_<row>" for a position.
@@ -6838,12 +6843,6 @@ fn spawn_mesh_link_dynamic(st: Arc<Mutex<ServerState>>, region: String, reg_dir:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
-
-    fn env_guard() -> MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap()
-    }
 
     fn test_entity(pos: [f64; 2], region: &str) -> Entity {
         let components = Map::new();
@@ -6961,20 +6960,12 @@ mod tests {
 
     #[test]
     fn grid2d_rejects_non_positive_or_nan_arena() {
-        let _guard = env_guard();
-        std::env::set_var("GW_GRID2D", "2x2");
-
-        std::env::set_var("GW_ARENA", "0,100");
-        assert!(parse_grid2d().is_none());
-
-        std::env::set_var("GW_ARENA", "NaN,100");
-        assert!(parse_grid2d().is_none());
-
-        std::env::set_var("GW_ARENA", "200,100");
-        assert_eq!(parse_grid2d(), Some((2, 2, 100.0, 50.0)));
-
-        std::env::remove_var("GW_ARENA");
-        std::env::remove_var("GW_GRID2D");
+        assert!(parse_grid2d_values("2x2", Some("0,100")).is_none());
+        assert!(parse_grid2d_values("2x2", Some("NaN,100")).is_none());
+        assert_eq!(
+            parse_grid2d_values("2x2", Some("200,100")),
+            Some((2, 2, 100.0, 50.0))
+        );
     }
 
     #[test]
