@@ -92,24 +92,42 @@ pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
             reason: optional_str(value, "reason").unwrap_or("").to_string(),
             fields: json_fields(value),
         })),
-        "Fold" => Ok(Op::Fold(Fold { fields: json_fields(value) })),
-        "ThresholdTx" => Ok(Op::ThresholdTx(ThresholdTx { fields: json_fields(value) })),
+        "Fold" => Ok(Op::Fold(Fold {
+            fields: json_fields(value),
+        })),
+        "ThresholdTx" => Ok(Op::ThresholdTx(ThresholdTx {
+            fields: json_fields(value),
+        })),
         "ThresholdTxResponse" => Ok(Op::ThresholdTxResponse(ThresholdTxResponse {
             fields: json_fields(value),
         })),
-        "EntityQuery" => Ok(Op::EntityQuery(EntityQuery { fields: json_fields(value) })),
+        "EntityQuery" => Ok(Op::EntityQuery(EntityQuery {
+            fields: json_fields(value),
+        })),
         "EntityQueryResponse" => Ok(Op::EntityQueryResponse(EntityQueryResponse {
             fields: json_fields(value),
         })),
-        "InspectorQuery" => Ok(Op::InspectorQuery(InspectorQuery { fields: json_fields(value) })),
-        "InspectorFrame" => Ok(Op::InspectorFrame(InspectorFrame { fields: json_fields(value) })),
-        "CommandRequest" => Ok(Op::CommandRequest(CommandRequest { fields: json_fields(value) })),
+        "InspectorQuery" => Ok(Op::InspectorQuery(InspectorQuery {
+            fields: json_fields(value),
+        })),
+        "InspectorFrame" => Ok(Op::InspectorFrame(InspectorFrame {
+            fields: json_fields(value),
+        })),
+        "CommandRequest" => Ok(Op::CommandRequest(CommandRequest {
+            fields: json_fields(value),
+        })),
         "CommandResponse" => Ok(Op::CommandResponse(CommandResponse {
             fields: json_fields(value),
         })),
-        "EntityEvent" => Ok(Op::EntityEvent(EntityEvent { fields: json_fields(value) })),
-        "FlagUpdate" => Ok(Op::FlagUpdate(FlagUpdate { fields: json_fields(value) })),
-        "Metrics" => Ok(Op::Metrics(Metrics { fields: json_fields(value) })),
+        "EntityEvent" => Ok(Op::EntityEvent(EntityEvent {
+            fields: json_fields(value),
+        })),
+        "FlagUpdate" => Ok(Op::FlagUpdate(FlagUpdate {
+            fields: json_fields(value),
+        })),
+        "Metrics" => Ok(Op::Metrics(Metrics {
+            fields: json_fields(value),
+        })),
         "SnapshotMarker" => Ok(Op::SnapshotMarker(SnapshotMarker {
             fields: json_fields(value),
         })),
@@ -117,11 +135,15 @@ pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
         "MeshAck" => Ok(Op::MeshAck(MeshAck {
             entity: EntityId::from(required_str(value, "entity")?),
         })),
-        "MeshGhost" => Ok(Op::MeshGhost(MeshGhost { fields: json_fields(value) })),
+        "MeshGhost" => Ok(Op::MeshGhost(MeshGhost {
+            fields: json_fields(value),
+        })),
         "MeshGhostRemove" => Ok(Op::MeshGhostRemove(MeshGhostRemove {
             fields: json_fields(value),
         })),
-        "LogMessage" => Ok(Op::LogMessage(LogMessage { fields: json_fields(value) })),
+        "LogMessage" => Ok(Op::LogMessage(LogMessage {
+            fields: json_fields(value),
+        })),
         "Health" => Ok(Op::Health),
         other => Err(ProtocolError::unknown_operation(other)),
     }
@@ -143,7 +165,7 @@ pub fn encode_json_value(op: &Op) -> Value {
         Op::ReserveEntityIds(op) => encode_reserve_entity_ids(op),
         Op::ReserveEntityIdsResponse(op) => {
             encode_json_fields("ReserveEntityIdsResponse", &op.fields)
-        },
+        }
         Op::AddComponent(op) => encode_add_component(op),
         Op::RemoveComponent(op) => encode_remove_component(op),
         Op::UpdateComponent(op) => encode_update_component(op),
@@ -152,7 +174,7 @@ pub fn encode_json_value(op: &Op) -> Value {
         Op::SetComponentAuthority(op) => encode_json_fields("SetComponentAuthority", &op.fields),
         Op::SetComponentAuthorityResponse(op) => {
             encode_json_fields("SetComponentAuthorityResponse", &op.fields)
-        },
+        }
         Op::AuthorityChange(op) => encode_authority_change(op),
         Op::UpdateRejected(op) => encode_update_rejected(op),
         Op::Fold(op) => encode_json_fields("Fold", &op.fields),
@@ -187,7 +209,13 @@ fn decode_worker_connect(value: &Value) -> Result<Op, ProtocolError> {
     let attributes = value
         .get("attributes")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     Ok(Op::WorkerConnect(WorkerConnect {
         worker_id: PeerId::from(required_str(value, "worker_id")?),
@@ -291,7 +319,10 @@ fn decode_authority_change(value: &Value) -> Result<Op, ProtocolError> {
     Ok(Op::AuthorityChange(AuthorityChange {
         entity: EntityId::from(required_str(value, "entity")?),
         component: ComponentName::from(optional_str(value, "comp").unwrap_or("pos")),
-        authoritative: value.get("authoritative").and_then(Value::as_bool).unwrap_or(false),
+        authoritative: value
+            .get("authoritative")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         authority_epoch: authority_epoch(value).unwrap_or(0),
         mode: optional_str(value, "mode").unwrap_or("").to_string(),
         fields: json_fields(value),
@@ -661,14 +692,28 @@ mod tests {
     #[test]
     fn lifecycle_and_dynamic_component_ops_roundtrip() {
         assert_roundtrip(json!({ "op": "CriticalSection", "phase": "begin", "entity": "node-1" }));
-        assert_roundtrip(json!({ "op": "AddEntity", "entity": "node-1", "components": { "mass": 2.5 } }));
+        assert_roundtrip(
+            json!({ "op": "AddEntity", "entity": "node-1", "components": { "mass": 2.5 } }),
+        );
         assert_roundtrip(json!({ "op": "RemoveEntity", "entity": "node-1" }));
-        assert_roundtrip(json!({ "op": "DeleteEntity", "request_id": "del-1", "entity": "node-1", "authority_epoch": 9 }));
-        assert_roundtrip(json!({ "op": "ReserveEntityIds", "request_id": "reserve-1", "count": 32 }));
-        assert_roundtrip(json!({ "op": "AddComponent", "entity": "node-1", "comp": "health", "value": { "hp": 100 }, "authority_epoch": 5 }));
-        assert_roundtrip(json!({ "op": "RemoveComponent", "entity": "node-1", "comp": "health", "authority_epoch": 6 }));
-        assert_roundtrip(json!({ "op": "UpdateComponent", "entity": "node-1", "comp": "pos", "value": [1.0, 2.0], "authority_epoch": 7 }));
-        assert_roundtrip(json!({ "op": "BatchUpdate", "comp": "vel", "updates": [["a", [1.0, 0.0], 7], ["b", [0.0, 1.0]]] }));
+        assert_roundtrip(
+            json!({ "op": "DeleteEntity", "request_id": "del-1", "entity": "node-1", "authority_epoch": 9 }),
+        );
+        assert_roundtrip(
+            json!({ "op": "ReserveEntityIds", "request_id": "reserve-1", "count": 32 }),
+        );
+        assert_roundtrip(
+            json!({ "op": "AddComponent", "entity": "node-1", "comp": "health", "value": { "hp": 100 }, "authority_epoch": 5 }),
+        );
+        assert_roundtrip(
+            json!({ "op": "RemoveComponent", "entity": "node-1", "comp": "health", "authority_epoch": 6 }),
+        );
+        assert_roundtrip(
+            json!({ "op": "UpdateComponent", "entity": "node-1", "comp": "pos", "value": [1.0, 2.0], "authority_epoch": 7 }),
+        );
+        assert_roundtrip(
+            json!({ "op": "BatchUpdate", "comp": "vel", "updates": [["a", [1.0, 0.0], 7], ["b", [0.0, 1.0]]] }),
+        );
     }
 
     #[test]
@@ -719,30 +764,64 @@ mod tests {
 
     #[test]
     fn query_command_event_inspector_and_admin_frames_roundtrip() {
-        assert_roundtrip(json!({ "op": "EntityQuery", "request_id": "q-1", "include_handoff_intent": true, "query": { "type": "sphere", "center": [0.0, 0.0], "radius": 50.0 } }));
-        assert_roundtrip(json!({ "op": "EntityQueryResponse", "request_id": "q-1", "count": 1, "entities": [{ "entity": "node-1", "pos": [1.0, 2.0], "components": { "kind": "unit" }, "region": "W", "authority": { "pos": { "owner": "zw-W", "epoch": 2 } } }] }));
-        assert_roundtrip(json!({ "op": "CommandRequest", "request_id": "cmd-1", "entity": "node-1", "command": "ping", "payload": { "mode": "test" }, "caller": "client-1" }));
-        assert_roundtrip(json!({ "op": "CommandResponse", "request_id": "cmd-1", "success": true, "payload": { "accepted": true } }));
-        assert_roundtrip(json!({ "op": "EntityEvent", "entity": "node-1", "event": "StatusChanged", "payload": { "amount": 12 }, "sim_time": 123.5, "gen": 77, "class": "critical", "count": 3 }));
-        assert_roundtrip(json!({ "op": "InspectorQuery", "request_id": "inspect-1", "max_entities": 128 }));
-        assert_roundtrip(json!({ "op": "InspectorFrame", "request_id": "inspect-1", "t_server": 123456, "broker": { "entity_count": 2 }, "zones": [], "workers": [], "entities": [] }));
-        assert_roundtrip(json!({ "op": "CreateEntityResponse", "request_id": "create-1", "entity": "node-1", "success": false, "reason": "draining" }));
-        assert_roundtrip(json!({ "op": "DeleteEntityResponse", "request_id": "delete-1", "entity": "node-1", "success": true, "idempotent": true }));
-        assert_roundtrip(json!({ "op": "ReserveEntityIdsResponse", "request_id": "reserve-1", "first_id": 1000, "count": 32 }));
-        assert_roundtrip(json!({ "op": "SetComponentAuthority", "request_id": "auth-1", "entity": "node-1", "comp": "pos", "owner": "zw-W", "mode": "server_physics_island", "authority_epoch": 4 }));
-        assert_roundtrip(json!({ "op": "SetComponentAuthorityResponse", "request_id": "auth-1", "entity": "node-1", "comp": "pos", "success": true, "owner": "zw-W", "authority_epoch": 4, "mode": "server_physics_island" }));
-        assert_roundtrip(json!({ "op": "ThresholdTx", "request_id": "tx-1", "entity": "node-1", "tx_id": "threshold-1", "phase": "prepare", "from": "W", "to": "E", "components": ["pos", "vel"] }));
-        assert_roundtrip(json!({ "op": "ThresholdTxResponse", "request_id": "tx-1", "entity": "node-1", "tx_id": "threshold-1", "phase": "commit", "success": true }));
-        assert_roundtrip(json!({ "op": "SnapshotMarker", "request_id": "snap-1", "snapshot_id": "s-1", "offset": 2048 }));
+        assert_roundtrip(
+            json!({ "op": "EntityQuery", "request_id": "q-1", "include_handoff_intent": true, "query": { "type": "sphere", "center": [0.0, 0.0], "radius": 50.0 } }),
+        );
+        assert_roundtrip(
+            json!({ "op": "EntityQueryResponse", "request_id": "q-1", "count": 1, "entities": [{ "entity": "node-1", "pos": [1.0, 2.0], "components": { "kind": "unit" }, "region": "W", "authority": { "pos": { "owner": "zw-W", "epoch": 2 } } }] }),
+        );
+        assert_roundtrip(
+            json!({ "op": "CommandRequest", "request_id": "cmd-1", "entity": "node-1", "command": "ping", "payload": { "mode": "test" }, "caller": "client-1" }),
+        );
+        assert_roundtrip(
+            json!({ "op": "CommandResponse", "request_id": "cmd-1", "success": true, "payload": { "accepted": true } }),
+        );
+        assert_roundtrip(
+            json!({ "op": "EntityEvent", "entity": "node-1", "event": "StatusChanged", "payload": { "amount": 12 }, "sim_time": 123.5, "gen": 77, "class": "critical", "count": 3 }),
+        );
+        assert_roundtrip(
+            json!({ "op": "InspectorQuery", "request_id": "inspect-1", "max_entities": 128 }),
+        );
+        assert_roundtrip(
+            json!({ "op": "InspectorFrame", "request_id": "inspect-1", "t_server": 123456, "broker": { "entity_count": 2 }, "zones": [], "workers": [], "entities": [] }),
+        );
+        assert_roundtrip(
+            json!({ "op": "CreateEntityResponse", "request_id": "create-1", "entity": "node-1", "success": false, "reason": "draining" }),
+        );
+        assert_roundtrip(
+            json!({ "op": "DeleteEntityResponse", "request_id": "delete-1", "entity": "node-1", "success": true, "idempotent": true }),
+        );
+        assert_roundtrip(
+            json!({ "op": "ReserveEntityIdsResponse", "request_id": "reserve-1", "first_id": 1000, "count": 32 }),
+        );
+        assert_roundtrip(
+            json!({ "op": "SetComponentAuthority", "request_id": "auth-1", "entity": "node-1", "comp": "pos", "owner": "zw-W", "mode": "server_physics_island", "authority_epoch": 4 }),
+        );
+        assert_roundtrip(
+            json!({ "op": "SetComponentAuthorityResponse", "request_id": "auth-1", "entity": "node-1", "comp": "pos", "success": true, "owner": "zw-W", "authority_epoch": 4, "mode": "server_physics_island" }),
+        );
+        assert_roundtrip(
+            json!({ "op": "ThresholdTx", "request_id": "tx-1", "entity": "node-1", "tx_id": "threshold-1", "phase": "prepare", "from": "W", "to": "E", "components": ["pos", "vel"] }),
+        );
+        assert_roundtrip(
+            json!({ "op": "ThresholdTxResponse", "request_id": "tx-1", "entity": "node-1", "tx_id": "threshold-1", "phase": "commit", "success": true }),
+        );
+        assert_roundtrip(
+            json!({ "op": "SnapshotMarker", "request_id": "snap-1", "snapshot_id": "s-1", "offset": 2048 }),
+        );
     }
 
     #[test]
     fn misc_and_mesh_visibility_frames_roundtrip() {
-        assert_roundtrip(json!({ "op": "Fold", "entity": "node-1", "region": "MARS", "pos": [100.0, 200.0] }));
+        assert_roundtrip(
+            json!({ "op": "Fold", "entity": "node-1", "region": "MARS", "pos": [100.0, 200.0] }),
+        );
         assert_roundtrip(json!({ "op": "FlagUpdate", "flag": "double_xp", "value": true }));
         assert_roundtrip(json!({ "op": "Metrics", "load": 0.75 }));
         assert_roundtrip(json!({ "op": "LogMessage", "level": "debug", "message": "hello" }));
-        assert_roundtrip(json!({ "op": "MeshGhost", "entity": "node-2", "pos": [49.0, 0.0], "vel": [1.0, 0.0], "components": { "kind": "unit" }, "owner_region": "E" }));
+        assert_roundtrip(
+            json!({ "op": "MeshGhost", "entity": "node-2", "pos": [49.0, 0.0], "vel": [1.0, 0.0], "components": { "kind": "unit" }, "owner_region": "E" }),
+        );
         assert_roundtrip(json!({ "op": "MeshGhostRemove", "entity": "node-2" }));
     }
 
@@ -784,7 +863,9 @@ mod tests {
             ProtocolErrorKind::UnsupportedVersion
         );
         assert_eq!(
-            decode_json_value(&json!({ "op": "Nope" })).unwrap_err().kind,
+            decode_json_value(&json!({ "op": "Nope" }))
+                .unwrap_err()
+                .kind,
             ProtocolErrorKind::UnknownOperation
         );
     }
