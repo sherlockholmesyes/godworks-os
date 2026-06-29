@@ -24,18 +24,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Format check
-        run: |
-          cargo fmt --all
-          git diff -- crates/godworks-protocol/src/json.rs crates/godworks-protocol/src/lib.rs > rustfmt.diff
-          test ! -s rustfmt.diff
-
-      - name: Upload rustfmt diff
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustfmt-diff
-          path: rustfmt.diff
-          if-no-files-found: ignore
+        run: cargo fmt --all -- --check
 
       - name: Compile all targets
         run: cargo check --workspace --all-targets
