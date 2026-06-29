@@ -435,10 +435,22 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(read_op(&mut broker_stream).await.unwrap(), Some(Op::WorkerConnect(_))));
-        assert!(matches!(read_op(&mut broker_stream).await.unwrap(), Some(Op::Interest(_))));
-        assert!(matches!(read_op(&mut broker_stream).await.unwrap(), Some(Op::UpdateComponent(_))));
-        assert!(matches!(read_op(&mut broker_stream).await.unwrap(), Some(Op::BatchUpdate(_))));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::WorkerConnect(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::Interest(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::UpdateComponent(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::BatchUpdate(_))
+        ));
     }
 
     #[tokio::test]
