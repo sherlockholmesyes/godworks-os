@@ -635,7 +635,8 @@ fn optional_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 fn authority_epoch(value: &Value) -> Option<u64> {
     optional_u64(value, "authority_epoch").or_else(|| optional_u64(value, "epoch"))
-}\n
+}
+
 fn optional_u64(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(|value| {
         value
