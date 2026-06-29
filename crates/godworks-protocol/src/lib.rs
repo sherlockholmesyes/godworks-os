@@ -241,20 +241,22 @@ pub struct SetComponentAuthorityResponse {
     pub fields: JsonFields,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AuthorityChange {
     pub entity: EntityId,
     pub component: ComponentName,
     pub authoritative: bool,
     pub authority_epoch: u64,
     pub mode: String,
+    pub fields: JsonFields,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateRejected {
     pub entity: Option<EntityId>,
     pub component: Option<ComponentName>,
     pub reason: String,
+    pub fields: JsonFields,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -332,6 +334,7 @@ pub struct MeshHandoff {
     pub authority_epoch: Option<u64>,
     pub lease_epoch: Option<u64>,
     pub source_durable_gen: Option<u64>,
+    pub fields: JsonFields,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
