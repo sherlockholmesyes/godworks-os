@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use godworks_core::Position2;
 use godworks_protocol::json::encode_json_value;
-use godworks_protocol::{BatchUpdate, Op};
+use godworks_protocol::{BatchUpdate, Op, UpdateRejected};
 use godworks_worker_sdk::{
     batch_entry, circle_interest, create_entity_op, disconnect_op, fold_op, heartbeat_op,
     legacy_worker_connect_op, read_op, write_op,
@@ -308,23 +308,27 @@ async fn main() {
         ticker.tick().await;
 
         // (1) drain + apply all pending ops at the tick boundary (game-loop discipline)
-        while let Ok(f) = rx.try_recv() {
-            let f = encode_json_value(&f);
-            apply_op(
-                &f,
-                &region,
-                &mut view_pos,
-                &mut view_vel,
-                &mut bots,
-                &mut bodies,
-                &mut islands,
-                &mut colliders,
-                &mut ijoints,
-                &mut mjoints,
-                radius,
-                rest,
-                &mut rejects,
-            );
+        while let Ok(op) = rx.try_recv() {
+            if let Op::UpdateRejected(rejected) = &op {
+                apply_update_rejected(rejected, &region, &mut rejects);
+            } else {
+                let f = encode_json_value(&op);
+                apply_op(
+                    &f,
+                    &region,
+                    &mut view_pos,
+                    &mut view_vel,
+                    &mut bots,
+                    &mut bodies,
+                    &mut islands,
+                    &mut colliders,
+                    &mut ijoints,
+                    &mut mjoints,
+                    radius,
+                    rest,
+                    &mut rejects,
+                );
+            }
         }
 
         // (2) step rapier (real collision/contact solve over the bodies we own)
@@ -500,6 +504,28 @@ fn destroy_body(
     bodies.remove(h, islands, colliders, ijoints, mjoints, true);
 }
 
+fn update_rejected_log_line(region: &str, rejected: &UpdateRejected) -> String {
+    let eid = rejected
+        .entity
+        .as_ref()
+        .map(|entity| entity.as_ref())
+        .unwrap_or("?");
+    let comp = rejected
+        .component
+        .as_ref()
+        .map(|component| component.as_ref())
+        .unwrap_or("?");
+    format!(
+        "[zw {region}] REJECTED e={eid} comp={comp} reason='{}'",
+        rejected.reason
+    )
+}
+
+fn apply_update_rejected(rejected: &UpdateRejected, region: &str, rejects: &mut u64) {
+    *rejects += 1;
+    eprintln!("{}", update_rejected_log_line(region, rejected));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_op(
     f: &Value,
@@ -640,4 +666,35 @@ fn arr2(v: Option<&Value>) -> Option<[f32; 2]> {
         return None;
     }
     Some([a[0].as_f64()? as f32, a[1].as_f64()? as f32])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use godworks_protocol::JsonFields;
+    use serde_json::Map;
+
+    #[test]
+    fn typed_update_rejected_uses_struct_fields_not_raw_json_bridge_fields() {
+        let mut fields = Map::new();
+        fields.insert("entity".to_string(), json!("raw-entity"));
+        fields.insert("comp".to_string(), json!("raw-comp"));
+        fields.insert("reason".to_string(), json!("raw reason"));
+
+        let rejected = UpdateRejected {
+            entity: Some("typed-entity".into()),
+            component: Some("typed-comp".into()),
+            reason: "typed reason".to_string(),
+            fields: JsonFields { fields },
+        };
+
+        assert_eq!(
+            update_rejected_log_line("W", &rejected),
+            "[zw W] REJECTED e=typed-entity comp=typed-comp reason='typed reason'"
+        );
+
+        let mut rejects = 0;
+        apply_update_rejected(&rejected, "W", &mut rejects);
+        assert_eq!(rejects, 1);
+    }
 }
