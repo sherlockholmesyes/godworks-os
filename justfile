@@ -12,21 +12,21 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
-# Compile all targets in debug mode.
+# Compile all workspace targets in debug mode.
 check:
-    cargo check --all-targets
+    cargo check --workspace --all-targets
 
-# Run clippy over all targets.
+# Run clippy over all workspace targets.
 lint:
-    cargo clippy --all-targets
+    cargo clippy --workspace --all-targets
 
-# Run the test suite.
+# Run the workspace test suite.
 test:
-    cargo test --all-targets
+    cargo test --workspace --all-targets
 
-# Build optimized binaries.
+# Build optimized workspace binaries and crates.
 build-release:
-    cargo build --release
+    cargo build --workspace --release
 
 # Run the complete local baseline gate used before opening product-hardening PRs.
 gate: fmt-check check lint test build-release
