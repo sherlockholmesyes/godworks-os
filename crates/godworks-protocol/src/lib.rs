@@ -63,6 +63,7 @@ pub enum Op {
     AddComponent(AddComponent),
     RemoveComponent(RemoveComponent),
     UpdateComponent(UpdateComponent),
+    ComponentUpdate(ComponentUpdate),
     BatchUpdate(BatchUpdate),
     SetComponentAuthority(SetComponentAuthority),
     SetComponentAuthorityResponse(SetComponentAuthorityResponse),
@@ -210,6 +211,11 @@ pub struct UpdateComponent {
     pub component: ComponentName,
     pub value: Value,
     pub authority_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentUpdate {
+    pub fields: JsonFields,
 }
 
 #[derive(Clone, Debug, PartialEq)]
