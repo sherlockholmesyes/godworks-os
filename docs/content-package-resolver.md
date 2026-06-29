@@ -93,3 +93,5 @@ content_load_ok=<entities>
 ```
 
 This is a client-contract proof for package manifests. It does not replace a real engine or legacy-client asset render proof.
+
+`client_probes/godot/content_load_probe.gd` is the next engine-side check: a real Godot runtime consumes the public `EntityQueryResponse` and resolves the same package load-set headlessly.

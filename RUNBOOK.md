@@ -10,6 +10,7 @@ This document covers local build, test, and runtime checks for the Godworks OS b
 | `zone_worker` | `src/bin/zone_worker.rs` | Rapier2D physics worker that owns bodies, simulates them, and sends component updates. |
 | `loadgen` | `src/bin/loadgen.rs` | Synthetic protocol throughput driver. |
 | `reality_loadgen` | `src/bin/reality_loadgen.rs` | Runtime gate for real broker/worker mesh adoption behavior. |
+| Godot content probe | `client_probes/godot/content_load_probe.gd` | Headless Godot client proof for content package load plans. |
 
 ## Build
 
@@ -132,6 +133,26 @@ The parseable result line exposes this as `handoff_probe_ok=<N>`, `handoff_probe
 The monitor health assertion is enabled by default. `GW_REQUIRE_MONITOR_HEALTH=0` disables it for compatibility probes; `GW_MAX_TICK_LAG_MS` and `GW_MAX_LOCK_HOLD_MS` tune the runtime thresholds.
 
 For manual experiments, run one broker per region and connect them with `GW_MESH` / `GW_ADVERTISE`. Keep broker and worker processes alive in foreground terminals or under a process manager; shell-backgrounded children may exit when their launcher exits.
+
+## Godot Client Content Probe
+
+`client_probes/godot/content_load_probe.gd` is a headless Godot runtime check for the same package-load contract. It connects to a live broker, creates one asset-bearing entity, queries it back, and resolves `asset_manifest + content_manifest` into a client package load-set.
+
+```powershell
+$env:GW_BIND="127.0.0.1"
+$env:GW_PORT="7777"
+cargo run --bin godworks_broker
+
+$env:GW_HOST="127.0.0.1"
+$env:GW_PORT="7777"
+godot --headless --path client_probes/godot --script res://content_load_probe.gd
+```
+
+Expected success:
+
+```text
+GODOT CONTENT-LOAD: PASS -- public EntityQueryResponse resolved to a client package load-set
+```
 
 ## Snapshot Restore Check
 
