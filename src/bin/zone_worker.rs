@@ -40,9 +40,8 @@ use std::env;
 use std::time::{Duration, Instant};
 
 use godworks_core::Position2;
-use godworks_protocol::json::encode_json_value;
 use godworks_protocol::{
-    AddEntity, AuthorityChange, BatchUpdate, ComponentUpdate, Op, UpdateRejected,
+    AddEntity, AuthorityChange, BatchUpdate, ComponentUpdate, Op, RemoveEntity, UpdateRejected,
 };
 use godworks_worker_sdk::{
     batch_entry, circle_interest, create_entity_op, disconnect_op, fold_op, heartbeat_op,
@@ -333,20 +332,18 @@ async fn main() {
                 Op::UpdateRejected(rejected) => {
                     apply_update_rejected(rejected, &region, &mut rejects);
                 }
-                _ => {
-                    let f = encode_json_value(&op);
-                    apply_op(
-                        &f,
-                        &mut view_pos,
-                        &mut view_vel,
-                        &mut bots,
-                        &mut bodies,
-                        &mut islands,
-                        &mut colliders,
-                        &mut ijoints,
-                        &mut mjoints,
-                    );
-                }
+                Op::RemoveEntity(remove) => apply_remove_entity(
+                    remove,
+                    &mut view_pos,
+                    &mut view_vel,
+                    &mut bots,
+                    &mut bodies,
+                    &mut islands,
+                    &mut colliders,
+                    &mut ijoints,
+                    &mut mjoints,
+                ),
+                _ => {}
             }
         }
 
@@ -588,6 +585,26 @@ fn apply_component_update(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_remove_entity(
+    remove: &RemoveEntity,
+    view_pos: &mut HashMap<String, [f32; 2]>,
+    view_vel: &mut HashMap<String, [f32; 2]>,
+    bots: &mut HashMap<String, Bot>,
+    bodies: &mut RigidBodySet,
+    islands: &mut IslandManager,
+    colliders: &mut ColliderSet,
+    ijoints: &mut ImpulseJointSet,
+    mjoints: &mut MultibodyJointSet,
+) {
+    let eid = remove.entity.as_ref();
+    view_pos.remove(eid);
+    view_vel.remove(eid);
+    if let Some(bot) = bots.remove(eid) {
+        destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
+    }
+}
+
 fn authority_extra<'a>(change: &'a AuthorityChange, key: &str) -> Option<&'a str> {
     change.fields.fields.get(key).and_then(Value::as_str)
 }
@@ -654,29 +671,6 @@ fn apply_authority_change(
         eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} destroy");
     } else {
         eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} (no local body)");
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_op(
-    f: &Value,
-    view_pos: &mut HashMap<String, [f32; 2]>,
-    view_vel: &mut HashMap<String, [f32; 2]>,
-    bots: &mut HashMap<String, Bot>,
-    bodies: &mut RigidBodySet,
-    islands: &mut IslandManager,
-    colliders: &mut ColliderSet,
-    ijoints: &mut ImpulseJointSet,
-    mjoints: &mut MultibodyJointSet,
-) {
-    let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
-    if op == "RemoveEntity" {
-        let eid = f.get("entity").and_then(|v| v.as_str()).unwrap_or("");
-        view_pos.remove(eid);
-        view_vel.remove(eid);
-        if let Some(bot) = bots.remove(eid) {
-            destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
-        }
     }
 }
 
@@ -775,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn json_fallback_no_longer_handles_carried_state_ops() {
+    fn typed_remove_entity_drops_view_state_and_body() {
         let mut view_pos = HashMap::new();
         let mut view_vel = HashMap::new();
         let mut bots = HashMap::new();
@@ -785,23 +779,15 @@ mod tests {
         let mut ijoints = ImpulseJointSet::new();
         let mut mjoints = MultibodyJointSet::new();
 
-        apply_op(
-            &json!({
-                "op":"AddEntity",
-                "entity":"raw-ship",
-                "components":{"pos":[1.0,2.0],"vel":[3.0,4.0]}
-            }),
-            &mut view_pos,
-            &mut view_vel,
-            &mut bots,
-            &mut bodies,
-            &mut islands,
-            &mut colliders,
-            &mut ijoints,
-            &mut mjoints,
-        );
-        apply_op(
-            &json!({"op":"ComponentUpdate","entity":"raw-ship","comp":"pos","value":[9.0,10.0]}),
+        view_pos.insert("ship".to_string(), [1.0, 2.0]);
+        view_vel.insert("ship".to_string(), [3.0, 4.0]);
+        let handle = add_test_bot("ship", 7, &mut bots, &mut bodies);
+        assert!(bodies.get(handle).is_some());
+
+        apply_remove_entity(
+            &RemoveEntity {
+                entity: "ship".into(),
+            },
             &mut view_pos,
             &mut view_vel,
             &mut bots,
@@ -814,6 +800,8 @@ mod tests {
 
         assert!(view_pos.is_empty());
         assert!(view_vel.is_empty());
+        assert!(bots.is_empty());
+        assert!(bodies.get(handle).is_none());
     }
 
     #[test]
