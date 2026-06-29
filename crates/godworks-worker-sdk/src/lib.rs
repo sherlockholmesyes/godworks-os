@@ -378,9 +378,16 @@ mod tests {
             "lease_epoch": 11,
             "source_durable_gen": 12,
             "authority": {
-                "pos": { "owner": "zw-E", "epoch": 9, "mode": "server_physics_island" }
+                "pos": {
+                    "owner": "zw-E",
+                    "epoch": 9,
+                    "mode": "server_physics_island"
+                }
             },
-            "components": { "mass": 2.0, "kind": "projectile" }
+            "components": {
+                "mass": 2.0,
+                "kind": "projectile"
+            }
         });
         let op = assert_payload_roundtrip(value);
         let frame = WorkerFrame::new(op);
