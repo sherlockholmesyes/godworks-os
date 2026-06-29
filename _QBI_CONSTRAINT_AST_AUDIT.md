@@ -16,7 +16,7 @@ The query evaluator should be one recursive matcher shared by local entities and
 | Value Predicate x Component Bag | Clean | Value paths start at the same component map that is emitted in query rows and manifests. |
 | Entity rows x Ghost rows | Clean | Both call the same `matches_query_parts` function; only the row source differs. |
 | Identity x Query | Clean | The matcher receives the entity id from the map key, which is the source of truth. |
-| Runtime x Query | Clean | `reality_loadgen` queries with a nested AST after cross-broker handoff. |
+| Runtime x Query | Clean | `reality_loadgen` queries with a nested AST after cross-broker handoff and exercises every current atom type. |
 | Broad-query failure | Clean | The runtime gate includes an in-radius decoy with the same broad components but the wrong `physics.writer`; a broad or component-only query cannot satisfy `qbi_ast_ok`. |
 
 ## Fixed In This Pass
@@ -27,6 +27,7 @@ The query evaluator should be one recursive matcher shared by local entities and
 - Unified entity and ghost query matching through one matcher.
 - Added direct test `entity_query_supports_qbi_boolean_constraint_ast`.
 - Extended `reality_loadgen` with `GW_REQUIRE_QBI_AST` and `qbi_ast_ok`.
+- Strengthened the runtime query to combine `sphere`, `box`, `region`, exact `entity` OR-list, component atoms, value predicates, and `not` decoy exclusion after cross-broker handoff.
 - Documented the public query constraint contract.
 
 ## Verification
@@ -43,7 +44,7 @@ Full suite result: 29 unit tests, 6 broker runtime tests, and 3 zone-worker runt
 
 ## Remaining Pressure
 
-This is a boolean AST plus first component-value predicates over the current atom set. Still open:
+The runtime gate now covers the full current AST atom set. Still open:
 
 - richer operators such as string prefix, set membership, and array contains;
 - cost limits beyond the current depth cap and frame cap;

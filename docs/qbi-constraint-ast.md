@@ -70,4 +70,4 @@ cargo test entity_query_supports_qbi_boolean_constraint_ast -- --nocapture
 cargo test cross_broker_reality_loadgen_requires_mesh_adoption -- --nocapture
 ```
 
-The direct test proves nested `and` / `or` / `not` selection plus component-payload value predicates. The cross-broker runtime gate uses the same AST after handoff and requires `qbi_ast_ok=<entities>`, with a decoy entity present to prove a broad or component-only query cannot pass.
+The direct test proves nested `and` / `or` / `not` selection across the current atom set (`sphere`, `box`, `component`, `value`, `region`, and `entity`). The cross-broker runtime gate uses the same AST after handoff and requires `qbi_ast_ok=<entities>`. It combines the post-handoff E region, spatial box, exact entity-id OR-list, component/value predicates, and a decoy entity to prove a broad, component-only, or value-only query cannot pass.

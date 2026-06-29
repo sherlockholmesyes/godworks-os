@@ -1025,6 +1025,7 @@ fn entity_query_supports_qbi_boolean_constraint_ast() {
             "type": "and",
             "constraints": [
                 {"type": "sphere", "center": [0.0, 0.0], "radius": 5.0},
+                {"type": "box", "min": [0.0, 0.0], "max": [5.0, 3.0]},
                 {
                     "type": "or",
                     "constraints": [

@@ -382,11 +382,17 @@ fn health_queue_ok(health: &Value) -> bool {
         && path_u64(health, &["pending_mesh"]).unwrap_or(u64::MAX) == 0
 }
 
-fn qbi_ast_query() -> Value {
+fn qbi_ast_query(entities: u64) -> Value {
+    let entity_constraints: Vec<Value> = (0..entities)
+        .map(|i| json!({"type":"entity","entity":format!("rlg-body-{i}")}))
+        .collect();
     json!({
         "type":"and",
         "constraints":[
             {"type":"sphere","center":[0.0,0.0],"radius":100.0},
+            {"type":"box","min":[0.0,-10.0],"max":[10.0,10.0]},
+            {"type":"region","region":"E"},
+            {"type":"or","constraints":entity_constraints},
             {"type":"component","comp":"physics"},
             {
                 "type":"or",
@@ -1129,7 +1135,9 @@ async fn main() {
                     handoff_probe_query_error = Some(e.to_string());
                 }
             }
-            match query_entities_with_query(&host, port_e, "rlg-qbi-ast", qbi_ast_query()).await {
+            match query_entities_with_query(&host, port_e, "rlg-qbi-ast", qbi_ast_query(entities))
+                .await
+            {
                 Ok(query) => {
                     qbi_ast_ok = count_qbi_ast_ok(&query, entities);
                 }
