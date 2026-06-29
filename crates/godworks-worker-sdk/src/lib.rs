@@ -500,12 +500,7 @@ mod tests {
         let first = worker.recv_frame().await.unwrap().unwrap();
         assert_eq!(first.kind(), WorkerFrameKind::AuthorityChange);
         assert_eq!(
-            first
-                .authority_change()
-                .unwrap()
-                .fields
-                .fields
-                .get("state"),
+            first.authority_change().unwrap().fields.fields.get("state"),
             Some(&json!("AUTHORITY_LOSS_IMMINENT"))
         );
 

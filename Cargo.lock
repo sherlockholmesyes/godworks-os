@@ -155,6 +155,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "godworks-worker-sdk"
+version = "0.1.0"
+dependencies = [
+ "godworks-core",
+ "godworks-protocol",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "godworks_broker"
 version = "0.1.0"
 dependencies = [
