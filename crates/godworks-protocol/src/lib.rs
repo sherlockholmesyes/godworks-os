@@ -130,9 +130,9 @@ pub struct RemoveEntity {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateEntity {
     pub entity: EntityId,
+    pub request_id: Option<String>,
     pub requested_region: Option<RegionId>,
-    pub pos: Position2,
-    pub vel: Velocity2,
+    pub components: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
