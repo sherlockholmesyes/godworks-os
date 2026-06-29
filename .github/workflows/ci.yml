@@ -27,13 +27,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Compile all targets
-        run: cargo check --all-targets
+        run: cargo check --workspace --all-targets
 
       - name: Clippy baseline
-        run: cargo clippy --all-targets
+        run: cargo clippy --workspace --all-targets
 
       - name: Unit and integration tests
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
 
       - name: Release build
-        run: cargo build --release
+        run: cargo build --workspace --release
