@@ -176,11 +176,15 @@ fn decode_worker_connect(value: &Value) -> Result<Op, ProtocolError> {
 fn decode_interest(value: &Value) -> Result<Op, ProtocolError> {
     let center = optional_array2(value, "center");
     let radius = optional_f64(value, "radius");
-    let aoi = center.zip(radius).map(|(center, radius)| Aoi2::Circle { center, radius });
+    let aoi = center.zip(radius).map(|(center, radius)| Aoi2::Circle {
+        center,
+        radius,
+    });
 
     Ok(Op::Interest(Interest {
         aoi,
-        full_radius: optional_f64(value, "full_radius").or_else(|| optional_f64(value, "fullRadius")),
+        full_radius: optional_f64(value, "full_radius")
+            .or_else(|| optional_f64(value, "fullRadius")),
         coarse_rate: optional_u64(value, "coarse_rate")
             .or_else(|| optional_u64(value, "coarseRate"))
             .unwrap_or(1),
@@ -220,7 +224,8 @@ fn decode_update_component(value: &Value) -> Result<Op, ProtocolError> {
                 .ok_or_else(|| ProtocolError::missing_field("comp"))?,
         ),
         value: value.get("value").cloned().unwrap_or(Value::Null),
-        authority_epoch: optional_u64(value, "authority_epoch").or_else(|| optional_u64(value, "epoch")),
+        authority_epoch: optional_u64(value, "authority_epoch")
+            .or_else(|| optional_u64(value, "epoch")),
     }))
 }
 
@@ -250,7 +255,9 @@ fn decode_batch_update(value: &Value) -> Result<Op, ProtocolError> {
                 let entity = obj
                     .get("entity")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| ProtocolError::malformed("BatchUpdate object entry missing entity"))?;
+                    .ok_or_else(|| {
+                        ProtocolError::malformed("BatchUpdate object entry missing entity")
+                    })?;
                 updates.push(BatchUpdateEntry {
                     entity: EntityId::from(entity),
                     value: obj.get("value").cloned().unwrap_or(Value::Null),
@@ -263,7 +270,8 @@ fn decode_batch_update(value: &Value) -> Result<Op, ProtocolError> {
             }
         }
     } else if let Some(values) = value.get("values").and_then(Value::as_object) {
-        let shared_epoch = optional_u64(value, "authority_epoch").or_else(|| optional_u64(value, "epoch"));
+        let shared_epoch = optional_u64(value, "authority_epoch")
+            .or_else(|| optional_u64(value, "epoch"));
         for (entity, update_value) in values {
             updates.push(BatchUpdateEntry {
                 entity: EntityId::from(entity.clone()),
@@ -304,7 +312,8 @@ fn decode_mesh_handoff(value: &Value) -> Result<Op, ProtocolError> {
         target_region: RegionId::from(target),
         pos: value.get("pos").map(pos2_from_value).unwrap_or_default(),
         vel: value.get("vel").map(vel2_from_value).unwrap_or_default(),
-        authority_epoch: optional_u64(value, "authority_epoch").or_else(|| optional_u64(value, "epoch")),
+        authority_epoch: optional_u64(value, "authority_epoch")
+            .or_else(|| optional_u64(value, "epoch")),
         lease_epoch: optional_u64(value, "lease_epoch"),
         source_durable_gen: optional_u64(value, "source_durable_gen"),
     }))
@@ -347,13 +356,17 @@ fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, ProtocolErro
 }
 
 fn optional_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 fn optional_u64(value: &Value, key: &str) -> Option<u64> {
-    value
-        .get(key)
-        .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok())))
+    value.get(key).and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+    })
 }
 
 fn optional_f64(value: &Value, key: &str) -> Option<f64> {
@@ -367,16 +380,24 @@ fn optional_array2(value: &Value, key: &str) -> Option<Position2> {
 fn pos2_from_value(value: &Value) -> Position2 {
     let arr = value.as_array();
     Position2::new(
-        arr.and_then(|a| a.first()).and_then(Value::as_f64).unwrap_or(0.0),
-        arr.and_then(|a| a.get(1)).and_then(Value::as_f64).unwrap_or(0.0),
+        arr.and_then(|a| a.first())
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        arr.and_then(|a| a.get(1))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
     )
 }
 
 fn vel2_from_value(value: &Value) -> Velocity2 {
     let arr = value.as_array();
     Velocity2::new(
-        arr.and_then(|a| a.first()).and_then(Value::as_f64).unwrap_or(0.0),
-        arr.and_then(|a| a.get(1)).and_then(Value::as_f64).unwrap_or(0.0),
+        arr.and_then(|a| a.first())
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        arr.and_then(|a| a.get(1))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
     )
 }
 
