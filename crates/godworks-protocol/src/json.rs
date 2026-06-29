@@ -95,10 +95,9 @@ fn decode_worker_connect(value: &Value) -> Result<Op, ProtocolError> {
 fn decode_interest(value: &Value) -> Result<Op, ProtocolError> {
     let center = optional_array2(value, "center");
     let radius = optional_f64(value, "radius");
-    let aoi = center.zip(radius).map(|(center, radius)| Aoi2::Circle {
-        center,
-        radius,
-    });
+    let aoi = center
+        .zip(radius)
+        .map(|(center, radius)| Aoi2::Circle { center, radius });
 
     Ok(Op::Interest(Interest {
         aoi,
@@ -172,10 +171,9 @@ fn decode_batch_update_array(items: &[Value]) -> Result<Vec<BatchUpdateEntry>, P
                 authority_epoch: entry.get(2).and_then(Value::as_u64),
             });
         } else if let Some(entry) = item.as_object() {
-            let entity = entry
-                .get("entity")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ProtocolError::malformed("BatchUpdate object entry missing entity"))?;
+            let entity = entry.get("entity").and_then(Value::as_str).ok_or_else(|| {
+                ProtocolError::malformed("BatchUpdate object entry missing entity")
+            })?;
 
             updates.push(BatchUpdateEntry {
                 entity: EntityId::from(entity),
