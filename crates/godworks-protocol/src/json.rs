@@ -80,11 +80,11 @@ pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
         "SetComponentAuthority" => Ok(Op::SetComponentAuthority(SetComponentAuthority {
             fields: json_fields(value),
         })),
-        "SetComponentAuthorityResponse" => {
-            Ok(Op::SetComponentAuthorityResponse(SetComponentAuthorityResponse {
+        "SetComponentAuthorityResponse" => Ok(Op::SetComponentAuthorityResponse(
+            SetComponentAuthorityResponse {
                 fields: json_fields(value),
-            }))
-        }
+            },
+        )),
         "AuthorityChange" => decode_authority_change(value),
         "UpdateRejected" => Ok(Op::UpdateRejected(UpdateRejected {
             entity: optional_str(value, "entity").map(EntityId::from),
@@ -237,9 +237,7 @@ fn decode_worker_connect(value: &Value) -> Result<Op, ProtocolError> {
 fn decode_interest(value: &Value) -> Result<Op, ProtocolError> {
     let center = optional_array2(value, "center");
     let radius = optional_f64(value, "radius");
-    let aoi = center
-        .zip(radius)
-        .map(|(center, radius)| Aoi2::Circle { center, radius });
+    let aoi = center.zip(radius).map(|(center, radius)| Aoi2::Circle { center, radius });
 
     Ok(Op::Interest(Interest {
         aoi,
@@ -637,8 +635,7 @@ fn optional_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 fn authority_epoch(value: &Value) -> Option<u64> {
     optional_u64(value, "authority_epoch").or_else(|| optional_u64(value, "epoch"))
-}
-
+}\n
 fn optional_u64(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(|value| {
         value
@@ -774,7 +771,7 @@ mod tests {
                     "at_rest": false
                 },
                 "schema": "body-v2",
-                "kind": "projectile"
+                "kind": "unit"
             },
         }));
     }
@@ -836,7 +833,7 @@ mod tests {
             },
             "components": {
                 "mass": 2.0,
-                "kind": "projectile"
+                "kind": "unit"
             }
         }));
     }
@@ -898,8 +895,8 @@ mod tests {
             "op": "CommandRequest",
             "request_id": "cmd-1",
             "entity": "ship-1",
-            "command": "fire",
-            "payload": { "weapon": "laser" },
+            "command": "ping",
+            "payload": { "mode": "test" },
             "caller": "client-1",
         }));
         assert_roundtrip(json!({
@@ -915,7 +912,7 @@ mod tests {
         assert_roundtrip(json!({
             "op": "EntityEvent",
             "entity": "ship-1",
-            "event": "TakeDamage",
+            "event": "StatusChanged",
             "payload": { "amount": 12 },
             "sim_time": 123.5,
             "gen": 77,
