@@ -30,6 +30,11 @@ cargo test cross_broker_reality_loadgen_requires_mesh_adoption -- --nocapture
 ```
 
 `reality_loadgen` now requires `content_manifest_ok=<entities>` when content manifests are enabled.
+It also runs a headless client package-load proof and requires
+`content_load_ok=<entities>`: the loader consumes only the public
+`EntityQueryResponse`, resolves each visible entity's package ids to package rows,
+expands package assets, and verifies that every entity asset has a package-carried
+URI and hash.
 
 Full verification:
 
@@ -44,4 +49,5 @@ All passed locally. Full suite result: 29 unit + 7 broker runtime + 3 zone-worke
 
 ## Remaining Pressure
 
-This closes the first package load-plan resolver. A real client package loading proof remains separate.
+This closes the first package load-plan resolver plus the first headless client
+package-load proof. A real engine / legacy-client render proof remains separate.

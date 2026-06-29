@@ -406,6 +406,11 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         "content manifest did not produce a package load plan for every crossed body: {metrics:?}"
     );
     assert_eq!(
+        metric_u64(&metrics, "content_load_ok"),
+        4,
+        "headless client could not resolve every crossed body's package load plan: {metrics:?}"
+    );
+    assert_eq!(
         metric_u64(&metrics, "schema_manifest_ok"),
         4,
         "schema manifest did not carry every crossed body's component ABI: {metrics:?}"

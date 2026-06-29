@@ -85,3 +85,11 @@ cargo test cross_broker_reality_loadgen_requires_mesh_adoption -- --nocapture
 ```
 
 The direct test proves visible-only package resolution, package dedupe, hash propagation, and no leakage of non-visible packages. The runtime gate proves the package plan remains available after a cross-broker handoff through `content_manifest_ok=<entities>`.
+
+The runtime gate also runs a headless client package-load proof. It consumes only the public `EntityQueryResponse`, resolves each visible entity's `entity_packages` to package rows, expands package assets, and requires every entity asset to have a URI and hash carried by its package. A passing run reports:
+
+```text
+content_load_ok=<entities>
+```
+
+This is a client-contract proof for package manifests. It does not replace a real engine or legacy-client asset render proof.

@@ -13,7 +13,7 @@
 //! Parseable final line starts with:
 //!   reality_loadgen result=pass|fail ...
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -721,6 +721,137 @@ fn count_content_manifest_ok(query: &Value, entities: u64) -> u64 {
     ok
 }
 
+fn object_string_set(value: Option<&Value>) -> HashSet<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn nonempty_string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+}
+
+fn map_has_nonempty_string(map: Option<&Value>, key: &str) -> bool {
+    map.and_then(Value::as_object)
+        .and_then(|obj| obj.get(key))
+        .and_then(Value::as_str)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+}
+
+fn count_content_load_ok(query: &Value, entities: u64) -> u64 {
+    let Some(asset_manifest) = query.get("asset_manifest") else {
+        return 0;
+    };
+    let Some(content_manifest) = query.get("content_manifest") else {
+        return 0;
+    };
+    let Some(asset_rows) = asset_manifest.get("assets").and_then(Value::as_array) else {
+        return 0;
+    };
+    let assets_by_id: HashMap<String, &Value> = asset_rows
+        .iter()
+        .filter_map(|asset| {
+            asset
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(|id| (id.to_string(), asset))
+        })
+        .collect();
+    let Some(entity_assets) = asset_manifest
+        .get("entity_assets")
+        .and_then(Value::as_object)
+    else {
+        return 0;
+    };
+    let Some(packages) = content_manifest.get("packages").and_then(Value::as_array) else {
+        return 0;
+    };
+    let packages_by_id: HashMap<String, &Value> = packages
+        .iter()
+        .filter_map(|package| {
+            package
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(|id| (id.to_string(), package))
+        })
+        .collect();
+    let Some(entity_packages) = content_manifest
+        .get("entity_packages")
+        .and_then(Value::as_object)
+    else {
+        return 0;
+    };
+
+    let mut ok = 0u64;
+    for i in 0..entities {
+        let eid = format!("rlg-body-{i}");
+        let required_assets = object_string_set(entity_assets.get(&eid));
+        let required_packages = object_string_set(entity_packages.get(&eid));
+        if required_assets.is_empty() || required_packages.is_empty() {
+            continue;
+        }
+
+        let mut loaded_assets = HashSet::new();
+        let mut packages_resolved = true;
+        for package_id in &required_packages {
+            let Some(package) = packages_by_id.get(package_id) else {
+                packages_resolved = false;
+                break;
+            };
+            for asset_id in object_string_set(package.get("assets")) {
+                loaded_assets.insert(asset_id);
+            }
+        }
+        if !packages_resolved || !required_assets.is_subset(&loaded_assets) {
+            continue;
+        }
+
+        let mut all_assets_resolved = true;
+        for asset_id in &required_assets {
+            let Some(asset) = assets_by_id.get(asset_id) else {
+                all_assets_resolved = false;
+                break;
+            };
+            if nonempty_string_field(asset, &["uri", "path"]).is_none()
+                || nonempty_string_field(asset, &["hash", "sha256"]).is_none()
+            {
+                all_assets_resolved = false;
+                break;
+            }
+            let package_carries_asset = required_packages.iter().any(|package_id| {
+                packages_by_id
+                    .get(package_id)
+                    .map(|package| {
+                        object_string_set(package.get("assets")).contains(asset_id)
+                            && map_has_nonempty_string(package.get("uris"), asset_id)
+                            && map_has_nonempty_string(package.get("hashes"), asset_id)
+                    })
+                    .unwrap_or(false)
+            });
+            if !package_carries_asset {
+                all_assets_resolved = false;
+                break;
+            }
+        }
+
+        if all_assets_resolved {
+            ok += 1;
+        }
+    }
+    ok
+}
+
 fn count_schema_manifest_ok(query: &Value, entities: u64) -> u64 {
     let Some(manifest) = query.get("schema_manifest") else {
         return 0;
@@ -821,6 +952,10 @@ async fn main() {
         .ok()
         .map(|v| v != "0")
         .unwrap_or(require_asset_manifest);
+    let require_content_load = env::var("GW_REQUIRE_CONTENT_LOAD")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(require_content_manifest);
     let require_schema_manifest = env::var("GW_REQUIRE_SCHEMA_MANIFEST")
         .ok()
         .map(|v| v != "0")
@@ -1065,6 +1200,7 @@ async fn main() {
     let mut physics_clock_ok = 0u64;
     let mut asset_manifest_ok = 0u64;
     let mut content_manifest_ok = 0u64;
+    let mut content_load_ok = 0u64;
     let mut schema_manifest_ok = 0u64;
     let mut qbi_ast_ok = 0u64;
     let mut handoff_probe_query_error: Option<String> = None;
@@ -1129,6 +1265,7 @@ async fn main() {
                     physics_clock_ok = count_physics_clock_ok(&query, entities);
                     asset_manifest_ok = count_asset_manifest_ok(&query, entities);
                     content_manifest_ok = count_content_manifest_ok(&query, entities);
+                    content_load_ok = count_content_load_ok(&query, entities);
                     schema_manifest_ok = count_schema_manifest_ok(&query, entities);
                 }
                 Err(e) => {
@@ -1265,6 +1402,9 @@ async fn main() {
     if require_content_manifest && content_manifest_ok < entities {
         failures.push("content_manifest_incomplete");
     }
+    if require_content_load && content_load_ok < entities {
+        failures.push("content_load_plan_unresolved");
+    }
     if require_schema_manifest && schema_manifest_ok < entities {
         failures.push("schema_manifest_incomplete");
     }
@@ -1287,7 +1427,7 @@ async fn main() {
     let result = if failures.is_empty() { "pass" } else { "fail" };
     let elapsed = started.elapsed().as_secs_f64();
     println!(
-        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} content_manifest_ok={} schema_manifest_ok={} qbi_ast_ok={} health_ok={} monitor_tick_ok={} monitor_queue_ok={} health_queue_backlog={} health_egress_max={} health_max_tick_lag_ms={:.2} health_max_lock_ms={:.2} mesh_ghosts={} slow_viewer={} failures={}",
+        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} content_manifest_ok={} content_load_ok={} schema_manifest_ok={} qbi_ast_ok={} health_ok={} monitor_tick_ok={} monitor_queue_ok={} health_queue_backlog={} health_egress_max={} health_max_tick_lag_ms={:.2} health_max_lock_ms={:.2} mesh_ghosts={} slow_viewer={} failures={}",
         result,
         if cross_broker { "cross-broker" } else { "single-broker" },
         entities,
@@ -1312,6 +1452,7 @@ async fn main() {
         physics_clock_ok,
         asset_manifest_ok,
         content_manifest_ok,
+        content_load_ok,
         schema_manifest_ok,
         qbi_ast_ok,
         health_ok,
