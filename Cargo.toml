@@ -1,5 +1,9 @@
 [workspace]
-members = ["."]
+members = [
+    ".",
+    "crates/godworks-core",
+    "crates/godworks-protocol",
+]
 resolver = "2"
 
 [package]
