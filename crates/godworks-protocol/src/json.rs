@@ -8,8 +8,10 @@ use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId, 
 use serde_json::{json, Map, Value};
 
 use crate::{
-    AuthorityChange, BatchUpdate, BatchUpdateEntry, CreateEntity, Heartbeat, Interest, MeshAck,
-    MeshHandoff, Op, ProtocolError, UpdateComponent, UpdateRejected, WorkerConnect,
+    AddComponent, AddEntity, AuthorityChange, BatchUpdate, BatchUpdateEntry, CreateEntity,
+    CriticalSection, DeleteEntity, Heartbeat, Interest, MeshAck, MeshHandoff, Op, ProtocolError,
+    RemoveComponent, RemoveEntity, ReserveEntityIds, UpdateComponent, UpdateRejected,
+    WorkerConnect,
 };
 
 /// Decode a JSON operation body into the typed v1 operation model.
@@ -23,7 +25,40 @@ pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
             worker_id: optional_str(value, "worker_id").map(PeerId::from),
         })),
         "Interest" => decode_interest(value),
+        "CriticalSection" => Ok(Op::CriticalSection(CriticalSection {
+            phase: optional_str(value, "phase").unwrap_or("").to_string(),
+            entity: optional_str(value, "entity").map(EntityId::from),
+        })),
+        "AddEntity" => Ok(Op::AddEntity(AddEntity {
+            entity: EntityId::from(required_str(value, "entity")?),
+            components: value.get("components").cloned(),
+        })),
+        "RemoveEntity" => Ok(Op::RemoveEntity(RemoveEntity {
+            entity: EntityId::from(required_str(value, "entity")?),
+        })),
         "CreateEntity" => decode_create_entity(value),
+        "DeleteEntity" => Ok(Op::DeleteEntity(DeleteEntity {
+            entity: EntityId::from(required_str(value, "entity")?),
+            request_id: optional_str(value, "request_id").map(str::to_string),
+            authority_epoch: authority_epoch(value),
+        })),
+        "ReserveEntityIds" => Ok(Op::ReserveEntityIds(ReserveEntityIds {
+            request_id: optional_str(value, "request_id").map(str::to_string),
+            count: optional_u64(value, "count")
+                .or_else(|| optional_u64(value, "n"))
+                .unwrap_or(0),
+        })),
+        "AddComponent" => Ok(Op::AddComponent(AddComponent {
+            entity: EntityId::from(required_str(value, "entity")?),
+            component: ComponentName::from(required_component_name(value)?),
+            value: value.get("value").cloned().unwrap_or(Value::Null),
+            authority_epoch: authority_epoch(value),
+        })),
+        "RemoveComponent" => Ok(Op::RemoveComponent(RemoveComponent {
+            entity: EntityId::from(required_str(value, "entity")?),
+            component: ComponentName::from(required_component_name(value)?),
+            authority_epoch: authority_epoch(value),
+        })),
         "UpdateComponent" => decode_update_component(value),
         "BatchUpdate" => decode_batch_update(value),
         "AuthorityChange" => decode_authority_change(value),
@@ -50,7 +85,17 @@ pub fn encode_json_value(op: &Op) -> Value {
         Op::Disconnect => json!({ "op": "Disconnect" }),
         Op::Heartbeat(op) => encode_heartbeat(op),
         Op::Interest(op) => encode_interest(op),
+        Op::CriticalSection(op) => encode_critical_section(op),
+        Op::AddEntity(op) => encode_add_entity(op),
+        Op::RemoveEntity(op) => json!({
+            "op": "RemoveEntity",
+            "entity": op.entity.as_ref(),
+        }),
         Op::CreateEntity(op) => encode_create_entity(op),
+        Op::DeleteEntity(op) => encode_delete_entity(op),
+        Op::ReserveEntityIds(op) => encode_reserve_entity_ids(op),
+        Op::AddComponent(op) => encode_add_component(op),
+        Op::RemoveComponent(op) => encode_remove_component(op),
         Op::UpdateComponent(op) => encode_update_component(op),
         Op::BatchUpdate(op) => encode_batch_update(op),
         Op::AuthorityChange(op) => encode_authority_change(op),
@@ -113,23 +158,11 @@ fn decode_interest(value: &Value) -> Result<Op, ProtocolError> {
 }
 
 fn decode_create_entity(value: &Value) -> Result<Op, ProtocolError> {
-    let components = value.get("components");
-    let pos = components
-        .and_then(|components| components.get("pos"))
-        .or_else(|| value.get("pos"))
-        .map(pos2_from_value)
-        .unwrap_or_default();
-    let vel = components
-        .and_then(|components| components.get("vel"))
-        .or_else(|| value.get("vel"))
-        .map(vel2_from_value)
-        .unwrap_or_default();
-
     Ok(Op::CreateEntity(CreateEntity {
         entity: EntityId::from(required_str(value, "entity")?),
+        request_id: optional_str(value, "request_id").map(str::to_string),
         requested_region: optional_str(value, "region").map(RegionId::from),
-        pos,
-        vel,
+        components: component_bag(value),
     }))
 }
 
@@ -286,17 +319,76 @@ fn encode_interest(op: &Interest) -> Value {
     Value::Object(obj)
 }
 
-fn encode_create_entity(op: &CreateEntity) -> Value {
-    let mut components = Map::new();
-    components.insert("pos".to_string(), json!(op.pos.to_array()));
-    components.insert("vel".to_string(), json!(op.vel.to_array()));
+fn encode_critical_section(op: &CriticalSection) -> Value {
+    let mut obj = object_with_op("CriticalSection");
+    obj.insert("phase".to_string(), json!(op.phase.as_str()));
+    if let Some(entity) = &op.entity {
+        obj.insert("entity".to_string(), json!(entity.as_ref()));
+    }
+    Value::Object(obj)
+}
 
+fn encode_add_entity(op: &AddEntity) -> Value {
+    let mut obj = object_with_op("AddEntity");
+    obj.insert("entity".to_string(), json!(op.entity.as_ref()));
+    if let Some(components) = &op.components {
+        obj.insert("components".to_string(), components.clone());
+    }
+    Value::Object(obj)
+}
+
+fn encode_create_entity(op: &CreateEntity) -> Value {
     let mut obj = object_with_op("CreateEntity");
     obj.insert("entity".to_string(), json!(op.entity.as_ref()));
+    if let Some(request_id) = &op.request_id {
+        obj.insert("request_id".to_string(), json!(request_id));
+    }
     if let Some(region) = &op.requested_region {
         obj.insert("region".to_string(), json!(region.as_ref()));
     }
-    obj.insert("components".to_string(), Value::Object(components));
+    obj.insert("components".to_string(), op.components.clone());
+    Value::Object(obj)
+}
+
+fn encode_delete_entity(op: &DeleteEntity) -> Value {
+    let mut obj = object_with_op("DeleteEntity");
+    obj.insert("entity".to_string(), json!(op.entity.as_ref()));
+    if let Some(request_id) = &op.request_id {
+        obj.insert("request_id".to_string(), json!(request_id));
+    }
+    if let Some(epoch) = op.authority_epoch {
+        obj.insert("authority_epoch".to_string(), json!(epoch));
+    }
+    Value::Object(obj)
+}
+
+fn encode_reserve_entity_ids(op: &ReserveEntityIds) -> Value {
+    let mut obj = object_with_op("ReserveEntityIds");
+    if let Some(request_id) = &op.request_id {
+        obj.insert("request_id".to_string(), json!(request_id));
+    }
+    obj.insert("count".to_string(), json!(op.count));
+    Value::Object(obj)
+}
+
+fn encode_add_component(op: &AddComponent) -> Value {
+    let mut obj = object_with_op("AddComponent");
+    obj.insert("entity".to_string(), json!(op.entity.as_ref()));
+    obj.insert("comp".to_string(), json!(op.component.as_ref()));
+    obj.insert("value".to_string(), op.value.clone());
+    if let Some(epoch) = op.authority_epoch {
+        obj.insert("authority_epoch".to_string(), json!(epoch));
+    }
+    Value::Object(obj)
+}
+
+fn encode_remove_component(op: &RemoveComponent) -> Value {
+    let mut obj = object_with_op("RemoveComponent");
+    obj.insert("entity".to_string(), json!(op.entity.as_ref()));
+    obj.insert("comp".to_string(), json!(op.component.as_ref()));
+    if let Some(epoch) = op.authority_epoch {
+        obj.insert("authority_epoch".to_string(), json!(epoch));
+    }
     Value::Object(obj)
 }
 
@@ -378,6 +470,21 @@ fn object_with_op(op: &str) -> Map<String, Value> {
     obj
 }
 
+fn component_bag(value: &Value) -> Value {
+    if let Some(components) = value.get("components") {
+        return components.clone();
+    }
+
+    let mut components = Map::new();
+    if let Some(pos) = value.get("pos") {
+        components.insert("pos".to_string(), pos.clone());
+    }
+    if let Some(vel) = value.get("vel") {
+        components.insert("vel".to_string(), vel.clone());
+    }
+    Value::Object(components)
+}
+
 fn required_component_name(value: &Value) -> Result<&str, ProtocolError> {
     optional_str(value, "comp")
         .or_else(|| optional_str(value, "component"))
@@ -444,6 +551,133 @@ mod tests {
             "region": "W",
             "attributes": ["physics", "server"],
             "proto": PROTOCOL_VERSION,
+        });
+
+        let decoded = decode_json_value(&raw).unwrap();
+        assert_eq!(encode_json_value(&decoded), raw);
+    }
+
+    #[test]
+    fn critical_section_json_roundtrips() {
+        let raw = json!({
+            "op": "CriticalSection",
+            "phase": "begin",
+            "entity": "ship-1",
+        });
+
+        let decoded = decode_json_value(&raw).unwrap();
+        assert_eq!(encode_json_value(&decoded), raw);
+    }
+
+    #[test]
+    fn add_entity_json_roundtrips() {
+        let raw = json!({
+            "op": "AddEntity",
+            "entity": "ship-1",
+            "components": {
+                "pos": [1.0, 2.0],
+                "vel": [0.1, 0.0],
+                "mass": 2.5,
+            },
+        });
+
+        let decoded = decode_json_value(&raw).unwrap();
+        assert_eq!(encode_json_value(&decoded), raw);
+    }
+
+    #[test]
+    fn remove_entity_json_roundtrips() {
+        let raw = json!({
+            "op": "RemoveEntity",
+            "entity": "ship-1",
+        });
+
+        let decoded = decode_json_value(&raw).unwrap();
+        assert_eq!(encode_json_value(&decoded), raw);
+    }
+
+    #[test]
+    fn create_entity_preserves_rich_component_bag() {
+        let raw = json!({
+            "op": "CreateEntity",
+            "request_id": "create-1",
+            "entity": "ship-1",
+            "region": "W",
+            "components": {
+                "pos": [-2.0, 0.5],
+                "vel": [0.08, 0.0],
+                "mass": 3.0,
+                "contact_radius": 0.75,
+                "sim_time": 0,
+                "gen": 0,
+            },
+        });
+
+        let decoded = decode_json_value(&raw).unwrap();
+        assert_eq!(encode_json_value(&decoded), raw);
+    }
+
+    #[test]
+    fn delete_entity_json_roundtrips() {
+        let raw = json!({
+            "op": "DeleteEntity",
+            "request_id": "delete-1",
+            "entity": "ship-1",
+            "authority_epoch": 7,
+        });
+
+        let decoded = decode_json_value(&raw).unwrap();
+        assert_eq!(encode_json_value(&decoded), raw);
+    }
+
+    #[test]
+    fn reserve_entity_ids_json_roundtrips() {
+        let raw = json!({
+            "op": "ReserveEntityIds",
+            "request_id": "reserve-1",
+            "count": 16,
+        });
+
+        let decoded = decode_json_value(&raw).unwrap();
+        assert_eq!(encode_json_value(&decoded), raw);
+    }
+
+    #[test]
+    fn reserve_entity_ids_accepts_n_alias() {
+        let raw = json!({
+            "op": "ReserveEntityIds",
+            "request_id": "reserve-1",
+            "n": 16,
+        });
+
+        let decoded = decode_json_value(&raw).unwrap();
+        match decoded {
+            Op::ReserveEntityIds(reserve) => assert_eq!(reserve.count, 16),
+            other => panic!("unexpected op: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_component_json_roundtrips() {
+        let raw = json!({
+            "op": "AddComponent",
+            "entity": "ship-1",
+            "comp": "shield",
+            "value": {"hp": 10},
+            "authority_epoch": 3,
+        });
+
+        let decoded = decode_json_value(&raw).unwrap();
+        assert_eq!(encode_json_value(&decoded), raw);
+    }
+
+    #[test]
+    fn remove_component_json_roundtrips() {
+        let raw = json!({
+            "op": "RemoveComponent",
+            "entity": "ship-1",
+            "comp": "shield",
+            "authority_epoch": 4,
         });
 
         let decoded = decode_json_value(&raw).unwrap();
