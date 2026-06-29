@@ -55,3 +55,15 @@ BSL is the middle ground:
 The SDK, examples, and protocol-level client code are intended to be Apache-2.0.
 This repository is the protected server runtime so the project can fund development
 without becoming a closed platform.
+
+This is also a funding model, not just a restriction. Godworks OS is built by a
+solo developer; the goal is to make a serious, high-quality multiplayer backend
+available in public instead of locking it behind a private platform. The protected
+server license gives the project a way to pay for the unglamorous work that makes
+the tool useful: tests, documentation, security hardening, compatibility, operations,
+and long-term maintenance.
+
+The intent is indie-friendly: small teams should be able to evaluate, build, and
+grow with the technology without being blocked up front. When a use case falls
+outside the public grant and needs a commercial agreement, the model should scale
+with the project's success, and that revenue goes back into improving the technology.
