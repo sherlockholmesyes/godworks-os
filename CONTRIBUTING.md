@@ -20,6 +20,18 @@ cargo test --workspace --all-targets
 cargo build --workspace --release
 ```
 
+## Drift check
+
+Before widening scope, read `docs/engineering/drift-guard.md`.
+
+The hardening rule is:
+
+```text
+wrong assumption × wrong implementation = third wrong system
+```
+
+A PR should either move the 2D spatial backend product surface forward or clearly explain why it is necessary foundation work.
+
 ## Change rules
 
 Persistent world-state mutations must go through the durable transition path:
@@ -60,6 +72,7 @@ A product-facing feature is not done until it has:
 ## Pull request checklist
 
 - [ ] `just gate` passes locally or the PR explains why it cannot yet pass.
+- [ ] Drift check passed; scope still points at the 2D spatial backend product vector.
 - [ ] Persistent-state changes include recovery tests.
 - [ ] Protocol changes update protocol docs.
 - [ ] New runtime flags/configs update ops docs.
