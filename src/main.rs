@@ -6859,6 +6859,56 @@ mod tests {
         }
     }
 
+    fn test_physics_island_entity(pos: [f64; 2], region: &str) -> Entity {
+        let mut components = Map::new();
+        components.insert("rot".to_string(), json!(0.25));
+        components.insert("lin".to_string(), json!([1.0, 0.0]));
+        components.insert("ang".to_string(), json!(0.125));
+        components.insert("at_rest".to_string(), json!(false));
+        Entity {
+            pos,
+            vel: [1.0, 0.0],
+            authority: initial_authority_map(&components, 1),
+            components,
+            region: region.to_string(),
+            version: 1,
+            last_broadcast_cell: Some(interest_cell_of(pos)),
+        }
+    }
+
+    fn expanded_physics_island_components() -> Vec<&'static str> {
+        vec!["ang", "at_rest", "lin", "pos", "rot", "vel"]
+    }
+
+    fn stamp_expanded_physics_island_epochs(e: &mut Entity) -> HashMap<String, u64> {
+        let epochs = [
+            ("ang", 3),
+            ("at_rest", 5),
+            ("lin", 7),
+            ("pos", 11),
+            ("rot", 13),
+            ("vel", 17),
+        ];
+        let mut out = HashMap::new();
+        for (comp, epoch) in epochs {
+            set_component_authority_epoch(e, comp, epoch);
+            out.insert(comp.to_string(), epoch);
+        }
+        out
+    }
+
+    fn physics_island_update_value(comp: &str) -> Value {
+        match comp {
+            "ang" => json!(0.75),
+            "at_rest" => json!(true),
+            "lin" => json!([2.0, 0.0]),
+            "pos" => json!([3.0, 0.0]),
+            "rot" => json!(0.5),
+            "vel" => json!([0.0, 2.0]),
+            other => panic!("unexpected physics-island comp {other}"),
+        }
+    }
+
     fn add_test_worker(state: &mut ServerState, wid: &str, region: &str) {
         let (tx, _rx) = mpsc::channel(CHANNEL_CAP);
         state.workers.insert(
@@ -7074,6 +7124,56 @@ mod tests {
         );
         assert!(!state.entities.contains_key("ship"));
         assert!(state.pending_mesh.contains_key("ship"));
+    }
+
+    #[test]
+    fn mesh_forward_carries_full_physics_island_authority_snapshot() {
+        let mut state = ServerState::new(30.0);
+        state.my_region = "W".to_string();
+        state.region_lease_epoch.insert("W".to_string(), 7);
+        add_test_worker(&mut state, "w1", "W");
+        let mut ship = test_physics_island_entity([1.0, 0.0], "W");
+        let old_epochs = stamp_expanded_physics_island_epochs(&mut ship);
+        let expected_epoch = old_epochs.values().copied().max().unwrap() + 1;
+        state.entities.insert("ship".to_string(), ship);
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.mesh.insert("E".to_string(), tx);
+
+        mesh_forward(&mut state, "ship", "E");
+
+        let fr = rx
+            .try_recv()
+            .expect("mesh forward must emit the durable covered handoff");
+        let handoff = decode_test_frame(&fr);
+        assert_eq!(handoff["op"], "MeshHandoff");
+        assert_eq!(handoff["authority_epoch"], expected_epoch);
+
+        let authority = handoff["authority"]
+            .as_object()
+            .expect("MeshHandoff must carry an authority snapshot");
+        for comp in expanded_physics_island_components() {
+            let spec = authority
+                .get(comp)
+                .unwrap_or_else(|| panic!("missing authority for {comp}"));
+            assert!(
+                spec["owner"].is_null(),
+                "mesh source must drop local ownership for {comp}"
+            );
+            assert_eq!(spec["authority_epoch"], expected_epoch, "{comp}");
+            assert_eq!(spec["mode"], "server_physics_island", "{comp}");
+        }
+
+        let components = handoff["components"]
+            .as_object()
+            .expect("MeshHandoff must carry the component payload");
+        for comp in ["ang", "at_rest", "lin", "rot"] {
+            assert!(
+                components.contains_key(comp),
+                "expanded physics payload must carry {comp} across the broker seam"
+            );
+        }
     }
 
     #[test]
@@ -7518,6 +7618,120 @@ mod tests {
         assert!(state.workers["w2"]
             .authority_epochs
             .contains_key(&authority_key("ship", "pos")));
+    }
+
+    #[test]
+    fn physics_island_handoff_fences_all_components() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        let mut ship = test_physics_island_entity([-1.0, 0.0], "W");
+        let old_epochs = stamp_expanded_physics_island_epochs(&mut ship);
+        let expected_epoch = old_epochs.values().copied().max().unwrap() + 1;
+        state.entities.insert("ship".to_string(), ship);
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        for comp in expanded_physics_island_components() {
+            assert_eq!(
+                component_authority_owner(&state.entities["ship"], comp),
+                Some("w1".to_string()),
+                "{comp}"
+            );
+            assert_eq!(
+                state.workers["w1"]
+                    .authority_epochs
+                    .get(&authority_key("ship", comp))
+                    .copied(),
+                Some(old_epochs[comp]),
+                "{comp}"
+            );
+        }
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+
+        let expected_comps: Vec<String> = expanded_physics_island_components()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(state.pending_handoffs.len(), 1);
+        assert_eq!(state.pending_handoffs[0].moved_comps, expected_comps);
+        assert_eq!(state.pending_handoffs[0].authority_epoch, expected_epoch);
+        let pending_authority = state.pending_handoffs[0]
+            .authority
+            .as_object()
+            .expect("pending handoff must carry an authority snapshot");
+        for comp in expanded_physics_island_components() {
+            let spec = pending_authority
+                .get(comp)
+                .unwrap_or_else(|| panic!("missing pending authority for {comp}"));
+            assert_eq!(spec["owner"], "w2", "{comp}");
+            assert_eq!(spec["authority_epoch"], expected_epoch, "{comp}");
+        }
+
+        flush_pending_handoffs(&mut state);
+
+        for comp in expanded_physics_island_components() {
+            assert_eq!(
+                component_authority_owner(&state.entities["ship"], comp),
+                Some("w2".to_string()),
+                "{comp}"
+            );
+            assert_eq!(
+                component_authority_epoch(&state.entities["ship"], comp),
+                expected_epoch,
+                "{comp}"
+            );
+            assert!(
+                !state.workers["w1"]
+                    .authority_epochs
+                    .contains_key(&authority_key("ship", comp)),
+                "old owner still has cached authority for {comp}"
+            );
+            assert_eq!(
+                state.workers["w2"]
+                    .authority_epochs
+                    .get(&authority_key("ship", comp))
+                    .copied(),
+                Some(expected_epoch),
+                "{comp}"
+            );
+            assert!(
+                !apply_one_update(
+                    &mut state,
+                    "w1",
+                    "ship",
+                    comp,
+                    physics_island_update_value(comp),
+                    Some(old_epochs[comp]),
+                ),
+                "old owner write must be fenced for {comp}"
+            );
+            assert!(
+                apply_one_update(
+                    &mut state,
+                    "w2",
+                    "ship",
+                    comp,
+                    physics_island_update_value(comp),
+                    Some(expected_epoch),
+                ),
+                "new owner write must apply for {comp}"
+            );
+        }
+        flush_pending_updates(&mut state);
+
+        assert_eq!(state.entities["ship"].pos, [3.0, 0.0]);
+        assert_eq!(state.entities["ship"].vel, [0.0, 2.0]);
+        assert_eq!(state.entities["ship"].components["rot"], json!(0.5));
+        assert_eq!(state.entities["ship"].components["lin"], json!([2.0, 0.0]));
+        assert_eq!(state.entities["ship"].components["ang"], json!(0.75));
+        assert_eq!(state.entities["ship"].components["at_rest"], json!(true));
     }
 
     #[test]
