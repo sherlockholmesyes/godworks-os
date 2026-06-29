@@ -4,30 +4,13 @@
 //! bridge: it documents and tests the current shape while giving future SDK work
 //! a typed boundary.
 
-use godworks_core::Aoi2;
-use godworks_core::ComponentName;
-use godworks_core::EntityId;
-use godworks_core::PeerId;
-use godworks_core::Position2;
-use godworks_core::RegionId;
-use godworks_core::Velocity2;
-use serde_json::json;
-use serde_json::Map;
-use serde_json::Value;
+use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId, Velocity2};
+use serde_json::{json, Map, Value};
 
-use crate::AuthorityChange;
-use crate::BatchUpdate;
-use crate::BatchUpdateEntry;
-use crate::CreateEntity;
-use crate::Heartbeat;
-use crate::Interest;
-use crate::MeshAck;
-use crate::MeshHandoff;
-use crate::Op;
-use crate::ProtocolError;
-use crate::UpdateComponent;
-use crate::UpdateRejected;
-use crate::WorkerConnect;
+use crate::{
+    AuthorityChange, BatchUpdate, BatchUpdateEntry, CreateEntity, Heartbeat, Interest, MeshAck,
+    MeshHandoff, Op, ProtocolError, UpdateComponent, UpdateRejected, WorkerConnect,
+};
 
 /// Decode a JSON operation body into the typed v1 operation model.
 pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
@@ -192,9 +175,7 @@ fn decode_batch_update_array(items: &[Value]) -> Result<Vec<BatchUpdateEntry>, P
             let entity = entry
                 .get("entity")
                 .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    ProtocolError::malformed("BatchUpdate object entry missing entity")
-                })?;
+                .ok_or_else(|| ProtocolError::malformed("BatchUpdate object entry missing entity"))?;
 
             updates.push(BatchUpdateEntry {
                 entity: EntityId::from(entity),
@@ -455,8 +436,7 @@ fn array_f64(arr: Option<&Vec<Value>>, index: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ProtocolErrorKind;
-    use crate::PROTOCOL_VERSION;
+    use crate::{ProtocolErrorKind, PROTOCOL_VERSION};
 
     #[test]
     fn worker_connect_json_roundtrips() {
