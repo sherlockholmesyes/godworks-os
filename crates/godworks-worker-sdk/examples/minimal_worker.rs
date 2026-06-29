@@ -1,5 +1,7 @@
 use godworks_core::Position2;
-use godworks_worker_sdk::{decode_frame_payload, read_op, write_op, WorkerConfig, WorkerSession};
+use godworks_worker_sdk::{
+    decode_frame_payload, read_op, write_op, WorkerConfig, WorkerSession,
+};
 use serde_json::json;
 use tokio::io::duplex;
 
