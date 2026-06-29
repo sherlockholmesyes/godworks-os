@@ -18,6 +18,9 @@ edition = "2021"
 # the reference is the conformance oracle, not the runtime.
 
 [dependencies]
+godworks-core = { path = "crates/godworks-core" }
+godworks-protocol = { path = "crates/godworks-protocol" }
+godworks-worker-sdk = { path = "crates/godworks-worker-sdk" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 # preserve_order: match insertion order so the op-stream is byte-identical
 serde_json = { version = "1", features = ["preserve_order"] }

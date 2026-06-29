@@ -39,30 +39,17 @@ use std::collections::HashMap;
 use std::env;
 use std::time::{Duration, Instant};
 
+use godworks_core::Position2;
+use godworks_protocol::json::encode_json_value;
+use godworks_protocol::{BatchUpdate, Op};
+use godworks_worker_sdk::{
+    batch_entry, circle_interest, create_entity_op, disconnect_op, fold_op, heartbeat_op,
+    legacy_worker_connect_op, read_op, write_op,
+};
 use rapier2d::prelude::*;
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-
-// ── wire framing: identical to loadgen.rs (4-byte big-endian length prefix + JSON body) ──
-fn frame(v: &Value) -> Vec<u8> {
-    let b = serde_json::to_vec(v).unwrap();
-    let n = b.len() as u32;
-    let mut o = Vec::with_capacity(4 + b.len());
-    o.extend_from_slice(&n.to_be_bytes());
-    o.extend_from_slice(&b);
-    o
-}
-
-async fn read_frame<R: AsyncReadExt + Unpin>(rd: &mut R) -> Option<Value> {
-    let mut h = [0u8; 4];
-    rd.read_exact(&mut h).await.ok()?;
-    let n = u32::from_be_bytes(h) as usize;
-    let mut b = vec![0u8; n];
-    rd.read_exact(&mut b).await.ok()?;
-    serde_json::from_slice(&b).ok()
-}
 
 // ── tiny xorshift RNG (avoid pulling in the `rand` crate; keep deps == broker's tokio+serde+rapier) ──
 struct Rng(u64);
@@ -188,25 +175,40 @@ async fn main() {
     };
     stream.set_nodelay(true).ok();
     let (mut rd, mut wr) = stream.into_split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Op>();
     tokio::spawn(async move {
-        while let Some(f) = read_frame(&mut rd).await {
-            if tx.send(f).is_err() {
-                break;
+        loop {
+            match read_op(&mut rd).await {
+                Ok(Some(f)) => {
+                    if tx.send(f).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[zw] read error: {e}");
+                    break;
+                }
             }
         }
     });
 
-    wr.write_all(&frame(
-        &json!({"op":"WorkerConnect","worker_id":wid,"region":region}),
-    ))
+    write_op(
+        &mut wr,
+        &legacy_worker_connect_op(wid.clone(), region.clone()),
+    )
     .await
     .ok();
     // a WIDE interest so we (a) are granted authority over entities we create in our region, and
     // (b) see neighbours' entities approaching the seam -> can adopt them on the authority grant.
-    wr.write_all(&frame(
-        &json!({"op":"Interest","center":[0.0,0.0],"radius":interest}),
-    ))
+    write_op(
+        &mut wr,
+        &Op::Interest(circle_interest(
+            Position2::new(0.0, 0.0),
+            interest as f64,
+            None,
+        )),
+    )
     .await
     .ok();
     eprintln!(
@@ -282,10 +284,14 @@ async fn main() {
         view_pos.insert(eid.clone(), [x, y]);
         view_vel.insert(eid.clone(), [vx, vy]);
         view_mass.insert(eid.clone(), m0);
-        wr.write_all(&frame(&json!({
-            "op":"CreateEntity","entity":eid,"region":region,
-            "components":{"pos":[x,y],"vel":[vx,vy],"mass":m0}
-        })))
+        write_op(
+            &mut wr,
+            &create_entity_op(
+                eid.clone(),
+                region.clone(),
+                json!({"pos":[x,y],"vel":[vx,vy],"mass":m0}),
+            ),
+        )
         .await
         .ok();
         eprintln!("[zw {region}] spawn e={eid} pos=[{x:.3},{y:.3}] vel=[{vx:.3},{vy:.3}]");
@@ -303,6 +309,7 @@ async fn main() {
 
         // (1) drain + apply all pending ops at the tick boundary (game-loop discipline)
         while let Ok(f) = rx.try_recv() {
+            let f = encode_json_value(&f);
             apply_op(
                 &f,
                 &region,
@@ -354,11 +361,9 @@ async fn main() {
             let (px, py, _vx, _vy) = body_state(&bodies, bot.handle);
             if fold_mode {
                 if let Some(target) = fold_target(px, py, cell.as_ref().unwrap(), &neighbors) {
-                    wr.write_all(&frame(&json!({
-                        "op":"Fold","entity":eid,"region":target,"pos":[px,py]
-                    })))
-                    .await
-                    .ok();
+                    write_op(&mut wr, &fold_op(eid.clone(), target.clone(), [px, py]))
+                        .await
+                        .ok();
                     eprintln!(
                         "[zw {region}] fold e={eid} -> {target} (exit pos=[{px:.2},{py:.2}])"
                     );
@@ -366,12 +371,16 @@ async fn main() {
                     continue;
                 }
             }
-            pos_updates.push(json!([eid, [px, py], bot.epoch]));
+            pos_updates.push(batch_entry(eid.clone(), json!([px, py]), Some(bot.epoch)));
         }
         if !pos_updates.is_empty() {
-            wr.write_all(&frame(&json!({
-                "op":"BatchUpdate","comp":"pos","updates":pos_updates
-            })))
+            write_op(
+                &mut wr,
+                &Op::BatchUpdate(BatchUpdate {
+                    component: "pos".into(),
+                    updates: pos_updates,
+                }),
+            )
             .await
             .ok();
         }
@@ -392,21 +401,23 @@ async fn main() {
         let mut vel_updates = Vec::with_capacity(bots.len());
         for (eid, bot) in bots.iter() {
             let (_px, _py, vx, vy) = body_state(&bodies, bot.handle);
-            vel_updates.push(json!([eid, [vx, vy], bot.epoch]));
+            vel_updates.push(batch_entry(eid.clone(), json!([vx, vy]), Some(bot.epoch)));
         }
         if !vel_updates.is_empty() {
-            wr.write_all(&frame(&json!({
-                "op":"BatchUpdate","comp":"vel","updates":vel_updates
-            })))
+            write_op(
+                &mut wr,
+                &Op::BatchUpdate(BatchUpdate {
+                    component: "vel".into(),
+                    updates: vel_updates,
+                }),
+            )
             .await
             .ok();
         }
 
         // (4) heartbeat ~4x/s (renew the region lease)
         if tick % ((hz as u64 / 4).max(1)) == 0 {
-            wr.write_all(&frame(&json!({"op":"Heartbeat","worker_id":wid})))
-                .await
-                .ok();
+            write_op(&mut wr, &heartbeat_op(wid.clone())).await.ok();
         }
 
         tick += 1;
@@ -429,7 +440,7 @@ async fn main() {
         }
     }
 
-    wr.write_all(&frame(&json!({"op":"Disconnect"}))).await.ok();
+    write_op(&mut wr, &disconnect_op()).await.ok();
     eprintln!(
         "[zw {region}] done tick={tick} owned={} rejects={rejects}",
         bots.len()
