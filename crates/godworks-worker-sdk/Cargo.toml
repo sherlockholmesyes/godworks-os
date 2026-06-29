@@ -1,0 +1,18 @@
+[package]
+name = "godworks-worker-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Minimal Rust SDK for Godworks OS workers over the typed v1 protocol."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+godworks-core = { path = "../godworks-core" }
+godworks-protocol = { path = "../godworks-protocol" }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }
