@@ -37,6 +37,7 @@ full SpatialOS replacement
 - Interest management / AOI.
 - Coarse fidelity updates.
 - Backpressure and bounded egress channels.
+- Max frame size and basic per-peer ingress frame rate limits.
 - Health/inspector-oriented runtime state.
 - Rapier2D physics worker demo.
 - Reality/load harness.
@@ -82,8 +83,7 @@ The product needs a formal security layer:
 
 - worker/client authentication;
 - mesh authentication;
-- frame size limits;
-- rate limits;
+- broader per-principal rate-limit policy;
 - observer/global-interest permissions;
 - token-bound worker attributes;
 - TLS/mTLS option.

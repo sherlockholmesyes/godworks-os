@@ -52,8 +52,21 @@ const EGRESS_SOFT_CAP: u64 = 4096;
 // stuck (no legitimate healthy consumer backs up 16k critical frames). At ~150 B/frame that is a ~2.5 MB hard
 // ceiling PER consumer: tight, principled, not a test-tuned knob. Above it, the critical-send-failure kicks it.
 const CHANNEL_CAP: usize = EGRESS_SOFT_CAP as usize * 4;
+// Security v0 ingress bound. The frame-size cap blocks one oversized body; this token bucket blocks the
+// other public-TCP failure mode: many valid small frames. Defaults are intentionally generous for local game
+// traffic and tests; operators can lower them with GW_INGRESS_RATE_PER_SEC / GW_INGRESS_BURST_FRAMES.
+const DEFAULT_INGRESS_RATE_PER_SEC: f64 = 2000.0;
+const DEFAULT_INGRESS_BURST_FRAMES: f64 = 4000.0;
 const PROTOCOL_VERSION: u64 = 1; // L4: this broker's wire-format version
 const MIN_PROTO: u64 = 1; // L4: oldest peer wire-version still understood
+
+fn parse_nonnegative_f64_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .unwrap_or(default)
+}
 
 // ── DYNAMIC SPLITTING (load-based capacity-add, not just the W|E boundary-shift) ──
 // A coarse region under sustained high load SPLITS into sub-bands, each owned by a fresh
@@ -474,6 +487,9 @@ struct WorkerHandle {
     dropped: Arc<AtomicU64>, // G4 count of degradable frames dropped under backpressure (slow consumer)
     disconnect: Arc<AtomicBool>, // T1: set when this consumer hit the hard egress cap on a CRITICAL frame -> reap_disconnecting tears it down (it reconnects + re-checks-out, no silent loss)
     grid_cells: Vec<(i64, i64)>, // Interest: the spatial-hash cells this worker's AOI occupies (tracked for removal on re-interest / disconnect)
+    ingress_tokens: f64,         // Security v0: per-peer token bucket for valid inbound frames
+    ingress_last_refill: Instant,
+    ingress_rejected: u64,
 }
 
 impl WorkerHandle {
@@ -1458,6 +1474,8 @@ struct ServerState {
     rebalance_jobs: Vec<RebalanceJob>, // Hardening #1: pending budgeted-incremental split jobs (front = active)
     event_outbox: Vec<BufferedEvent>, // L1: EntityEvents buffered for the coalescing flush (storm-bounded delivery)
     load_level: u8, // L3 graceful-degradation: 0 normal / 1 stressed / 2 overloaded (derived from the egress backlog); degradation keys off this; recovers when load clears
+    ingress_rate_per_sec: f64, // Security v0: frame token refill per worker/peer
+    ingress_burst_frames: f64, // Security v0: max accumulated inbound frame tokens per worker/peer
     mesh: HashMap<String, UnboundedSender<Vec<u8>>>, // region -> link to the neighbour BROKER owning it (N-neighbour cross-broker mesh)
     // B1 cross-broker seam: entities handed EAST but not yet ACK'd by the neighbour. The forward removes
     // the entity from `entities` but parks it here (the MeshHandoff frame + when-sent) until a MeshAck
@@ -1565,6 +1583,15 @@ impl ServerState {
             rebalance_jobs: Vec::new(),
             event_outbox: Vec::new(),
             load_level: 0,
+            ingress_rate_per_sec: parse_nonnegative_f64_env(
+                "GW_INGRESS_RATE_PER_SEC",
+                DEFAULT_INGRESS_RATE_PER_SEC,
+            ),
+            ingress_burst_frames: parse_nonnegative_f64_env(
+                "GW_INGRESS_BURST_FRAMES",
+                DEFAULT_INGRESS_BURST_FRAMES,
+            )
+            .max(1.0),
             mesh: HashMap::new(),
             pending_mesh: HashMap::new(),
             mesh_regions: HashSet::new(),
@@ -2658,6 +2685,50 @@ fn reap_disconnecting(state: &mut ServerState) {
         state.workers.remove(&wid);
         println!("[T1] worker '{wid}' force-disconnected -- hard egress cap ({CHANNEL_CAP}) hit on a critical frame (slow/stuck consumer); it will reconnect + re-checkout");
     }
+}
+
+fn refill_ingress_tokens(w: &mut WorkerHandle, rate_per_sec: f64, burst_frames: f64, now: Instant) {
+    if rate_per_sec > 0.0 {
+        let elapsed = now
+            .checked_duration_since(w.ingress_last_refill)
+            .unwrap_or_default()
+            .as_secs_f64();
+        w.ingress_tokens = (w.ingress_tokens + elapsed * rate_per_sec).min(burst_frames);
+    }
+    w.ingress_last_refill = now;
+}
+
+fn reject_ingress_rate_limit(state: &mut ServerState, wid: &str, f: &Value) -> bool {
+    let rate = state.ingress_rate_per_sec;
+    let burst = state.ingress_burst_frames.max(1.0);
+    let now = Instant::now();
+    let Some(w) = state.workers.get_mut(wid) else {
+        return false;
+    };
+
+    refill_ingress_tokens(w, rate, burst, now);
+    if w.ingress_tokens >= 1.0 {
+        w.ingress_tokens -= 1.0;
+        return false;
+    }
+
+    w.ingress_rejected = w.ingress_rejected.saturating_add(1);
+    let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    emit(
+        state,
+        wid,
+        json!({
+            "op": "UpdateRejected",
+            "request_id": f.get("request_id").cloned().unwrap_or(Value::Null),
+            "entity": f.get("entity").cloned().unwrap_or(Value::Null),
+            "comp": f.get("comp").cloned().unwrap_or(Value::Null),
+            "error": "rate_limit_error",
+            "rate_limited": true,
+            "limited_op": op,
+            "reason": "rate_limit_error: ingress frame budget exceeded"
+        }),
+    );
+    true
 }
 
 // L1 event-storm: flush the buffered EntityEvents to interested workers, COALESCED by class so a 1000-event
@@ -4818,6 +4889,10 @@ fn apply_one_update(
 }
 
 fn dispatch(state: &mut ServerState, wid: &str, f: &Value) {
+    if reject_ingress_rate_limit(state, wid, f) {
+        reap_disconnecting(state);
+        return;
+    }
     dispatch_inner(state, wid, f);
     // T1: a single frame's fan-out (e.g. a critical EntityEvent to N observers) may have driven a stuck
     // consumer past the hard egress cap; reap it NOW (within this frame) so its bounded channel can hold at
@@ -5518,6 +5593,8 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     "load": state.worker_load.get(id).copied().unwrap_or(0.0),
                     "out_queue": w.out_queue.load(Ordering::Relaxed),
                     "dropped": w.dropped.load(Ordering::Relaxed),
+                    "ingress_tokens": w.ingress_tokens,
+                    "ingress_rejected": w.ingress_rejected,
                     "slow_consumer": w.out_queue.load(Ordering::Relaxed) > EGRESS_SOFT_CAP})
                 })
                 .collect();
@@ -6636,6 +6713,7 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
 
     {
         let mut s = state.lock().await;
+        let ingress_tokens = s.ingress_burst_frames.max(1.0);
         s.workers.insert(
             wid.clone(),
             WorkerHandle {
@@ -6654,6 +6732,9 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
                 dropped,
                 disconnect,
                 grid_cells: Vec::new(),
+                ingress_tokens,
+                ingress_last_refill: Instant::now(),
+                ingress_rejected: 0,
             },
         );
         update_interest_grid(&mut s, &wid); // Interest: default a fresh worker to global (no AOI yet); an Interest op re-indexes it
@@ -6911,6 +6992,7 @@ mod tests {
 
     fn add_test_worker(state: &mut ServerState, wid: &str, region: &str) {
         let (tx, _rx) = mpsc::channel(CHANNEL_CAP);
+        let ingress_tokens = state.ingress_burst_frames.max(1.0);
         state.workers.insert(
             wid.to_string(),
             WorkerHandle {
@@ -6929,6 +7011,9 @@ mod tests {
                 dropped: Arc::new(AtomicU64::new(0)),
                 disconnect: Arc::new(AtomicBool::new(false)),
                 grid_cells: Vec::new(),
+                ingress_tokens,
+                ingress_last_refill: Instant::now(),
+                ingress_rejected: 0,
             },
         );
         state
@@ -6942,6 +7027,7 @@ mod tests {
         region: &str,
     ) -> mpsc::Receiver<Vec<u8>> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+        let ingress_tokens = state.ingress_burst_frames.max(1.0);
         state.workers.insert(
             wid.to_string(),
             WorkerHandle {
@@ -6960,6 +7046,9 @@ mod tests {
                 dropped: Arc::new(AtomicU64::new(0)),
                 disconnect: Arc::new(AtomicBool::new(false)),
                 grid_cells: Vec::new(),
+                ingress_tokens,
+                ingress_last_refill: Instant::now(),
+                ingress_rejected: 0,
             },
         );
         state
@@ -7090,6 +7179,77 @@ mod tests {
             .expect("oversized header should return before reading a body");
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn ingress_rate_limit_rejects_before_dispatch_or_wal() {
+        let mut state = ServerState::new(30.0);
+        state.ingress_rate_per_sec = 0.0;
+        state.ingress_burst_frames = 2.0;
+        let mut rx = add_test_worker_with_rx(&mut state, "spam", "W");
+
+        dispatch(
+            &mut state,
+            "spam",
+            &json!({"op":"LogMessage","msg":"budget-1"}),
+        );
+        dispatch(
+            &mut state,
+            "spam",
+            &json!({"op":"LogMessage","msg":"budget-2"}),
+        );
+        dispatch(
+            &mut state,
+            "spam",
+            &json!({
+                "op":"CreateEntity",
+                "request_id":"create-after-budget",
+                "entity":"should-not-exist",
+                "components":{"pos":[-1.0,0.0],"vel":[0.0,0.0]}
+            }),
+        );
+
+        assert!(
+            !state.entities.contains_key("should-not-exist"),
+            "rate-limited CreateEntity must not reach dispatch_inner"
+        );
+        assert_eq!(state.workers["spam"].ingress_rejected, 1);
+        let reject = decode_test_frame(
+            &rx.try_recv()
+                .expect("rate-limited peer must receive a structured rejection"),
+        );
+        assert_eq!(reject["op"], "UpdateRejected");
+        assert_eq!(reject["error"], "rate_limit_error");
+        assert_eq!(reject["rate_limited"], true);
+        assert_eq!(reject["limited_op"], "CreateEntity");
+        assert_eq!(reject["request_id"], "create-after-budget");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ingress_rate_limit_refills_by_elapsed_time() {
+        let mut state = ServerState::new(30.0);
+        state.ingress_rate_per_sec = 10.0;
+        state.ingress_burst_frames = 1.0;
+        let mut rx = add_test_worker_with_rx(&mut state, "refill", "W");
+        {
+            let w = state.workers.get_mut("refill").unwrap();
+            w.ingress_tokens = 0.0;
+            w.ingress_last_refill = Instant::now() - Duration::from_millis(250);
+        }
+
+        dispatch(
+            &mut state,
+            "refill",
+            &json!({"op":"LogMessage","msg":"after-refill"}),
+        );
+
+        assert_eq!(state.workers["refill"].ingress_rejected, 0);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            state.workers["refill"].ingress_tokens < 1.0,
+            "the refilled token should be consumed by the accepted frame"
+        );
     }
 
     #[test]

@@ -43,9 +43,10 @@ The product is a server-side spatial backend plus SDKs and tooling, not a full r
 ### v0.8 — Ops and security beta
 
 - Frame size limits.
+- Basic broker ingress frame rate limits.
 - Worker/client auth.
 - Mesh auth.
-- Rate limits.
+- Broader per-principal rate-limit policy.
 - Metrics exporter.
 - Docker Compose.
 - WAL inspect/recovery CLI.
