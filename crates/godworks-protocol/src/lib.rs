@@ -4,13 +4,19 @@
 //! protocol. The existing broker still owns runtime dispatch; future hardening
 //! PRs should migrate raw JSON construction into this crate and then add codecs.
 
+pub mod json;
+
 use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId, Velocity2};
+use serde_json::Value;
 
 /// Current broker protocol version.
 pub const PROTOCOL_VERSION: u64 = 1;
 
 /// Oldest protocol version accepted by the current broker.
 pub const MIN_PROTOCOL_VERSION: u64 = 1;
+
+/// Conservative frame ceiling for future hardened readers.
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Returns whether a peer protocol version is currently supported.
 pub const fn supports_protocol(version: u64) -> bool {
@@ -109,8 +115,7 @@ pub struct CreateEntity {
 pub struct UpdateComponent {
     pub entity: EntityId,
     pub component: ComponentName,
-    /// Opaque payload placeholder until the JSON/binary codec lands.
-    pub value_debug: String,
+    pub value: Value,
     pub authority_epoch: Option<u64>,
 }
 
@@ -123,8 +128,7 @@ pub struct BatchUpdate {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BatchUpdateEntry {
     pub entity: EntityId,
-    /// Opaque payload placeholder until the JSON/binary codec lands.
-    pub value_debug: String,
+    pub value: Value,
     pub authority_epoch: Option<u64>,
 }
 
@@ -183,6 +187,34 @@ impl ProtocolError {
             message: format!(
                 "unsupported protocol version {version}; supported range is {MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION}"
             ),
+        }
+    }
+
+    pub fn malformed(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProtocolErrorKind::MalformedFrame,
+            message: message.into(),
+        }
+    }
+
+    pub fn missing_field(field: &str) -> Self {
+        Self {
+            kind: ProtocolErrorKind::MissingRequiredField,
+            message: format!("missing required field '{field}'"),
+        }
+    }
+
+    pub fn unknown_operation(op: &str) -> Self {
+        Self {
+            kind: ProtocolErrorKind::UnknownOperation,
+            message: format!("unknown operation '{op}'"),
+        }
+    }
+
+    pub fn oversized_frame(bytes: usize, max: usize) -> Self {
+        Self {
+            kind: ProtocolErrorKind::OversizedFrame,
+            message: format!("frame size {bytes} exceeds max frame size {max}"),
         }
     }
 }
