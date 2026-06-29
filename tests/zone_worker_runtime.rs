@@ -86,6 +86,38 @@ fn start_worker(
     cmd.spawn().expect("spawn zone_worker")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn start_worker_with_motion(
+    port: u16,
+    region: &str,
+    worker_id: &str,
+    spawn_n: usize,
+    spawn_box: Option<&str>,
+    spawn_vel: &str,
+    spawn_speed: &str,
+    duration: &str,
+) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zone_worker"));
+    cmd.env("GW_ZW_HOST", "127.0.0.1")
+        .env("GW_ZW_PORT", port.to_string())
+        .env("GW_ZW_REGION", region)
+        .env("GW_ZW_ID", worker_id)
+        .env("GW_ZW_SPAWN", spawn_n.to_string())
+        .env("GW_ZW_DURATION", duration)
+        .env("GW_ZW_HZ", "30")
+        .env("GW_ZW_SPAWN_VEL", spawn_vel)
+        .env("GW_ZW_SPAWN_SPEED", spawn_speed)
+        .env("GW_ZW_SEED", "4242")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(b) = spawn_box {
+        cmd.env("GW_ZW_SPAWN_BOX", b);
+    } else {
+        cmd.env_remove("GW_ZW_SPAWN_BOX");
+    }
+    cmd.spawn().expect("spawn zone_worker")
+}
+
 fn stop(child: &mut Child) {
     if child.try_wait().expect("try_wait").is_none() {
         let _ = child.kill();
@@ -287,4 +319,90 @@ fn dense_seam_with_matching_e_worker_conserves_authority() {
         100,
         "authority was not conserved across seam: W={w_owned}, E={e_owned}, frame={frame}"
     );
+}
+
+#[test]
+fn moving_w_bodies_handoff_to_e_without_rejects_or_stale_ownership() {
+    let port = free_port();
+    let mut broker = start_broker("moving_w_to_e_lifecycle", port);
+    let east = start_worker_with_motion(port, "E", "zw-E-lifecycle", 0, None, "0,0", "0", "5.0");
+    sleep(Duration::from_millis(250));
+    let west = start_worker_with_motion(
+        port,
+        "W",
+        "zw-W-lifecycle",
+        24,
+        Some("-4,-2,-1,1"),
+        "10,0",
+        "0",
+        "5.0",
+    );
+
+    let west_out = wait_output(west);
+    let east_out = wait_output(east);
+    let frame = inspector_frame(port, "moving-w-to-e");
+    stop(&mut broker);
+
+    assert!(
+        west_out.status.success(),
+        "west zone_worker failed: {:?}",
+        west_out.status
+    );
+    assert!(
+        east_out.status.success(),
+        "east zone_worker failed: {:?}",
+        east_out.status
+    );
+    let west_stderr = stderr_text(&west_out);
+    let east_stderr = stderr_text(&east_out);
+    let west_gains = count(&west_stderr, "AUTH-GAIN");
+    let west_losses = count(&west_stderr, "AUTH-LOSS");
+    let east_gains = count(&east_stderr, "AUTH-GAIN");
+
+    assert_eq!(
+        west_gains, 24,
+        "west did not gain all spawned bodies\n{west_stderr}"
+    );
+    assert_eq!(
+        west_losses, 24,
+        "west did not release every crossing body\nwest={west_stderr}\neast={east_stderr}"
+    );
+    assert!(
+        east_gains >= 24,
+        "east did not adopt the crossing bodies\nwest={west_stderr}\neast={east_stderr}"
+    );
+    assert_eq!(count(&west_stderr, "REJECTED"), 0, "{west_stderr}");
+    assert_eq!(count(&east_stderr, "REJECTED"), 0, "{east_stderr}");
+    assert_eq!(
+        parse_done_value(&west_stderr, "owned"),
+        Some(0),
+        "{west_stderr}"
+    );
+
+    let entities = frame
+        .get("entities")
+        .and_then(Value::as_array)
+        .expect("entities array");
+    let real_entities: Vec<&Value> = entities
+        .iter()
+        .filter(|e| e.get("ghost").and_then(Value::as_bool) != Some(true))
+        .collect();
+    assert_eq!(
+        real_entities.len(),
+        24,
+        "entity lifecycle lost bodies: {frame}"
+    );
+
+    for entity in real_entities {
+        let owner = entity
+            .get("authority")
+            .and_then(|a| a.get("pos"))
+            .and_then(|p| p.get("owner"))
+            .and_then(Value::as_str);
+        assert_eq!(
+            owner,
+            Some("zw-E-lifecycle"),
+            "crossed entity retained stale/non-east authority: {entity}"
+        );
+    }
 }
