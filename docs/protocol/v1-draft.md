@@ -166,6 +166,6 @@ conflict
 - [x] Add golden roundtrip tests for lifecycle/visibility and response/query/event/admin families.
 - [x] Add max frame size constant.
 - [x] Complete typed JSON coverage for the current v1 runtime operation families.
-- [ ] Wire broker frame reader to `DEFAULT_MAX_FRAME_BYTES`.
+- [x] Wire broker frame reader to `DEFAULT_MAX_FRAME_BYTES`.
 - [ ] Replace raw JSON construction in `zone_worker` with typed SDK calls.
 - [ ] Keep protocol docs synchronized with the typed enum.
