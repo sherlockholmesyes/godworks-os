@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use godworks_core::Position2;
 use godworks_protocol::json::encode_json_value;
-use godworks_protocol::{BatchUpdate, Op, UpdateRejected};
+use godworks_protocol::{AuthorityChange, BatchUpdate, Op, UpdateRejected};
 use godworks_worker_sdk::{
     batch_entry, circle_interest, create_entity_op, disconnect_op, fold_op, heartbeat_op,
     legacy_worker_connect_op, read_op, write_op,
@@ -309,12 +309,9 @@ async fn main() {
 
         // (1) drain + apply all pending ops at the tick boundary (game-loop discipline)
         while let Ok(op) = rx.try_recv() {
-            if let Op::UpdateRejected(rejected) = &op {
-                apply_update_rejected(rejected, &region, &mut rejects);
-            } else {
-                let f = encode_json_value(&op);
-                apply_op(
-                    &f,
+            match &op {
+                Op::AuthorityChange(change) => apply_authority_change(
+                    change,
                     &region,
                     &mut view_pos,
                     &mut view_vel,
@@ -326,8 +323,24 @@ async fn main() {
                     &mut mjoints,
                     radius,
                     rest,
-                    &mut rejects,
-                );
+                ),
+                Op::UpdateRejected(rejected) => {
+                    apply_update_rejected(rejected, &region, &mut rejects);
+                }
+                _ => {
+                    let f = encode_json_value(&op);
+                    apply_op(
+                        &f,
+                        &mut view_pos,
+                        &mut view_vel,
+                        &mut bots,
+                        &mut bodies,
+                        &mut islands,
+                        &mut colliders,
+                        &mut ijoints,
+                        &mut mjoints,
+                    );
+                }
             }
         }
 
@@ -526,9 +539,13 @@ fn apply_update_rejected(rejected: &UpdateRejected, region: &str, rejects: &mut 
     eprintln!("{}", update_rejected_log_line(region, rejected));
 }
 
+fn authority_extra<'a>(change: &'a AuthorityChange, key: &str) -> Option<&'a str> {
+    change.fields.fields.get(key).and_then(Value::as_str)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn apply_op(
-    f: &Value,
+fn apply_authority_change(
+    change: &AuthorityChange,
     region: &str,
     view_pos: &mut HashMap<String, [f32; 2]>,
     view_vel: &mut HashMap<String, [f32; 2]>,
@@ -540,7 +557,68 @@ fn apply_op(
     mjoints: &mut MultibodyJointSet,
     radius: f32,
     rest: f32,
-    rejects: &mut u64,
+) {
+    let eid = change.entity.as_ref().to_string();
+    let comp = change.component.as_ref();
+    // only the physics-island root component drives the body lifecycle (pos). vel rides with it.
+    if comp != "pos" && !comp.is_empty() {
+        return;
+    }
+    let epoch = change.authority_epoch;
+    // C2 pre-handoff intent: NOT a real authority change; log + ignore for the body lifecycle.
+    if authority_extra(change, "state") == Some("AUTHORITY_LOSS_IMMINENT") {
+        let tgt = authority_extra(change, "handoff_target_region").unwrap_or("?");
+        eprintln!("[zw {region}] LOSS-IMMINENT e={eid} target={tgt}");
+        return;
+    }
+    if change.authoritative {
+        // ADOPT: create a rapier body from the carried pos+vel (exactly-one-zone simulates it now).
+        if let Some(bot) = bots.get_mut(&eid) {
+            bot.epoch = epoch; // re-grant: refresh the epoch we fence writes with
+        } else {
+            let p = *view_pos.get(&eid).unwrap_or(&[0.0, 0.0]);
+            let v = *view_vel.get(&eid).unwrap_or(&[0.0, 0.0]);
+            let rb = RigidBodyBuilder::dynamic()
+                .translation(vector![p[0], p[1]])
+                .linvel(vector![v[0], v[1]])
+                .linear_damping(0.0)
+                .ccd_enabled(true)
+                .build();
+            let h = bodies.insert(rb);
+            colliders.insert_with_parent(
+                ColliderBuilder::ball(radius)
+                    .restitution(rest)
+                    .density(1.0)
+                    .build(),
+                h,
+                bodies,
+            );
+            bots.insert(eid.clone(), Bot { handle: h, epoch });
+            eprintln!(
+                "[zw {region}] AUTH-GAIN e={eid} epoch={epoch} adopt pos=[{:.3},{:.3}] vel=[{:.3},{:.3}]",
+                p[0], p[1], v[0], v[1]
+            );
+        }
+    } else if let Some(bot) = bots.remove(&eid) {
+        // LOSE: destroy the local body (the other zone owns it now).
+        destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
+        eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} destroy");
+    } else {
+        eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} (no local body)");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_op(
+    f: &Value,
+    view_pos: &mut HashMap<String, [f32; 2]>,
+    view_vel: &mut HashMap<String, [f32; 2]>,
+    bots: &mut HashMap<String, Bot>,
+    bodies: &mut RigidBodySet,
+    islands: &mut IslandManager,
+    colliders: &mut ColliderSet,
+    ijoints: &mut ImpulseJointSet,
+    mjoints: &mut MultibodyJointSet,
 ) {
     let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
     match op {
@@ -583,79 +661,6 @@ fn apply_op(
                 destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
             }
         }
-        "AuthorityChange" => {
-            let eid = f
-                .get("entity")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let comp = f.get("comp").and_then(|v| v.as_str()).unwrap_or("");
-            // only the physics-island root component drives the body lifecycle (pos). vel rides with it.
-            if comp != "pos" && !comp.is_empty() {
-                return;
-            }
-            let epoch = f
-                .get("authority_epoch")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            // C2 pre-handoff intent: NOT a real authority change — log + ignore for the body lifecycle
-            if f.get("state").and_then(|v| v.as_str()) == Some("AUTHORITY_LOSS_IMMINENT") {
-                let tgt = f
-                    .get("handoff_target_region")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                eprintln!("[zw {region}] LOSS-IMMINENT e={eid} target={tgt}");
-                return;
-            }
-            let authoritative = f
-                .get("authoritative")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if authoritative {
-                // ADOPT: create a rapier body from the carried pos+vel (exactly-one-zone simulates it now)
-                if let Some(bot) = bots.get_mut(&eid) {
-                    bot.epoch = epoch; // re-grant: refresh the epoch we fence writes with
-                } else {
-                    let p = *view_pos.get(&eid).unwrap_or(&[0.0, 0.0]);
-                    let v = *view_vel.get(&eid).unwrap_or(&[0.0, 0.0]);
-                    let rb = RigidBodyBuilder::dynamic()
-                        .translation(vector![p[0], p[1]])
-                        .linvel(vector![v[0], v[1]])
-                        .linear_damping(0.0)
-                        .ccd_enabled(true)
-                        .build();
-                    let h = bodies.insert(rb);
-                    colliders.insert_with_parent(
-                        ColliderBuilder::ball(radius)
-                            .restitution(rest)
-                            .density(1.0)
-                            .build(),
-                        h,
-                        bodies,
-                    );
-                    bots.insert(eid.clone(), Bot { handle: h, epoch });
-                    eprintln!(
-                        "[zw {region}] AUTH-GAIN e={eid} epoch={epoch} adopt pos=[{:.3},{:.3}] vel=[{:.3},{:.3}]",
-                        p[0], p[1], v[0], v[1]
-                    );
-                }
-            } else {
-                // LOSE: destroy the local body (the other zone owns it now)
-                if let Some(bot) = bots.remove(&eid) {
-                    destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
-                    eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} destroy");
-                } else {
-                    eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} (no local body)");
-                }
-            }
-        }
-        "UpdateRejected" => {
-            let eid = f.get("entity").and_then(|v| v.as_str()).unwrap_or("?");
-            let comp = f.get("comp").and_then(|v| v.as_str()).unwrap_or("?");
-            let reason = f.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
-            *rejects += 1;
-            eprintln!("[zw {region}] REJECTED e={eid} comp={comp} reason='{reason}'");
-        }
         _ => {}
     }
 }
@@ -673,6 +678,17 @@ mod tests {
     use super::*;
     use godworks_protocol::JsonFields;
     use serde_json::Map;
+
+    fn add_test_bot(
+        eid: &str,
+        epoch: u64,
+        bots: &mut HashMap<String, Bot>,
+        bodies: &mut RigidBodySet,
+    ) -> RigidBodyHandle {
+        let handle = bodies.insert(RigidBodyBuilder::dynamic().build());
+        bots.insert(eid.to_string(), Bot { handle, epoch });
+        handle
+    }
 
     #[test]
     fn typed_update_rejected_uses_struct_fields_not_raw_json_bridge_fields() {
@@ -696,5 +712,95 @@ mod tests {
         let mut rejects = 0;
         apply_update_rejected(&rejected, "W", &mut rejects);
         assert_eq!(rejects, 1);
+    }
+
+    #[test]
+    fn typed_authority_loss_uses_struct_fields_not_raw_json_bridge_fields() {
+        let mut fields = Map::new();
+        fields.insert("entity".to_string(), json!("raw-entity"));
+        fields.insert("comp".to_string(), json!("gameplay"));
+        fields.insert("authoritative".to_string(), json!(true));
+        fields.insert("authority_epoch".to_string(), json!(99));
+
+        let change = AuthorityChange {
+            entity: "typed-entity".into(),
+            component: "pos".into(),
+            authoritative: false,
+            authority_epoch: 7,
+            mode: "server_physics_island".to_string(),
+            fields: JsonFields { fields },
+        };
+
+        let mut view_pos = HashMap::new();
+        let mut view_vel = HashMap::new();
+        let mut bots = HashMap::new();
+        let mut bodies = RigidBodySet::new();
+        let mut islands = IslandManager::new();
+        let mut colliders = ColliderSet::new();
+        let mut ijoints = ImpulseJointSet::new();
+        let mut mjoints = MultibodyJointSet::new();
+        let handle = add_test_bot("typed-entity", 1, &mut bots, &mut bodies);
+
+        apply_authority_change(
+            &change,
+            "W",
+            &mut view_pos,
+            &mut view_vel,
+            &mut bots,
+            &mut bodies,
+            &mut islands,
+            &mut colliders,
+            &mut ijoints,
+            &mut mjoints,
+            0.5,
+            0.9,
+        );
+
+        assert!(!bots.contains_key("typed-entity"));
+        assert!(bodies.get(handle).is_none());
+    }
+
+    #[test]
+    fn typed_authority_loss_imminent_metadata_does_not_destroy_body() {
+        let mut fields = Map::new();
+        fields.insert("state".to_string(), json!("AUTHORITY_LOSS_IMMINENT"));
+        fields.insert("handoff_target_region".to_string(), json!("E"));
+
+        let change = AuthorityChange {
+            entity: "ship".into(),
+            component: "pos".into(),
+            authoritative: false,
+            authority_epoch: 8,
+            mode: "server_physics_island".to_string(),
+            fields: JsonFields { fields },
+        };
+
+        let mut view_pos = HashMap::new();
+        let mut view_vel = HashMap::new();
+        let mut bots = HashMap::new();
+        let mut bodies = RigidBodySet::new();
+        let mut islands = IslandManager::new();
+        let mut colliders = ColliderSet::new();
+        let mut ijoints = ImpulseJointSet::new();
+        let mut mjoints = MultibodyJointSet::new();
+        let handle = add_test_bot("ship", 8, &mut bots, &mut bodies);
+
+        apply_authority_change(
+            &change,
+            "W",
+            &mut view_pos,
+            &mut view_vel,
+            &mut bots,
+            &mut bodies,
+            &mut islands,
+            &mut colliders,
+            &mut ijoints,
+            &mut mjoints,
+            0.5,
+            0.9,
+        );
+
+        assert!(bots.contains_key("ship"));
+        assert!(bodies.get(handle).is_some());
     }
 }
