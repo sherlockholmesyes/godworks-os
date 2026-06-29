@@ -57,8 +57,11 @@ The broker must reject peers outside its supported protocol range and return a s
 | Op | Direction | Persistent | Purpose |
 |---|---|---:|---|
 | `CreateEntity` | worker -> broker | yes | Create/register an entity. |
+| `CreateEntityResponse` | broker -> worker | no | Create result when a request id is supplied. |
 | `DeleteEntity` | worker -> broker | yes | Tombstone/delete an entity. |
+| `DeleteEntityResponse` | broker -> worker | no | Delete result when a request id is supplied. |
 | `ReserveEntityIds` | worker -> broker | yes | Reserve monotonic entity id range. |
+| `ReserveEntityIdsResponse` | broker -> worker | no | Reserved id range response. |
 
 ### Component writes
 
@@ -69,6 +72,7 @@ The broker must reject peers outside its supported protocol range and return a s
 | `AddComponent` | worker -> broker | yes | Add a dynamic component. |
 | `RemoveComponent` | worker -> broker | yes | Remove a dynamic component. |
 | `SetComponentAuthority` | admin/kernel worker -> broker | yes | Change owner/mode/epoch of a component. |
+| `SetComponentAuthorityResponse` | broker -> admin/kernel worker | no | Authority-change result. |
 | `UpdateRejected` | broker -> peer | no | Structured rejection for authority, ACL, WAL, protocol, or rate-limit failures. |
 
 ### Authority and handoff
@@ -78,6 +82,7 @@ The broker must reject peers outside its supported protocol range and return a s
 | `AuthorityChange` | broker -> worker/client | no | Grant/revoke authority or warn of imminent loss. |
 | `Fold` | worker -> broker | yes | Portal/non-local region transfer request by current owner. |
 | `ThresholdTx` | worker -> broker | yes | Prepare/preload/commit/adopt/abort threshold transition. |
+| `ThresholdTxResponse` | broker -> worker | no | Threshold transaction response when a request id is supplied. |
 
 ### Mesh
 
@@ -99,6 +104,7 @@ The broker must reject peers outside its supported protocol range and return a s
 | `EntityEvent` | owner -> broker -> interested peers | no | Transient event delivered through interest channel. |
 | `FlagUpdate` | peer -> broker -> peers | no | Broadcast runtime flag. |
 | `Metrics` | worker -> broker | no | Worker load input for rebalancing. |
+| `LogMessage` | peer -> broker | no | Log/dev message accepted by broker and ignored. |
 
 ### Inspector/admin
 
@@ -108,47 +114,22 @@ The broker must reject peers outside its supported protocol range and return a s
 | `InspectorFrame` | broker -> inspector | no | Debug/ops state frame. |
 | `SnapshotMarker` | admin -> broker | yes | Mark coordinated snapshot/restore boundary. |
 
-## JSON codec bootstrap coverage
+## JSON codec coverage
 
-The first typed JSON codec covers the operations needed to stabilize the worker/mesh SDK path:
+The typed JSON codec now covers the current v1 runtime wire in two layers:
 
-- `WorkerConnect`
-- `Disconnect`
-- `Heartbeat`
-- `Interest`
-- `CreateEntity`
-- `UpdateComponent`
-- `BatchUpdate`
-- `AuthorityChange`
-- `UpdateRejected`
-- `MeshHandoff`
-- `MeshAck`
-- `Health`
+1. Structured typed fields for the stable/loss-sensitive lifecycle and visibility path, including rich `CreateEntity.components` preservation.
+2. Lossless operation-specific JSON field bags for response/query/event/admin families whose payloads are still broad runtime JSON and must not be narrowed before SDK work.
 
-Remaining operations still need typed coverage before SDK migration is complete:
+Covered operation families:
 
-- `AddEntity`
-- `RemoveEntity`
-- `CriticalSection`
-- `DeleteEntity`
-- `ReserveEntityIds`
-- `AddComponent`
-- `RemoveComponent`
-- `SetComponentAuthority`
-- `Fold`
-- `ThresholdTx`
-- `MeshGhost`
-- `MeshGhostRemove`
-- `EntityQuery`
-- `EntityQueryResponse`
-- `CommandRequest`
-- `CommandResponse`
-- `EntityEvent`
-- `FlagUpdate`
-- `Metrics`
-- `InspectorQuery`
-- `InspectorFrame`
-- `SnapshotMarker`
+- connection/liveness: `WorkerConnect`, `Disconnect`, `Heartbeat`, `Health`
+- visibility/interest: `Interest`, `CriticalSection`, `AddEntity`, `RemoveEntity`, `ComponentUpdate`
+- lifecycle: `CreateEntity`, `CreateEntityResponse`, `DeleteEntity`, `DeleteEntityResponse`, `ReserveEntityIds`, `ReserveEntityIdsResponse`
+- components/authority: `AddComponent`, `RemoveComponent`, `UpdateComponent`, `BatchUpdate`, `SetComponentAuthority`, `SetComponentAuthorityResponse`, `AuthorityChange`, `UpdateRejected`
+- handoff/mesh: `Fold`, `ThresholdTx`, `ThresholdTxResponse`, `MeshHandoff`, `MeshAck`, `MeshGhost`, `MeshGhostRemove`
+- query/commands/events: `EntityQuery`, `EntityQueryResponse`, `CommandRequest`, `CommandResponse`, `EntityEvent`, `FlagUpdate`, `Metrics`, `LogMessage`
+- inspector/admin: `InspectorQuery`, `InspectorFrame`, `SnapshotMarker`
 
 ## Persistent-operation rule
 
@@ -181,10 +162,10 @@ conflict
 
 - [x] Add `godworks-protocol` crate.
 - [x] Define initial `Op` enum.
-- [x] Add initial JSON codec for current wire compatibility.
-- [x] Add first golden roundtrip tests.
+- [x] Add JSON codec for current wire compatibility.
+- [x] Add golden roundtrip tests for lifecycle/visibility and response/query/event/admin families.
 - [x] Add max frame size constant.
-- [ ] Complete typed coverage for every protocol operation.
+- [x] Complete typed JSON coverage for the current v1 runtime operation families.
 - [ ] Wire broker frame reader to `DEFAULT_MAX_FRAME_BYTES`.
 - [ ] Replace raw JSON construction in `zone_worker` with typed SDK calls.
 - [ ] Keep protocol docs synchronized with the typed enum.
