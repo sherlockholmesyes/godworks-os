@@ -9,9 +9,9 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     AddComponent, AddEntity, AuthorityChange, BatchUpdate, BatchUpdateEntry, CommandRequest,
-    CommandResponse, CreateEntity, CreateEntityResponse, CriticalSection, DeleteEntity,
-    DeleteEntityResponse, EntityEvent, EntityQuery, EntityQueryResponse, FlagUpdate, Fold,
-    Heartbeat, InspectorFrame, InspectorQuery, Interest, JsonFields, LogMessage, MeshAck,
+    CommandResponse, ComponentUpdate, CreateEntity, CreateEntityResponse, CriticalSection,
+    DeleteEntity, DeleteEntityResponse, EntityEvent, EntityQuery, EntityQueryResponse, FlagUpdate,
+    Fold, Heartbeat, InspectorFrame, InspectorQuery, Interest, JsonFields, LogMessage, MeshAck,
     MeshGhost, MeshGhostRemove, MeshHandoff, Metrics, Op, ProtocolError, RemoveComponent,
     RemoveEntity, ReserveEntityIds, ReserveEntityIdsResponse, SetComponentAuthority,
     SetComponentAuthorityResponse, SnapshotMarker, ThresholdTx, ThresholdTxResponse,
@@ -73,6 +73,9 @@ pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
             authority_epoch: authority_epoch(value),
         })),
         "UpdateComponent" => decode_update_component(value),
+        "ComponentUpdate" => Ok(Op::ComponentUpdate(ComponentUpdate {
+            fields: json_fields(value),
+        })),
         "BatchUpdate" => decode_batch_update(value),
         "SetComponentAuthority" => Ok(Op::SetComponentAuthority(SetComponentAuthority {
             fields: json_fields(value),
@@ -169,6 +172,7 @@ pub fn encode_json_value(op: &Op) -> Value {
         Op::AddComponent(op) => encode_add_component(op),
         Op::RemoveComponent(op) => encode_remove_component(op),
         Op::UpdateComponent(op) => encode_update_component(op),
+        Op::ComponentUpdate(op) => encode_json_fields("ComponentUpdate", &op.fields),
         Op::BatchUpdate(op) => encode_batch_update(op),
         Op::SetComponentAuthority(op) => encode_json_fields("SetComponentAuthority", &op.fields),
         Op::SetComponentAuthorityResponse(op) => {
@@ -682,6 +686,17 @@ mod tests {
             "comp": "pos",
             "value": [12.5, -3.0],
             "authority_epoch": 42,
+        }));
+    }
+
+    #[test]
+    fn component_update_visibility_frame_roundtrips() {
+        assert_roundtrip(json!({
+            "op": "ComponentUpdate",
+            "entity": "ship-1",
+            "comp": "pos",
+            "value": [12.5, -3.0],
+            "fidelity": "coarse",
         }));
     }
 
