@@ -54,7 +54,7 @@ pub fn encode_json_value(op: &Op) -> Value {
                 obj.insert("proto".to_string(), json!(proto));
             }
             if !op.attributes.is_empty() {
-                obj.insert("attributes".to_string(), json!(op.attributes));
+                obj.insert("attributes".to_string(), json!(&op.attributes));
             }
             Value::Object(obj)
         }
@@ -95,8 +95,8 @@ pub fn encode_json_value(op: &Op) -> Value {
                 .updates
                 .iter()
                 .map(|entry| match entry.authority_epoch {
-                    Some(epoch) => json!([entry.entity.as_ref(), entry.value, epoch]),
-                    None => json!([entry.entity.as_ref(), entry.value]),
+                    Some(epoch) => json!([entry.entity.as_ref(), entry.value.clone(), epoch]),
+                    None => json!([entry.entity.as_ref(), entry.value.clone()]),
                 })
                 .collect();
             json!({ "op": "BatchUpdate", "comp": op.component.as_ref(), "updates": updates })
@@ -107,7 +107,7 @@ pub fn encode_json_value(op: &Op) -> Value {
             "comp": op.component.as_ref(),
             "authoritative": op.authoritative,
             "authority_epoch": op.authority_epoch,
-            "mode": op.mode,
+            "mode": op.mode.as_str(),
         }),
         Op::UpdateRejected(op) => {
             let mut obj = object_with_op("UpdateRejected");
@@ -117,7 +117,7 @@ pub fn encode_json_value(op: &Op) -> Value {
             if let Some(component) = &op.component {
                 obj.insert("comp".to_string(), json!(component.as_ref()));
             }
-            obj.insert("reason".to_string(), json!(op.reason));
+            obj.insert("reason".to_string(), json!(op.reason.as_str()));
             Value::Object(obj)
         }
         Op::MeshHandoff(op) => {
@@ -383,7 +383,7 @@ fn vel2_from_value(value: &Value) -> Velocity2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PROTOCOL_VERSION, ProtocolErrorKind};
+    use crate::{ProtocolErrorKind, PROTOCOL_VERSION};
 
     #[test]
     fn worker_connect_json_roundtrips() {
