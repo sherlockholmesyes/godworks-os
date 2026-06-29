@@ -446,44 +446,37 @@ mod tests {
         let (mut broker_stream, worker_stream) = duplex(8192);
         let mut worker = WorkerSession::new(worker_stream);
 
-        write_op(
-            &mut broker_stream,
-            &decode_frame_payload(
-                json!({
-                    "op": "AuthorityChange",
-                    "entity": "ship",
-                    "comp": "pos",
-                    "authoritative": false,
-                    "authority_epoch": 12,
-                    "mode": "server_physics_island",
-                    "state": "AUTHORITY_LOSS_IMMINENT",
-                    "handoff_target": "zw-E",
-                    "handoff_target_region": "E"
-                })
-                .to_string()
-                .as_bytes(),
-            )
-            .unwrap(),
+        let authority_op = decode_frame_payload(
+            json!({
+                "op": "AuthorityChange",
+                "entity": "ship",
+                "comp": "pos",
+                "authoritative": false,
+                "authority_epoch": 12,
+                "mode": "server_physics_island",
+                "state": "AUTHORITY_LOSS_IMMINENT",
+                "handoff_target": "zw-E",
+                "handoff_target_region": "E"
+            })
+            .to_string()
+            .as_bytes(),
         )
-        .await
         .unwrap();
-        write_op(
-            &mut broker_stream,
-            &decode_frame_payload(
-                json!({
-                    "op": "EntityEvent",
-                    "entity": "ship",
-                    "event": "StatusChanged",
-                    "payload": { "hp": 80 },
-                    "gen": 3
-                })
-                .to_string()
-                .as_bytes(),
-            )
-            .unwrap(),
+        write_op(&mut broker_stream, &authority_op).await.unwrap();
+
+        let event_op = decode_frame_payload(
+            json!({
+                "op": "EntityEvent",
+                "entity": "ship",
+                "event": "StatusChanged",
+                "payload": { "hp": 80 },
+                "gen": 3
+            })
+            .to_string()
+            .as_bytes(),
         )
-        .await
         .unwrap();
+        write_op(&mut broker_stream, &event_op).await.unwrap();
 
         let first = worker.recv_frame().await.unwrap().unwrap();
         assert_eq!(first.kind(), WorkerFrameKind::AuthorityChange);
