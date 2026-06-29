@@ -26,9 +26,9 @@ Excluded:
 The SDK wraps the protocol boundary. It must not reintroduce ad-hoc raw JSON as the user-facing API, and it must not drop fields from broad runtime frames.
 
 ```text
-wrong A: build SDK before protocol boundary is lossless
-wrong B: SDK helpers silently discard broad frame metadata
-third wrong: a convenient API that hides correctness bugs
+failure mode A: build SDK helpers before the protocol boundary is lossless
+failure mode B: SDK helpers silently discard broad frame metadata
+guarded target state: a convenient API that keeps correctness bugs visible
 ```
 
 ## Minimal flow
