@@ -133,21 +133,22 @@ fn stderr_text(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-fn count(haystack: &str, needle: &str) -> usize {
-    haystack.matches(needle).count()
-}
-
-fn parse_done_value(stderr: &str, key: &str) -> Option<usize> {
-    let done = stderr
+fn parse_summary(stderr: &str) -> Value {
+    const PREFIX: &str = "zone_worker_summary ";
+    let line = stderr
         .lines()
         .rev()
-        .find(|line| line.contains("done tick="))?;
-    for part in done.split_whitespace() {
-        if let Some(v) = part.strip_prefix(&format!("{key}=")) {
-            return v.parse().ok();
-        }
-    }
-    None
+        .find(|line| line.starts_with(PREFIX))
+        .unwrap_or_else(|| panic!("missing zone_worker_summary line\n{stderr}"));
+    serde_json::from_str(line.trim_start_matches(PREFIX))
+        .unwrap_or_else(|err| panic!("invalid zone_worker_summary json: {err}\nline={line}"))
+}
+
+fn summary_usize(summary: &Value, key: &str) -> usize {
+    summary
+        .get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("summary missing numeric key {key}: {summary}")) as usize
 }
 
 fn extract_eid(line: &str) -> Option<String> {
@@ -220,11 +221,12 @@ fn create_storm_named_region_every_created_entity_ends_owned() {
     stop(&mut broker);
     assert!(out.status.success(), "zone_worker failed: {:?}", out.status);
     let stderr = stderr_text(&out);
-    assert_eq!(count(&stderr, "AUTH-GAIN"), 100, "{stderr}");
-    assert_eq!(count(&stderr, "AUTH-LOSS"), 0, "{stderr}");
-    assert_eq!(count(&stderr, "REJECTED"), 0, "{stderr}");
-    assert_eq!(parse_done_value(&stderr, "owned"), Some(100), "{stderr}");
-    assert_eq!(parse_done_value(&stderr, "rejects"), Some(0), "{stderr}");
+    let summary = parse_summary(&stderr);
+    assert_eq!(summary.get("region").and_then(Value::as_str), Some("EARTH"));
+    assert_eq!(summary_usize(&summary, "auth_gain"), 100, "{stderr}");
+    assert_eq!(summary_usize(&summary, "auth_loss"), 0, "{stderr}");
+    assert_eq!(summary_usize(&summary, "rejects"), 0, "{stderr}");
+    assert_eq!(summary_usize(&summary, "owned"), 100, "{stderr}");
 }
 
 #[test]
@@ -355,29 +357,26 @@ fn moving_w_bodies_handoff_to_e_without_rejects_or_stale_ownership() {
     );
     let west_stderr = stderr_text(&west_out);
     let east_stderr = stderr_text(&east_out);
-    let west_gains = count(&west_stderr, "AUTH-GAIN");
-    let west_losses = count(&west_stderr, "AUTH-LOSS");
-    let east_gains = count(&east_stderr, "AUTH-GAIN");
+    let west_summary = parse_summary(&west_stderr);
+    let east_summary = parse_summary(&east_stderr);
 
     assert_eq!(
-        west_gains, 24,
+        summary_usize(&west_summary, "auth_gain"),
+        24,
         "west did not gain all spawned bodies\n{west_stderr}"
     );
     assert_eq!(
-        west_losses, 24,
+        summary_usize(&west_summary, "auth_loss"),
+        24,
         "west did not release every crossing body\nwest={west_stderr}\neast={east_stderr}"
     );
     assert!(
-        east_gains >= 24,
+        summary_usize(&east_summary, "auth_gain") >= 24,
         "east did not adopt the crossing bodies\nwest={west_stderr}\neast={east_stderr}"
     );
-    assert_eq!(count(&west_stderr, "REJECTED"), 0, "{west_stderr}");
-    assert_eq!(count(&east_stderr, "REJECTED"), 0, "{east_stderr}");
-    assert_eq!(
-        parse_done_value(&west_stderr, "owned"),
-        Some(0),
-        "{west_stderr}"
-    );
+    assert_eq!(summary_usize(&west_summary, "rejects"), 0, "{west_stderr}");
+    assert_eq!(summary_usize(&east_summary, "rejects"), 0, "{east_stderr}");
+    assert_eq!(summary_usize(&west_summary, "owned"), 0, "{west_stderr}");
 
     let entities = frame
         .get("entities")
