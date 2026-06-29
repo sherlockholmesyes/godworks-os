@@ -92,6 +92,7 @@ pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
                 .or_else(|| optional_str(value, "component"))
                 .map(ComponentName::from),
             reason: optional_str(value, "reason").unwrap_or("").to_string(),
+            fields: json_fields(value),
         })),
         "Fold" => Ok(Op::Fold(Fold {
             fields: json_fields(value),
@@ -342,6 +343,7 @@ fn decode_authority_change(value: &Value) -> Result<Op, ProtocolError> {
             .unwrap_or(false),
         authority_epoch: authority_epoch(value).unwrap_or(0),
         mode: optional_str(value, "mode").unwrap_or("").to_string(),
+        fields: json_fields(value),
     }))
 }
 
@@ -361,6 +363,7 @@ fn decode_mesh_handoff(value: &Value) -> Result<Op, ProtocolError> {
         authority_epoch: authority_epoch(value),
         lease_epoch: optional_u64(value, "lease_epoch"),
         source_durable_gen: optional_u64(value, "source_durable_gen"),
+        fields: json_fields(value),
     }))
 }
 
@@ -517,6 +520,10 @@ fn encode_batch_update(op: &BatchUpdate) -> Value {
 }
 
 fn encode_authority_change(op: &AuthorityChange) -> Value {
+    if !op.fields.fields.is_empty() {
+        return encode_json_fields("AuthorityChange", &op.fields);
+    }
+
     json!({
         "op": "AuthorityChange",
         "entity": op.entity.as_ref(),
@@ -528,6 +535,10 @@ fn encode_authority_change(op: &AuthorityChange) -> Value {
 }
 
 fn encode_update_rejected(op: &UpdateRejected) -> Value {
+    if !op.fields.fields.is_empty() {
+        return encode_json_fields("UpdateRejected", &op.fields);
+    }
+
     let mut obj = object_with_op("UpdateRejected");
     if let Some(entity) = &op.entity {
         obj.insert("entity".to_string(), json!(entity.as_ref()));
@@ -540,6 +551,10 @@ fn encode_update_rejected(op: &UpdateRejected) -> Value {
 }
 
 fn encode_mesh_handoff(op: &MeshHandoff) -> Value {
+    if !op.fields.fields.is_empty() {
+        return encode_json_fields("MeshHandoff", &op.fields);
+    }
+
     let mut obj = object_with_op("MeshHandoff");
     obj.insert("entity".to_string(), json!(op.entity.as_ref()));
     if let Some(source) = &op.source_region {
@@ -797,6 +812,61 @@ mod tests {
             "entity": "ship-1",
             "comp": "health",
             "authority_epoch": 6,
+        }));
+    }
+
+    #[test]
+    fn mesh_handoff_preserves_authority_and_components() {
+        assert_roundtrip(json!({
+            "op": "MeshHandoff",
+            "entity": "ship",
+            "source_region": "W",
+            "target": "E",
+            "pos": [1.0, 2.0],
+            "vel": [3.0, 4.0],
+            "authority_epoch": 9,
+            "lease_epoch": 11,
+            "source_durable_gen": 12,
+            "authority": {
+                "pos": {
+                    "owner": "zw-E",
+                    "epoch": 9,
+                    "mode": "server_physics_island"
+                }
+            },
+            "components": {
+                "mass": 2.0,
+                "kind": "projectile"
+            }
+        }));
+    }
+
+    #[test]
+    fn authority_change_preserves_loss_imminent_metadata() {
+        assert_roundtrip(json!({
+            "op": "AuthorityChange",
+            "entity": "ship",
+            "comp": "pos",
+            "authoritative": false,
+            "authority_epoch": 12,
+            "mode": "server_physics_island",
+            "state": "AUTHORITY_LOSS_IMMINENT",
+            "handoff_target": "zw-E",
+            "handoff_target_region": "E",
+        }));
+    }
+
+    #[test]
+    fn update_rejected_preserves_admin_stale_ghost_metadata() {
+        assert_roundtrip(json!({
+            "op": "UpdateRejected",
+            "request_id": "admin-1",
+            "entity": "ship",
+            "comp": "pos",
+            "reason": "stale authority epoch",
+            "authority_epoch": 13,
+            "ghost": true,
+            "owner_region": "E",
         }));
     }
 
