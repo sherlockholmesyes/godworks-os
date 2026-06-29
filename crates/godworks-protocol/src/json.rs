@@ -8,9 +8,9 @@ use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId, 
 use serde_json::{json, Map, Value};
 
 use crate::{
-    supports_protocol, AuthorityChange, BatchUpdate, BatchUpdateEntry, CreateEntity, Heartbeat,
-    Interest, MeshAck, MeshHandoff, Op, ProtocolError, UpdateComponent, UpdateRejected,
-    WorkerConnect,
+    AuthorityChange, BatchUpdate, BatchUpdateEntry, CreateEntity, Heartbeat, Interest, MeshAck,
+    MeshHandoff, Op, ProtocolError, UpdateComponent, UpdateRejected, WorkerConnect,
+    supports_protocol,
 };
 
 /// Decode a JSON operation body into the typed v1 operation model.
@@ -404,7 +404,7 @@ fn vel2_from_value(value: &Value) -> Velocity2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProtocolErrorKind, PROTOCOL_VERSION};
+    use crate::{PROTOCOL_VERSION, ProtocolErrorKind};
 
     #[test]
     fn worker_connect_json_roundtrips() {
