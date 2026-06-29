@@ -11,10 +11,10 @@ just gate
 Expected commands:
 
 - `cargo fmt --all -- --check`
-- `cargo check --all-targets`
-- `cargo clippy --all-targets`
-- `cargo test --all-targets`
-- `cargo build --release`
+- `cargo check --workspace --all-targets`
+- `cargo clippy --workspace --all-targets`
+- `cargo test --workspace --all-targets`
+- `cargo build --workspace --release`
 
 ## Runtime smoke test
 
