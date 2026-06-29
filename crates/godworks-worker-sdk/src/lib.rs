@@ -359,37 +359,34 @@ mod tests {
     use serde_json::json;
     use tokio::io::duplex;
 
-    fn assert_payload_roundtrip(value: Value) -> Op {
-        let op = decode_frame_payload(value.to_string().as_bytes()).unwrap();
-        assert_eq!(encode_json_value(&op), value);
+    fn value(src: &str) -> Value {
+        serde_json::from_str(src).unwrap()
+    }
+
+    fn assert_payload_roundtrip(src: &str) -> Op {
+        let expected = value(src);
+        let op = decode_frame_payload(src.as_bytes()).unwrap();
+        assert_eq!(encode_json_value(&op), expected);
         op
     }
 
     #[test]
     fn mesh_handoff_authority_components_roundtrip_losslessly() {
-        let value = json!({
-            "op": "MeshHandoff",
-            "entity": "ship",
-            "source_region": "W",
-            "target": "E",
-            "pos": [1.0, 2.0],
-            "vel": [3.0, 4.0],
-            "authority_epoch": 9,
-            "lease_epoch": 11,
-            "source_durable_gen": 12,
-            "authority": {
-                "pos": {
-                    "owner": "zw-E",
-                    "epoch": 9,
-                    "mode": "server_physics_island"
-                }
-            },
-            "components": {
-                "mass": 2.0,
-                "kind": "projectile"
-            }
-        });
-        let op = assert_payload_roundtrip(value);
+        let op = assert_payload_roundtrip(
+            r#"{
+                "op":"MeshHandoff",
+                "entity":"ship",
+                "source_region":"W",
+                "target":"E",
+                "pos":[1.0,2.0],
+                "vel":[3.0,4.0],
+                "authority_epoch":9,
+                "lease_epoch":11,
+                "source_durable_gen":12,
+                "authority":{"pos":{"owner":"zw-E","epoch":9,"mode":"server_physics_island"}},
+                "components":{"mass":2.0,"kind":"projectile"}
+            }"#,
+        );
         let frame = WorkerFrame::new(op);
         assert_eq!(frame.kind(), WorkerFrameKind::MeshHandoff);
         assert!(frame.mesh_handoff().is_some());
@@ -397,27 +394,31 @@ mod tests {
 
     #[test]
     fn authority_loss_and_update_rejected_metadata_roundtrip_losslessly() {
-        assert_payload_roundtrip(json!({
-            "op": "AuthorityChange",
-            "entity": "ship",
-            "comp": "pos",
-            "authoritative": false,
-            "authority_epoch": 12,
-            "mode": "server_physics_island",
-            "state": "AUTHORITY_LOSS_IMMINENT",
-            "handoff_target": "zw-E",
-            "handoff_target_region": "E"
-        }));
-        assert_payload_roundtrip(json!({
-            "op": "UpdateRejected",
-            "request_id": "admin-1",
-            "entity": "ship",
-            "comp": "pos",
-            "reason": "stale authority epoch",
-            "authority_epoch": 13,
-            "ghost": true,
-            "owner_region": "E"
-        }));
+        assert_payload_roundtrip(
+            r#"{
+                "op":"AuthorityChange",
+                "entity":"ship",
+                "comp":"pos",
+                "authoritative":false,
+                "authority_epoch":12,
+                "mode":"server_physics_island",
+                "state":"AUTHORITY_LOSS_IMMINENT",
+                "handoff_target":"zw-E",
+                "handoff_target_region":"E"
+            }"#,
+        );
+        assert_payload_roundtrip(
+            r#"{
+                "op":"UpdateRejected",
+                "request_id":"admin-1",
+                "entity":"ship",
+                "comp":"pos",
+                "reason":"stale authority epoch",
+                "authority_epoch":13,
+                "ghost":true,
+                "owner_region":"E"
+            }"#,
+        );
     }
 
     #[tokio::test]
@@ -466,32 +467,30 @@ mod tests {
         let mut worker = WorkerSession::new(worker_stream);
 
         let authority_op = decode_frame_payload(
-            json!({
-                "op": "AuthorityChange",
-                "entity": "ship",
-                "comp": "pos",
-                "authoritative": false,
-                "authority_epoch": 12,
-                "mode": "server_physics_island",
-                "state": "AUTHORITY_LOSS_IMMINENT",
-                "handoff_target": "zw-E",
-                "handoff_target_region": "E"
-            })
-            .to_string()
+            r#"{
+                "op":"AuthorityChange",
+                "entity":"ship",
+                "comp":"pos",
+                "authoritative":false,
+                "authority_epoch":12,
+                "mode":"server_physics_island",
+                "state":"AUTHORITY_LOSS_IMMINENT",
+                "handoff_target":"zw-E",
+                "handoff_target_region":"E"
+            }"#
             .as_bytes(),
         )
         .unwrap();
         write_op(&mut broker_stream, &authority_op).await.unwrap();
 
         let event_op = decode_frame_payload(
-            json!({
-                "op": "EntityEvent",
-                "entity": "ship",
-                "event": "StatusChanged",
-                "payload": { "hp": 80 },
-                "gen": 3
-            })
-            .to_string()
+            r#"{
+                "op":"EntityEvent",
+                "entity":"ship",
+                "event":"StatusChanged",
+                "payload":{"hp":80},
+                "gen":3
+            }"#
             .as_bytes(),
         )
         .unwrap();
@@ -500,7 +499,12 @@ mod tests {
         let first = worker.recv_frame().await.unwrap().unwrap();
         assert_eq!(first.kind(), WorkerFrameKind::AuthorityChange);
         assert_eq!(
-            first.authority_change().unwrap().fields.fields.get("state"),
+            first
+                .authority_change()
+                .unwrap()
+                .fields
+                .fields
+                .get("state"),
             Some(&json!("AUTHORITY_LOSS_IMMINENT"))
         );
 
