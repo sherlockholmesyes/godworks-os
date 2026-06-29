@@ -14,10 +14,10 @@ Equivalent commands:
 
 ```bash
 cargo fmt --all -- --check
-cargo check --all-targets
-cargo clippy --all-targets
-cargo test --all-targets
-cargo build --release
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets
+cargo test --workspace --all-targets
+cargo build --workspace --release
 ```
 
 ## Change rules
@@ -46,7 +46,7 @@ Any new wire operation or field must update:
 - No global world-state mutation before authority checks.
 - No broker-to-broker handoff without durable source-side state.
 - No ghost entity may ever receive authoritative grants.
-- No security-sensitive component may be mutable by an unprivileged worker.
+- Privileged components must not be mutable by an unprivileged worker.
 
 ## Documentation rules
 
