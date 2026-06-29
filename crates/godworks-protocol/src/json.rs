@@ -169,7 +169,9 @@ pub fn encode_json_value(op: &Op) -> Value {
         Op::DeleteEntity(op) => encode_delete_entity(op),
         Op::DeleteEntityResponse(op) => encode_json_fields("DeleteEntityResponse", &op.fields),
         Op::ReserveEntityIds(op) => encode_reserve_entity_ids(op),
-        Op::ReserveEntityIdsResponse(op) => encode_json_fields("ReserveEntityIdsResponse", &op.fields),
+        Op::ReserveEntityIdsResponse(op) => {
+            encode_json_fields("ReserveEntityIdsResponse", &op.fields)
+        }
         Op::AddComponent(op) => encode_add_component(op),
         Op::RemoveComponent(op) => encode_remove_component(op),
         Op::UpdateComponent(op) => encode_update_component(op),
@@ -237,7 +239,9 @@ fn decode_worker_connect(value: &Value) -> Result<Op, ProtocolError> {
 fn decode_interest(value: &Value) -> Result<Op, ProtocolError> {
     let center = optional_array2(value, "center");
     let radius = optional_f64(value, "radius");
-    let aoi = center.zip(radius).map(|(center, radius)| Aoi2::Circle { center, radius });
+    let aoi = center
+        .zip(radius)
+        .map(|(center, radius)| Aoi2::Circle { center, radius });
 
     Ok(Op::Interest(Interest {
         aoi,
