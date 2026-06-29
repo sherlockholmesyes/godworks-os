@@ -16,6 +16,8 @@ The broker is only healthy after a real load window if:
 
 The existing `Health` op returns `HealthFrame` over the same length-prefixed JSON worker protocol as every other broker operation. No HTTP side channel is required.
 
+`reality_loadgen` connects health probes as `region=MESH` control workers with a `health` attribute. They are not observers and do not receive interest checkout traffic before the `HealthFrame`; otherwise a large post-handoff checkout burst can hide the liveness answer behind unrelated `AddEntity` / `ComponentUpdate` frames.
+
 `HealthFrame` includes:
 
 - `monitor_ticks`

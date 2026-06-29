@@ -16,7 +16,7 @@
 //!                  as the honest no-spare dead-end; metrics{handoffs,applies,failovers}.
 //! the reference is the conformance oracle; this is the runtime (no GC, real threads, ARM).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -364,6 +364,42 @@ fn existing_mesh_adopt_matches(
         }
     }
     true
+}
+
+#[derive(Clone)]
+struct PreparedMeshForward {
+    eid: String,
+    handoff: Value,
+    mesh_out: Value,
+    target: String,
+}
+
+fn assembly_member_ids(state: &ServerState, root: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([root.to_string()]);
+
+    while let Some(eid) = queue.pop_front() {
+        if !seen.insert(eid.clone()) || !state.entities.contains_key(&eid) {
+            continue;
+        }
+        out.push(eid.clone());
+
+        let mut children: Vec<String> = state
+            .entities
+            .iter()
+            .filter(|(_, e)| {
+                e.components.get("parent").and_then(Value::as_str) == Some(eid.as_str())
+            })
+            .map(|(cid, _)| cid.clone())
+            .collect();
+        children.sort();
+        for child in children {
+            queue.push_back(child);
+        }
+    }
+
+    out
 }
 
 fn is_platform_reserved_component(comp: &str) -> bool {
@@ -2589,6 +2625,23 @@ fn apply_wal_events(
                     recovered_pending.insert(eid.to_string(), ev.clone());
                 }
             }
+            "mesh_out_group" => {
+                // Source-side atomic assembly departure: root + children are one durable generation. Recovery
+                // parks each member as an ordinary in-flight MeshHandoff, but never recovers only a prefix of
+                // the assembly from a half-written series of per-entity records.
+                if let Some(members) = ev.get("members").and_then(|v| v.as_array()) {
+                    for member in members {
+                        let eid = member["entity"].as_str().unwrap_or("");
+                        if eid.is_empty() {
+                            continue;
+                        }
+                        store.remove(eid);
+                        if !g2d_off {
+                            recovered_pending.insert(eid.to_string(), member.clone());
+                        }
+                    }
+                }
+            }
             "mesh_acked" => {
                 // The entity crossed the seam AND the neighbour ACK'd it -> it lives THERE now. Drop the
                 // local copy AND clear the in-flight channel state (the handoff completed -> do NOT resend).
@@ -3022,8 +3075,14 @@ fn spawn_committed_region(
     true
 }
 
-// CROSS-BROKER MESH: hand an entity across the PROCESS seam to the neighbour broker owning `target`.
-fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
+fn prepare_mesh_forward_entity(
+    state: &ServerState,
+    eid: &str,
+    target: &str,
+    source_gen: u64,
+    src_region: &str,
+    src_lease_epoch: Option<u64>,
+) -> Option<PreparedMeshForward> {
     let (pos, vel, comps, authority_epoch, authority) = match state.entities.get(eid) {
         Some(e) => {
             let mut authority = e.authority.clone();
@@ -3061,8 +3120,34 @@ fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
                 authority_to_json(&authority),
             )
         }
-        None => return,
+        None => return None,
     };
+    let handoff = json!({"op":"MeshHandoff","entity":eid,"target":target,
+        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
+        "authority_epoch":authority_epoch,
+        "authority":authority.clone(),
+        "src_region":src_region,
+        "lease_epoch":src_lease_epoch,
+        "source_durable_gen":source_gen,
+        "components":Value::Object(comps.clone())});
+    let mesh_out = json!({"kind":"mesh_out","entity":eid,"target":target,
+        "authority_epoch":authority_epoch,"authority":authority,
+        "src_region":src_region,
+        "lease_epoch":src_lease_epoch,
+        "source_durable_gen":source_gen,
+        "gen":source_gen,
+        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
+        "components":Value::Object(comps)});
+    Some(PreparedMeshForward {
+        eid: eid.to_string(),
+        handoff,
+        mesh_out,
+        target: target.to_string(),
+    })
+}
+
+// CROSS-BROKER MESH: hand an entity or root assembly across the PROCESS seam to the neighbour broker owning `target`.
+fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
     // L6 SELF-FENCE: if a NEWER incarnation has taken over the region I own (the registry shows my_region at
     // a strictly higher lease_epoch held by a different addr), I am the STALE owner -- do NOT keep emitting
     // ownership traffic. Hold the entity local + park-and-refuse rather than push a stale handoff the peer
@@ -3075,23 +3160,10 @@ fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
         );
         return;
     }
-    // carry velocity across the process seam too -- adopting with [0,0] stalls the body at the boundary
-    // then re-accelerates (discontinuous cross-broker flight). pos+vel both ride. Build the frame ONCE so
-    // a dropped send can be re-tried verbatim until the neighbour ACKs. `target` rides too so the receiver
-    // lands the entity in the right one of ITS regions (N-neighbour, not just an east seam).
-    // L6 lease fence: stamp the SENDER's owned region + the lease_epoch it holds for it, so the receiver can
-    // fence a stale incarnation (a returned-from-partition old owner carries its OLD, lower epoch).
-    let src_region = state.my_region.clone();
-    let src_lease_epoch = state.region_lease_epoch.get(&src_region).copied();
-    let source_gen = state.pending_gen.saturating_add(1);
-    let handoff = json!({"op":"MeshHandoff","entity":eid,"target":target,
-        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
-        "authority_epoch":authority_epoch,
-        "authority":authority.clone(),
-        "src_region":src_region,
-        "lease_epoch":src_lease_epoch,
-        "source_durable_gen":source_gen,
-        "components":Value::Object(comps)});
+    let members = assembly_member_ids(state, eid);
+    if members.is_empty() {
+        return;
+    }
     let tx = match state.mesh.get(target).cloned() {
         Some(tx) => tx,
         None => {
@@ -3101,60 +3173,89 @@ fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
             return;
         }
     };
-    let mesh_out = json!({"kind":"mesh_out","entity":eid,"target":target,
-        "authority_epoch":authority_epoch,"authority":authority,
-        "src_region":src_region,
-        "lease_epoch":src_lease_epoch,
+    // carry velocity across the process seam too -- adopting with [0,0] stalls the body at the boundary
+    // then re-accelerates (discontinuous cross-broker flight). pos+vel both ride. Build each frame ONCE so
+    // a dropped send can be re-tried verbatim until the neighbour ACKs. `target` rides too so the receiver
+    // lands the entity in the right one of ITS regions (N-neighbour, not just an east seam).
+    // L6 lease fence: stamp the SENDER's owned region + the lease_epoch it holds for it, so the receiver can
+    // fence a stale incarnation (a returned-from-partition old owner carries its OLD, lower epoch).
+    let src_region = state.my_region.clone();
+    let src_lease_epoch = state.region_lease_epoch.get(&src_region).copied();
+    let source_gen = state.pending_gen.saturating_add(1);
+    let prepared: Vec<PreparedMeshForward> = members
+        .iter()
+        .filter_map(|member| {
+            prepare_mesh_forward_entity(
+                state,
+                member,
+                target,
+                source_gen,
+                &src_region,
+                src_lease_epoch,
+            )
+        })
+        .collect();
+    if prepared.is_empty() {
+        return;
+    }
+    let mesh_out_group = json!({
+        "kind":"mesh_out_group",
+        "root":eid,
+        "target":target,
         "source_durable_gen":source_gen,
         "gen":source_gen,
-        "pos":[pos[0],pos[1]],"vel":[vel[0],vel[1]],
-        "components":handoff.get("components").cloned().unwrap_or(Value::Null)});
+        "members":prepared.iter().map(|p| p.mesh_out.clone()).collect::<Vec<Value>>()
+    });
     // WAL + fsync the cross-seam departure BEFORE a neighbour can observe/adopt the handoff. The durable
     // watermark is the source-side visibility gate: crash before it -> source keeps the entity; crash after
     // it -> recovery rebuilds pending_mesh and resends. Sending above source durable_gen would let the
     // neighbour adopt a transition this broker could not reproduce.
-    if state.wal_append_nosync(&mesh_out).is_err() {
-        eprintln!("[mesh] WAL failed before forwarding {eid} -> {target}; keeping entity local and failing closed");
+    if state.wal_append_nosync(&mesh_out_group).is_err() {
+        eprintln!(
+            "[mesh] WAL failed before forwarding {eid} -> {target}; keeping assembly local and failing closed"
+        );
         return;
     }
     state.pending_gen = source_gen;
     if state.wal_sync().is_err() {
         eprintln!(
-            "[mesh] WAL sync failed before forwarding {eid} -> {target}; keeping entity local and failing closed"
+            "[mesh] WAL sync failed before forwarding {eid} -> {target}; keeping assembly local and failing closed"
         );
         return;
     }
     state.durable_gen = state.durable_gen.max(source_gen);
     // Park it pending the neighbour's MeshAck BEFORE attempting the send; if this process crashes after the WAL
     // but before/while sending, recovery reconstructs the same pending handoff from mesh_out.
-    state.pending_mesh.insert(
-        eid.to_string(),
-        (handoff.clone(), Instant::now(), target.to_string()),
-    );
-    state.entities.remove(eid);
-    let delivered = tx.send(frame(&handoff)).is_ok();
-    if !delivered {
-        // the link is down RIGHT NOW -- keep the entity LOCAL (do not park+remove into a dead seam). A
-        // WAL already linearized the departure, so do NOT resurrect locally; pending_mesh will resend once
-        // the mesh task reconnects.
-        eprintln!("[mesh] link to {target} dropped after WAL -- parked {eid} pending resend");
-    }
-    // CROSS-BROKER handoff counted HERE -- the delivered-departure linearization point (a live link accepted
-    // the frame + the mesh_out is WAL'd). The mirror of `handoffs += 1` in the LOCAL handoff() path, but a
-    // DISTINCT metric so the Inspector sees same-broker vs cross-server handoffs separately. Counted on the
-    // SENDING broker (the one initiating the authority transfer across the seam); a dropped/re-sent frame goes
-    // through resend_pending_mesh (a different path), so this fires exactly once per logical cross-broker move.
-    state.metrics.mesh_handoffs += 1;
-    let wids: Vec<String> = state.workers.keys().cloned().collect();
-    for wid in wids {
-        if state.workers[&wid].view.contains(eid) {
-            emit(state, &wid, json!({"op":"RemoveEntity","entity":eid}));
-            if let Some(w) = state.workers.get_mut(&wid) {
-                w.view.remove(eid);
+    let moved_count = prepared.len();
+    for p in prepared {
+        state.pending_mesh.insert(
+            p.eid.clone(),
+            (p.handoff.clone(), Instant::now(), p.target.clone()),
+        );
+        state.entities.remove(&p.eid);
+        let delivered = tx.send(frame(&p.handoff)).is_ok();
+        if !delivered {
+            // WAL already linearized the departure, so do NOT resurrect locally; pending_mesh will resend once
+            // the mesh task reconnects.
+            eprintln!(
+                "[mesh] link to {target} dropped after WAL -- parked {} pending resend",
+                p.eid
+            );
+        }
+        // CROSS-BROKER handoff counted HERE -- the durable departure linearization point. Count per entity
+        // because health/load rulers ask how many ownership objects crossed, not how many root assemblies.
+        state.metrics.mesh_handoffs += 1;
+        let wids: Vec<String> = state.workers.keys().cloned().collect();
+        for wid in wids {
+            if state.workers[&wid].view.contains(&p.eid) {
+                emit(state, &wid, json!({"op":"RemoveEntity","entity":p.eid}));
+                if let Some(w) = state.workers.get_mut(&wid) {
+                    w.view.remove(&p.eid);
+                }
             }
         }
     }
-    eprintln!("[mesh] forwarded {eid} -> {target} (pending the neighbour's MeshAck, re-sent until confirmed)");
+    eprintln!("[mesh] forwarded {eid} -> {target} members={moved_count} (pending MeshAck, re-sent until confirmed)");
 }
 
 // B1: re-send any cross-broker handoff the neighbour hasn't ACK'd yet (a dropped MeshHandoff OR a dropped
@@ -7641,6 +7742,60 @@ mod tests {
     }
 
     #[test]
+    fn mesh_forward_moves_assembly_members_as_one_source_generation() {
+        let mut state = ServerState::new(30.0);
+        state.my_region = "W".to_string();
+        state.region_lease_epoch.insert("W".to_string(), 7);
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([1.0, 0.0], "W"));
+        let mut child = test_entity([-2.0, 0.2], "W");
+        child.components.insert("parent".to_string(), json!("ship"));
+        child
+            .components
+            .insert("assembly_probe".to_string(), json!({"writer":"W_INIT"}));
+        state.entities.insert("ship-child".to_string(), child);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.mesh.insert("E".to_string(), tx);
+
+        mesh_forward(&mut state, "ship", "E");
+
+        let first = decode_test_frame(&rx.try_recv().expect("root/child frame 1"));
+        let second = decode_test_frame(&rx.try_recv().expect("root/child frame 2"));
+        let ids: HashSet<String> = [first.clone(), second.clone()]
+            .iter()
+            .filter_map(|frame| {
+                frame
+                    .get("entity")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from(["ship".to_string(), "ship-child".to_string()])
+        );
+        let g1 = first
+            .get("source_durable_gen")
+            .and_then(Value::as_u64)
+            .unwrap();
+        let g2 = second
+            .get("source_durable_gen")
+            .and_then(Value::as_u64)
+            .unwrap();
+        assert_eq!(
+            g1, g2,
+            "assembly members must share one durable source generation"
+        );
+        assert!(g1 <= state.durable_gen);
+        assert!(!state.entities.contains_key("ship"));
+        assert!(!state.entities.contains_key("ship-child"));
+        assert!(state.pending_mesh.contains_key("ship"));
+        assert!(state.pending_mesh.contains_key("ship-child"));
+    }
+
+    #[test]
     fn mesh_adopt_persists_committed_region_for_strip_target() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8884,6 +9039,7 @@ async fn main() {
                 "authority":payload.get("authority").cloned().unwrap_or(Value::Null),
                 "src_region":payload.get("src_region").cloned().unwrap_or(Value::Null),
                 "lease_epoch":payload.get("lease_epoch").cloned().unwrap_or(Value::Null),
+                "source_durable_gen":payload.get("source_durable_gen").cloned().unwrap_or(Value::Null),
                 "components":payload.get("components").cloned().unwrap_or(Value::Null)});
             state
                 .pending_mesh

@@ -62,6 +62,7 @@ struct Counters {
     authority_loss: AtomicU64,
     update_rejected: AtomicU64,
     handoff_probe_rejected: AtomicU64,
+    assembly_probe_rejected: AtomicU64,
     entity_event: AtomicU64,
     visual_event: AtomicU64,
     command_request: AtomicU64,
@@ -102,6 +103,9 @@ impl Counters {
                 self.update_rejected.fetch_add(1, Ordering::Relaxed);
                 if f.get("comp").and_then(|v| v.as_str()) == Some("handoff_probe") {
                     self.handoff_probe_rejected.fetch_add(1, Ordering::Relaxed);
+                }
+                if f.get("comp").and_then(|v| v.as_str()) == Some("assembly_probe") {
+                    self.assembly_probe_rejected.fetch_add(1, Ordering::Relaxed);
                 }
             }
             "EntityEvent" => {
@@ -311,7 +315,7 @@ async fn query_health(host: &str, port: u16, request_id: &str) -> std::io::Resul
     stream.set_nodelay(true).ok();
     write_raw(
         &mut stream,
-        &json!({"op":"WorkerConnect","worker_id":format!("rlg-health-{request_id}"),"region":"OBS","attributes":["observer"],"proto":1}),
+        &json!({"op":"WorkerConnect","worker_id":format!("rlg-health-{request_id}"),"region":"MESH","attributes":["health"],"proto":1}),
     )
     .await?;
     write_raw(&mut stream, &json!({"op":"Health","request_id":request_id})).await?;
@@ -423,6 +427,36 @@ fn count_handoff_probe_ok(query: &Value, entities: u64) -> u64 {
                     .and_then(|p| p.get("writer"))
                     .and_then(|v| v.as_str())
                     == Some("E")
+        });
+        if matched {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+fn count_assembly_child_ok(query: &Value, entities: u64) -> u64 {
+    let Some(rows) = query.get("entities").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    let mut ok = 0u64;
+    for i in 0..entities {
+        let root = format!("rlg-body-{i}");
+        let child = format!("rlg-body-{i}-child");
+        let matched = rows.iter().any(|row| {
+            row.get("entity").and_then(|v| v.as_str()) == Some(child.as_str())
+                && row.get("region").and_then(|v| v.as_str()) == Some("E")
+                && row
+                    .get("components")
+                    .and_then(|c| c.get("parent"))
+                    .and_then(|v| v.as_str())
+                    == Some(root.as_str())
+                && row
+                    .get("components")
+                    .and_then(|c| c.get("assembly_probe"))
+                    .and_then(|p| p.get("writer"))
+                    .and_then(|v| v.as_str())
+                    == Some("E_CHILD")
         });
         if matched {
             ok += 1;
@@ -940,6 +974,10 @@ async fn main() {
         .ok()
         .map(|v| v != "0")
         .unwrap_or(true);
+    let require_assembly_handoff = env::var("GW_REQUIRE_ASSEMBLY_HANDOFF")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(require_mesh);
     let require_physics_payload = env::var("GW_REQUIRE_PHYSICS_PAYLOAD")
         .ok()
         .map(|v| v != "0")
@@ -1093,6 +1131,25 @@ async fn main() {
         )
         .await
         .unwrap();
+        let child = format!("rlg-body-{i}-child");
+        send_json(
+            &owner_w_wr,
+            &json!({
+                "op":"CreateEntity",
+                "request_id":format!("create-{i}-child"),
+                "entity":child,
+                "region":"W",
+                "components":{
+                    "pos":[-2.0,y + 0.08],
+                    "vel":[0.08,0.0],
+                    "parent":eid,
+                    "assembly_part":{"root":format!("rlg-body-{i}"),"slot":"child"},
+                    "assembly_probe":{"writer":"W_INIT","seq":0}
+                }
+            }),
+        )
+        .await
+        .unwrap();
     }
 
     send_json(
@@ -1203,10 +1260,16 @@ async fn main() {
     let mut content_load_ok = 0u64;
     let mut schema_manifest_ok = 0u64;
     let mut qbi_ast_ok = 0u64;
+    let mut assembly_child_ok = 0u64;
     let mut handoff_probe_query_error: Option<String> = None;
     if require_writer_swap {
+        let expected_authority_gain = if require_assembly_handoff {
+            entities.saturating_mul(2)
+        } else {
+            entities
+        };
         let gained = wait_until(Duration::from_secs(3), || {
-            Counters::get(&east.authority_gain) >= entities
+            Counters::get(&east.authority_gain) >= expected_authority_gain
         })
         .await;
         if gained {
@@ -1257,10 +1320,43 @@ async fn main() {
                 .await
                 .unwrap();
             }
+            if require_assembly_handoff {
+                for i in 0..entities {
+                    let child = format!("rlg-body-{i}-child");
+                    send_json(
+                        &owner_e_wr,
+                        &json!({
+                            "op":"UpdateComponent",
+                            "entity":child,
+                            "comp":"assembly_probe",
+                            "value":{"writer":"E_CHILD","seq":i}
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                for i in 0..entities {
+                    let child = format!("rlg-body-{i}-child");
+                    send_json(
+                        &owner_w_wr,
+                        &json!({
+                            "op":"UpdateComponent",
+                            "entity":child,
+                            "comp":"assembly_probe",
+                            "value":{"writer":"W_STALE_CHILD","seq":i}
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
             tokio::time::sleep(Duration::from_millis(600)).await;
             match query_entities(&host, port_e, "rlg-handoff-probe").await {
                 Ok(query) => {
                     handoff_probe_ok = count_handoff_probe_ok(&query, entities);
+                    assembly_child_ok = count_assembly_child_ok(&query, entities);
                     physics_payload_ok = count_physics_payload_ok(&query, entities);
                     physics_clock_ok = count_physics_clock_ok(&query, entities);
                     asset_manifest_ok = count_asset_manifest_ok(&query, entities);
@@ -1357,6 +1453,8 @@ async fn main() {
     let east_authority_gain = Counters::get(&east.authority_gain);
     let handoff_probe_rejected =
         Counters::get(&all.handoff_probe_rejected) + Counters::get(&east.handoff_probe_rejected);
+    let assembly_probe_rejected =
+        Counters::get(&all.assembly_probe_rejected) + Counters::get(&east.assembly_probe_rejected);
     let rejections = Counters::get(&all.update_rejected) + Counters::get(&east.update_rejected);
 
     let mut failures = Vec::new();
@@ -1389,6 +1487,12 @@ async fn main() {
     }
     if require_writer_swap && handoff_probe_query_error.is_some() {
         failures.push("handoff_probe_query_failed");
+    }
+    if require_assembly_handoff && assembly_child_ok < entities {
+        failures.push("assembly_child_not_transferred");
+    }
+    if require_assembly_handoff && assembly_probe_rejected < entities {
+        failures.push("assembly_stale_w_writer_not_rejected");
     }
     if require_physics_payload && physics_payload_ok < entities {
         failures.push("physics_payload_not_visible");
@@ -1426,8 +1530,12 @@ async fn main() {
 
     let result = if failures.is_empty() { "pass" } else { "fail" };
     let elapsed = started.elapsed().as_secs_f64();
+    let health_query_error_label = health_query_error
+        .as_deref()
+        .unwrap_or("none")
+        .replace(char::is_whitespace, "_");
     println!(
-        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} content_manifest_ok={} content_load_ok={} schema_manifest_ok={} qbi_ast_ok={} health_ok={} monitor_tick_ok={} monitor_queue_ok={} health_queue_backlog={} health_egress_max={} health_max_tick_lag_ms={:.2} health_max_lock_ms={:.2} mesh_ghosts={} slow_viewer={} failures={}",
+        "reality_loadgen result={} mode={} entities={} ticks={} elapsed={:.2} add={} updates={} coarse={} events={} visual_events={} command_req_owner={} command_resp_caller={} query_resp={} rejections={} east_add={} east_updates={} east_visible={} east_authority_gain={} handoff_probe_ok={} handoff_probe_rejected={} assembly_child_ok={} assembly_probe_rejected={} physics_payload_ok={} physics_clock_ok={} asset_manifest_ok={} content_manifest_ok={} content_load_ok={} schema_manifest_ok={} qbi_ast_ok={} health_ok={} monitor_tick_ok={} monitor_queue_ok={} health_query_error={} health_queue_backlog={} health_egress_max={} health_max_tick_lag_ms={:.2} health_max_lock_ms={:.2} mesh_ghosts={} slow_viewer={} failures={}",
         result,
         if cross_broker { "cross-broker" } else { "single-broker" },
         entities,
@@ -1448,6 +1556,8 @@ async fn main() {
         east_authority_gain,
         handoff_probe_ok,
         handoff_probe_rejected,
+        assembly_child_ok,
+        assembly_probe_rejected,
         physics_payload_ok,
         physics_clock_ok,
         asset_manifest_ok,
@@ -1458,6 +1568,7 @@ async fn main() {
         health_ok,
         monitor_tick_ok,
         monitor_queue_ok,
+        health_query_error_label,
         health_queue_backlog_total,
         health_egress_max,
         health_max_tick_lag_ms,

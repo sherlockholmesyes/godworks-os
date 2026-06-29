@@ -338,6 +338,7 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         .env("GW_EVENT_BURST", "6")
         .env("GW_REQUIRE_MESH", "1")
         .env("GW_REQUIRE_WRITER_SWAP", "1")
+        .env("GW_REQUIRE_ASSEMBLY_HANDOFF", "1")
         .env("GW_REQUIRE_PHYSICS_PAYLOAD", "1")
         .env("GW_REQUIRE_ASSET_MANIFEST", "1")
         .env("GW_REQUIRE_CONTENT_MANIFEST", "1")
@@ -384,6 +385,16 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         metric_u64(&metrics, "handoff_probe_rejected"),
         4,
         "old owner was not fenced after adopt: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "assembly_child_ok"),
+        4,
+        "root assembly children did not transfer with their parents across the broker seam: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "assembly_probe_rejected"),
+        4,
+        "old owner was not fenced from writing assembly children after adopt: {metrics:?}"
     );
     assert_eq!(
         metric_u64(&metrics, "physics_payload_ok"),
