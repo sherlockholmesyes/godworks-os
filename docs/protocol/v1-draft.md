@@ -19,6 +19,8 @@ Immediate hardening requirement:
 A broker must reject oversized frames before allocating the full body.
 ```
 
+The typed protocol crate now exposes `DEFAULT_MAX_FRAME_BYTES`; broker enforcement still needs to be wired into the frame reader.
+
 ## Version negotiation
 
 Workers should connect with:
@@ -106,6 +108,48 @@ The broker must reject peers outside its supported protocol range and return a s
 | `InspectorFrame` | broker -> inspector | no | Debug/ops state frame. |
 | `SnapshotMarker` | admin -> broker | yes | Mark coordinated snapshot/restore boundary. |
 
+## JSON codec bootstrap coverage
+
+The first typed JSON codec covers the operations needed to stabilize the worker/mesh SDK path:
+
+- `WorkerConnect`
+- `Disconnect`
+- `Heartbeat`
+- `Interest`
+- `CreateEntity`
+- `UpdateComponent`
+- `BatchUpdate`
+- `AuthorityChange`
+- `UpdateRejected`
+- `MeshHandoff`
+- `MeshAck`
+- `Health`
+
+Remaining operations still need typed coverage before SDK migration is complete:
+
+- `AddEntity`
+- `RemoveEntity`
+- `CriticalSection`
+- `DeleteEntity`
+- `ReserveEntityIds`
+- `AddComponent`
+- `RemoveComponent`
+- `SetComponentAuthority`
+- `Fold`
+- `ThresholdTx`
+- `MeshGhost`
+- `MeshGhostRemove`
+- `EntityQuery`
+- `EntityQueryResponse`
+- `CommandRequest`
+- `CommandResponse`
+- `EntityEvent`
+- `FlagUpdate`
+- `Metrics`
+- `InspectorQuery`
+- `InspectorFrame`
+- `SnapshotMarker`
+
 ## Persistent-operation rule
 
 A persistent op must not mutate published world state until the durable transition is written and crossed through the durability barrier.
@@ -135,10 +179,12 @@ conflict
 
 ## Typed protocol work items
 
-- [ ] Add `godworks-protocol` crate.
-- [ ] Define `Op` enum with serde support.
-- [ ] Add JSON codec for current wire compatibility.
-- [ ] Add golden roundtrip tests.
-- [ ] Add max frame size constant.
+- [x] Add `godworks-protocol` crate.
+- [x] Define initial `Op` enum.
+- [x] Add initial JSON codec for current wire compatibility.
+- [x] Add first golden roundtrip tests.
+- [x] Add max frame size constant.
+- [ ] Complete typed coverage for every protocol operation.
+- [ ] Wire broker frame reader to `DEFAULT_MAX_FRAME_BYTES`.
 - [ ] Replace raw JSON construction in `zone_worker` with typed SDK calls.
 - [ ] Keep protocol docs synchronized with the typed enum.
