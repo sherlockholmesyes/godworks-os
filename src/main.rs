@@ -68,6 +68,11 @@ const DEFAULT_INGRESS_BURST_FRAMES: f64 = 4000.0;
 const INGRESS_BYTES_PER_TOKEN: f64 = 8192.0;
 const PROTOCOL_VERSION: u64 = 1; // L4: this broker's wire-format version
 const MIN_PROTO: u64 = 1; // L4: oldest peer wire-version still understood
+const SNAPSHOT_MANIFEST_VERSION: u64 = 1;
+const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
+const SPATIAL_SCHEMA_VERSION: u64 = 1;
+const COORDINATE_CODEC_VERSION: u64 = 1;
+const COMPONENT_REGISTRY_VERSION: u64 = 0;
 
 struct InboundFrame {
     value: Value,
@@ -2629,10 +2634,8 @@ fn replay_tape_op_summary(f: &Value, byte_len: usize) -> Value {
     Value::Object(summary)
 }
 
-fn record_replay_tape_spatial_contract(state: &ServerState, event: &mut Map<String, Value>) {
-    event.insert("spatial_dim".to_string(), json!("D2"));
-    event.insert("coordinate_codec".to_string(), json!("debug_f64_2"));
-    let partition_schema = if let Some((cols, rows, _cell_w, _cell_h)) = state.grid2d {
+fn partition_schema_contract(state: &ServerState) -> Value {
+    if let Some((cols, rows, _cell_w, _cell_h)) = state.grid2d {
         json!({
             "kind": "grid2d",
             "cols": cols,
@@ -2643,8 +2646,24 @@ fn record_replay_tape_spatial_contract(state: &ServerState, event: &mut Map<Stri
             "kind": "strip1d",
             "boundary_count": state.boundaries.len()
         })
-    };
-    event.insert("partition_schema".to_string(), partition_schema);
+    }
+}
+
+fn spatial_schema_contract(state: &ServerState) -> Value {
+    json!({
+        "spatial_dim": "D2",
+        "coordinate_codec": "debug_f64_2",
+        "partition_schema": partition_schema_contract(state)
+    })
+}
+
+fn record_replay_tape_spatial_contract(state: &ServerState, event: &mut Map<String, Value>) {
+    event.insert("spatial_dim".to_string(), json!("D2"));
+    event.insert("coordinate_codec".to_string(), json!("debug_f64_2"));
+    event.insert(
+        "partition_schema".to_string(),
+        partition_schema_contract(state),
+    );
 }
 
 fn record_replay_tape_ingress(
@@ -6211,6 +6230,13 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 wid,
                 json!({
                     "op": "SnapshotManifest", "request_id": req_id, "snapshot_id": snapshot_id,
+                    "snapshot_manifest_version": SNAPSHOT_MANIFEST_VERSION,
+                    "snapshot_schema_version": SNAPSHOT_SCHEMA_VERSION,
+                    "spatial_schema_version": SPATIAL_SCHEMA_VERSION,
+                    "coordinate_codec_version": COORDINATE_CODEC_VERSION,
+                    "component_registry_version": COMPONENT_REGISTRY_VERSION,
+                    "partition_map_version": state.zone_topology_rev,
+                    "spatial_schema": spatial_schema_contract(state),
                     "broker_id": broker_id, "wal_offset": wal_offset, "entity_count": state.entities.len(),
                     "authority_hash": authority_hash.to_string(), "pending_mesh": state.pending_mesh.len(),
                     "in_flight": in_flight, "t_server": now_millis()
@@ -10509,6 +10535,68 @@ mod tests {
         assert!(full_report.error.is_none(), "{:?}", full_report.error);
         assert!(full_store.contains_key("pre-cut"));
         assert!(full_store.contains_key("post-cut"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_manifest_carries_spatial_schema_contract() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_snapshot_spatial_contract_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.grid2d = Some((3, 2, 10.0, 20.0));
+        state.zone_topology_rev = 7;
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        state.ensure_wal_header();
+
+        let mut rx = add_test_worker_with_rx(&mut state, "snap", "OBS");
+        state
+            .workers
+            .get_mut("snap")
+            .unwrap()
+            .attributes
+            .insert("snapshot".to_string());
+
+        dispatch_test_frame(
+            &mut state,
+            "snap",
+            &json!({"op":"SnapshotMarker","request_id":"s1","snapshot_id":"cut-1"}),
+        );
+
+        let manifest = decode_test_frame(&rx.try_recv().expect("snapshot manifest must emit"));
+        assert_eq!(manifest["op"], "SnapshotManifest");
+        assert_eq!(manifest["snapshot_manifest_version"], 1);
+        assert_eq!(manifest["snapshot_schema_version"], 1);
+        assert_eq!(manifest["spatial_schema_version"], 1);
+        assert_eq!(manifest["coordinate_codec_version"], 1);
+        assert_eq!(manifest["component_registry_version"], 0);
+        assert_eq!(manifest["partition_map_version"], 7);
+        assert_eq!(manifest["spatial_schema"]["spatial_dim"], "D2");
+        assert_eq!(
+            manifest["spatial_schema"]["coordinate_codec"],
+            "debug_f64_2"
+        );
+        assert_eq!(
+            manifest["spatial_schema"]["partition_schema"],
+            json!({"kind":"grid2d","cols":3,"rows":2})
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
