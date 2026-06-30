@@ -89,3 +89,11 @@ contract before adding scene-node lifecycle:
 
 The Godot-side runner for the same fixture is
 `client_probes/godot/client_bridge_contract_probe.gd`.
+
+The first real socket runner is
+`client_probes/godot/client_bridge_tcp_resync_probe.gd`. It starts from the same
+Godot-side adapter, connects to a broker over the current length-prefixed JSON
+wire protocol, disconnects a viewer, deletes stale broker state while the viewer
+is offline, reconnects, and rebuilds the adapter from a live
+`EntityQueryResponse`. That keeps the next bridge step grounded in real broker
+output without turning the SDK into a transport or prediction layer.
