@@ -25,6 +25,10 @@ snapshot restore into a second persistence system. The point is that the cut
 names the same spatial/partition contract as replay and future protocol
 fixtures.
 
+The protocol crate exposes typed `SnapshotManifest` accessors for those fields
+and a current-version check. The JSON wire shape stays lossless and unchanged;
+typed consumers no longer need to hand-parse the artifact contract.
+
 `component_registry_version = 1` means the cut can be interpreted against the
 built-in registry in `godworks-core`; it does not mean unknown project-specific
 components are rejected by the broker yet.
@@ -49,6 +53,8 @@ The task-relative regression gates are:
 ```text
 snapshot_marker_restore_offset_rolls_back_post_cut_entities
 snapshot_manifest_carries_spatial_schema_contract
+snapshot_manifest_contract_accessors_match_current_wire_shape
+snapshot_manifest_contract_rejects_future_versions
 snapshot_vector_restores_in_flight_mesh_handoff_exactly_once
 ```
 

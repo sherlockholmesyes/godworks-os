@@ -32,7 +32,10 @@ use godworks_core::{
     PartitionSchema, SpatialSchema, COORDINATE_CODEC_VERSION, SPATIAL_SCHEMA_VERSION,
     STANDARD_COMPONENT_REGISTRY_VERSION,
 };
-use godworks_protocol::{operation_semantics, DEFAULT_MAX_FRAME_BYTES};
+use godworks_protocol::{
+    operation_semantics, DEFAULT_MAX_FRAME_BYTES, SNAPSHOT_MANIFEST_VERSION,
+    SNAPSHOT_SCHEMA_VERSION,
+};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -72,8 +75,6 @@ const DEFAULT_INGRESS_BURST_FRAMES: f64 = 4000.0;
 const INGRESS_BYTES_PER_TOKEN: f64 = 8192.0;
 const PROTOCOL_VERSION: u64 = 1; // L4: this broker's wire-format version
 const MIN_PROTO: u64 = 1; // L4: oldest peer wire-version still understood
-const SNAPSHOT_MANIFEST_VERSION: u64 = 1;
-const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
 struct InboundFrame {
     value: Value,
     byte_len: usize,
@@ -10811,6 +10812,22 @@ mod tests {
         assert_eq!(
             manifest["spatial_schema"]["partition_schema"],
             json!({"kind":"grid2d","cols":3,"rows":2})
+        );
+
+        let typed =
+            godworks_protocol::json::decode_json_value(&manifest).expect("manifest must decode");
+        let godworks_protocol::Op::SnapshotManifest(typed_manifest) = typed else {
+            panic!("expected typed SnapshotManifest");
+        };
+        assert!(typed_manifest.has_current_versions());
+        assert_eq!(typed_manifest.snapshot_id(), Some("cut-1"));
+        assert_eq!(typed_manifest.partition_map_version(), Some(7));
+        assert_eq!(
+            typed_manifest.spatial_schema(),
+            Some(SpatialSchema::current_2d(PartitionSchema::Grid2D {
+                cols: 3,
+                rows: 2
+            }))
         );
 
         let _ = std::fs::remove_dir_all(&dir);

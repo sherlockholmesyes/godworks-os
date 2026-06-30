@@ -671,6 +671,7 @@ mod tests {
     use crate::ProtocolErrorKind;
     use crate::PROTOCOL_VERSION;
     use crate::{operation_semantics, OperationCategory, OperationPersistence};
+    use crate::{PartitionSchema, SpatialSchema};
 
     fn assert_roundtrip(raw: Value) {
         let decoded = decode_json_value(&raw).unwrap();
@@ -886,6 +887,108 @@ mod tests {
                 "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
             }
         }));
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_accessors_match_current_wire_shape() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "request_id": "snap-1",
+            "snapshot_id": "s-1",
+            "broker_id": "broker-a",
+            "wal_offset": 2048,
+            "entity_count": 3,
+            "pending_mesh": 1,
+            "authority_hash": "12345",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 7,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "grid2d", "cols": 3, "rows": 2 }
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.request_id(), Some("snap-1"));
+        assert_eq!(manifest.snapshot_id(), Some("s-1"));
+        assert_eq!(manifest.broker_id(), Some("broker-a"));
+        assert_eq!(manifest.wal_offset(), Some(2048));
+        assert_eq!(manifest.entity_count(), Some(3));
+        assert_eq!(manifest.pending_mesh(), Some(1));
+        assert_eq!(manifest.authority_hash(), Some("12345"));
+        assert!(manifest.has_current_versions());
+        assert_eq!(manifest.partition_map_version(), Some(7));
+        assert_eq!(
+            manifest.spatial_schema(),
+            Some(SpatialSchema::current_2d(PartitionSchema::Grid2D {
+                cols: 3,
+                rows: 2
+            }))
+        );
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_rejects_invalid_spatial_schema() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "grid2d", "cols": 0, "rows": 2 }
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.spatial_schema(), None);
+        assert!(manifest.has_current_versions());
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_rejects_future_versions() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 2,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.snapshot_manifest_version(), Some(2));
+        assert!(!manifest.has_current_versions());
+        assert_eq!(
+            manifest.spatial_schema(),
+            Some(SpatialSchema::current_2d(PartitionSchema::strip1d(1)))
+        );
     }
 
     #[test]
