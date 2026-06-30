@@ -75,6 +75,52 @@ fn parse_nonempty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PeerClaims {
+    region: String,
+    attributes: HashSet<String>,
+}
+
+fn parse_connect_auth_claims(spec: &str) -> HashMap<String, PeerClaims> {
+    let mut claims = HashMap::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let mut parts = entry.splitn(3, ':');
+        let Some(token) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(region) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let attributes = parts
+            .next()
+            .unwrap_or("")
+            .split('|')
+            .filter_map(|attr| {
+                let attr = attr.trim();
+                (!attr.is_empty()).then(|| attr.to_string())
+            })
+            .collect();
+        claims.insert(
+            token.to_string(),
+            PeerClaims {
+                region: region.to_string(),
+                attributes,
+            },
+        );
+    }
+    claims
+}
+
+fn parse_connect_auth_claims_env() -> HashMap<String, PeerClaims> {
+    parse_nonempty_env("GW_AUTH_CLAIMS")
+        .map(|spec| parse_connect_auth_claims(&spec))
+        .unwrap_or_default()
+}
+
 // ── DYNAMIC SPLITTING (load-based capacity-add, not just the W|E boundary-shift) ──
 // A coarse region under sustained high load SPLITS into sub-bands, each owned by a fresh
 // standby worker -- this ADDS capacity (rebalance() only shifts the W|E line between two
@@ -1486,6 +1532,7 @@ struct ServerState {
     ingress_rate_per_sec: f64, // Security v0: frame token refill per worker/peer
     ingress_burst_frames: f64, // Security v0: max accumulated inbound frame tokens per worker/peer
     connect_auth_token: Option<String>, // Security v0: optional shared secret required on WorkerConnect before registration
+    connect_auth_claims: HashMap<String, PeerClaims>, // Security v0.1: token -> broker-owned region/attrs; peer JSON cannot self-assign them
     mesh: HashMap<String, UnboundedSender<Vec<u8>>>, // region -> link to the neighbour BROKER owning it (N-neighbour cross-broker mesh)
     // B1 cross-broker seam: entities handed EAST but not yet ACK'd by the neighbour. The forward removes
     // the entity from `entities` but parks it here (the MeshHandoff frame + when-sent) until a MeshAck
@@ -1603,6 +1650,7 @@ impl ServerState {
             )
             .max(1.0),
             connect_auth_token: parse_nonempty_env("GW_AUTH_TOKEN"),
+            connect_auth_claims: parse_connect_auth_claims_env(),
             mesh: HashMap::new(),
             pending_mesh: HashMap::new(),
             mesh_regions: HashSet::new(),
@@ -6486,6 +6534,45 @@ fn auth_token_matches(required: Option<&str>, provided: Option<&str>) -> bool {
     required.is_none_or(|expected| provided == Some(expected))
 }
 
+fn resolve_connect_claims(
+    required: Option<&str>,
+    configured_claims: &HashMap<String, PeerClaims>,
+    provided: Option<&str>,
+    requested_region: Option<&str>,
+    requested_attributes: &HashSet<String>,
+) -> Result<Option<PeerClaims>, &'static str> {
+    if !configured_claims.is_empty() {
+        let Some(token) = provided else {
+            return Err("authentication required");
+        };
+        let Some(claims) = configured_claims.get(token) else {
+            return Err("authentication required");
+        };
+        if requested_region.is_some_and(|region| region != claims.region) {
+            return Err("auth token is not valid for requested region");
+        }
+        if !requested_attributes.is_subset(&claims.attributes) {
+            return Err("auth token is not valid for requested attributes");
+        }
+        return Ok(Some(claims.clone()));
+    }
+
+    if auth_token_matches(required, provided) {
+        Ok(None)
+    } else {
+        Err("authentication required")
+    }
+}
+
+fn auth_token_for_region(state: &ServerState, region: &str) -> Option<String> {
+    state
+        .connect_auth_claims
+        .iter()
+        .find(|(_, claims)| claims.region == region)
+        .map(|(token, _)| token.clone())
+        .or_else(|| state.connect_auth_token.clone())
+}
+
 async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>) {
     sock.set_nodelay(true).ok();
     let (mut rd, mut wr) = sock.into_split();
@@ -6501,12 +6588,9 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
         Some(s) => s.to_string(),
         None => return,
     };
-    let region = first
-        .get("region")
-        .and_then(|v| v.as_str())
-        .unwrap_or("OBS")
-        .to_string();
-    let attributes: HashSet<String> = first
+    let requested_region = first.get("region").and_then(|v| v.as_str());
+    let mut region = requested_region.unwrap_or("OBS").to_string();
+    let mut attributes: HashSet<String> = first
         .get("attributes")
         .and_then(|v| v.as_array())
         .map(|a| {
@@ -6535,25 +6619,39 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
         }
     }
 
-    // Security v0: optional shared-secret connect gate. This is intentionally BEFORE worker registration,
+    // Security v0/v0.1: optional connect gate. This is intentionally BEFORE worker registration,
     // before region lease, before egress channel allocation, and before the peer can claim privileged
-    // attributes. Unset GW_AUTH_TOKEN preserves the dev/test wire shape. Set GW_AUTH_TOKEN makes the broker
-    // fail closed for WorkerConnect frames whose auth_token is absent or mismatched. The token is never logged.
-    let required_auth = {
+    // attributes. Unset auth config preserves the dev/test wire shape. GW_AUTH_TOKEN keeps the old dev
+    // shared-secret behavior; GW_AUTH_CLAIMS is the stricter production shape where the token maps to the
+    // broker-owned region/attributes and peer JSON cannot self-assign them. The token is never logged.
+    let (required_auth, configured_claims) = {
         let s = state.lock().await;
-        s.connect_auth_token.clone()
+        (s.connect_auth_token.clone(), s.connect_auth_claims.clone())
     };
     let provided_auth = first.get("auth_token").and_then(|v| v.as_str());
-    if !auth_token_matches(required_auth.as_deref(), provided_auth) {
-        let rej = frame(&json!({
-            "op": "AuthReject",
-            "worker_id": wid,
-            "error": "auth_error",
-            "reason": "authentication required"
-        }));
-        let _ = wr.write_all(&rej).await;
-        println!("[broker] worker '{wid}' REJECTED -- auth failed");
-        return; // do NOT register; the connection drops as wr/rd go out of scope
+    match resolve_connect_claims(
+        required_auth.as_deref(),
+        &configured_claims,
+        provided_auth,
+        requested_region,
+        &attributes,
+    ) {
+        Ok(Some(claims)) => {
+            region = claims.region;
+            attributes = claims.attributes;
+        }
+        Ok(None) => {}
+        Err(reason) => {
+            let rej = frame(&json!({
+                "op": "AuthReject",
+                "worker_id": wid,
+                "error": "auth_error",
+                "reason": reason
+            }));
+            let _ = wr.write_all(&rej).await;
+            println!("[broker] worker '{wid}' REJECTED -- auth failed");
+            return; // do NOT register; the connection drops as wr/rd go out of scope
+        }
     }
 
     // T1: BOUNDED egress channel (capacity CHANNEL_CAP). A stuck consumer can hold AT MOST CHANNEL_CAP unsent
@@ -6756,7 +6854,7 @@ fn spawn_mesh_link_dynamic(st: Arc<Mutex<ServerState>>, region: String, reg_dir:
                     let (mut rd, mut wr) = stream.into_split();
                     let token = {
                         let s = st.lock().await;
-                        s.connect_auth_token.clone()
+                        auth_token_for_region(&s, "MESH")
                     };
                     let hs = worker_connect_frame(
                         &format!("mesh-link-{region}"),
@@ -7098,7 +7196,7 @@ async fn main() {
                     let (mut rd, mut wr) = stream.into_split();
                     let token = {
                         let s = st.lock().await;
-                        s.connect_auth_token.clone()
+                        auth_token_for_region(&s, "MESH")
                     };
                     let hs = worker_connect_frame(
                         &format!("mesh-link-{region}"),
@@ -7532,6 +7630,160 @@ mod tests {
         assert!(auth_token_matches(Some("secret"), Some("secret")));
         assert!(!auth_token_matches(Some("secret"), None));
         assert!(!auth_token_matches(Some("secret"), Some("wrong")));
+    }
+
+    #[test]
+    fn worker_connect_claims_bind_token_to_region_and_attributes() {
+        let claims = parse_connect_auth_claims("w-secret:W:physics|sim,mesh-secret:MESH:mesh");
+        assert_eq!(claims.len(), 2);
+
+        let requested_attrs = HashSet::from(["physics".to_string()]);
+        let resolved =
+            resolve_connect_claims(None, &claims, Some("w-secret"), Some("W"), &requested_attrs)
+                .unwrap()
+                .unwrap();
+        assert_eq!(resolved.region, "W");
+        assert!(resolved.attributes.contains("physics"));
+        assert!(resolved.attributes.contains("sim"));
+
+        assert_eq!(
+            resolve_connect_claims(None, &claims, Some("w-secret"), Some("E"), &requested_attrs)
+                .unwrap_err(),
+            "auth token is not valid for requested region"
+        );
+
+        let escalated_attrs = HashSet::from(["physics".to_string(), "inspector".to_string()]);
+        assert_eq!(
+            resolve_connect_claims(None, &claims, Some("w-secret"), Some("W"), &escalated_attrs)
+                .unwrap_err(),
+            "auth token is not valid for requested attributes"
+        );
+
+        let derived =
+            resolve_connect_claims(None, &claims, Some("w-secret"), None, &HashSet::new())
+                .unwrap()
+                .unwrap();
+        assert_eq!(derived.region, "W");
+    }
+
+    #[tokio::test]
+    async fn worker_connect_claim_token_rejects_wrong_region_before_registration() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            s.connect_auth_claims.insert(
+                "w-secret".to_string(),
+                PeerClaims {
+                    region: "W".to_string(),
+                    attributes: HashSet::from(["physics".to_string()]),
+                },
+            );
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"region-thief",
+                "region":"E",
+                "attributes":["physics"],
+                "auth_token":"w-secret"
+            })))
+            .await
+            .unwrap();
+
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await.unwrap();
+        let n = u32::from_be_bytes(hdr) as usize;
+        let mut body = vec![0u8; n];
+        client.read_exact(&mut body).await.unwrap();
+        let reject: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(reject["op"], "AuthReject");
+        assert_eq!(reject["error"], "auth_error");
+        assert_eq!(
+            reject["reason"],
+            "auth token is not valid for requested region"
+        );
+        server.await.unwrap();
+
+        let s = state.lock().await;
+        assert!(
+            !s.workers.contains_key("region-thief"),
+            "wrong-region claim token must not register a worker"
+        );
+        assert!(
+            !matches!(s.region_worker.get("E"), Some(w) if w == "region-thief"),
+            "wrong-region claim token must not claim region ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_connect_claim_token_registers_from_broker_owned_claims() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            s.connect_auth_claims.insert(
+                "w-secret".to_string(),
+                PeerClaims {
+                    region: "W".to_string(),
+                    attributes: HashSet::from(["physics".to_string()]),
+                },
+            );
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"worker-ok",
+                "region":"W",
+                "auth_token":"w-secret"
+            })))
+            .await
+            .unwrap();
+
+        let mut registered = false;
+        for _ in 0..20 {
+            {
+                let s = state.lock().await;
+                registered = s.workers.contains_key("worker-ok")
+                    && matches!(s.region_worker.get("W"), Some(w) if w == "worker-ok")
+                    && s.workers
+                        .get("worker-ok")
+                        .is_some_and(|w| w.attributes.contains("physics"));
+            }
+            if registered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registered,
+            "claim token must register with broker-owned region and attributes"
+        );
+
+        client
+            .write_all(&frame(&json!({"op":"Disconnect"})))
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
