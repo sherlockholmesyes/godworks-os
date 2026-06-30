@@ -1,9 +1,9 @@
 # Snapshot Restore Gate
 
 Godworks snapshots are WAL cut markers, not a second persistence format.
-An admin peer sends `SnapshotMarker`; the broker appends a durable
-`snapshot_marker` record and replies with a `SnapshotManifest` containing the
-current `wal_offset`.
+An admin peer sends `SnapshotMarker`; the broker first flushes staged durable
+transitions, then appends a durable `snapshot_marker` record and replies with a
+`SnapshotManifest` containing the current `wal_offset`.
 
 `SnapshotManifest` is also the restore artifact contract. It carries enough
 schema metadata for future SDKs, tools, replay/eval jobs, and 3D-ready clients
@@ -41,6 +41,8 @@ GW_RESTORE_OFFSET=<SnapshotManifest.wal_offset>
 
 The recovery contract is:
 
+- queued durable transitions that are already accepted by the broker are flushed
+  before the marker names the cut;
 - records before the cut are replayed;
 - records after the cut are ignored;
 - `mesh_out` before the cut restores as an in-flight pending handoff on the
@@ -52,6 +54,7 @@ The task-relative regression gates are:
 
 ```text
 snapshot_marker_restore_offset_rolls_back_post_cut_entities
+snapshot_marker_flushes_pending_update_before_cut
 snapshot_manifest_carries_spatial_schema_contract
 snapshot_manifest_contract_accessors_match_current_wire_shape
 snapshot_manifest_contract_rejects_future_versions

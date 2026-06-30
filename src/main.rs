@@ -925,10 +925,9 @@ fn component_authority_owner(e: &Entity, comp: &str) -> Option<String> {
         .and_then(|ca| ca.owner.clone())
 }
 
-// whether a worker with `attrs` may READ (be checked out) entity `e`
-fn acl_read_ok(attrs: &HashSet<String>, e: &Entity) -> bool {
-    if let Some(read) = e
-        .components
+// whether a worker with `attrs` may READ a component bag.
+fn acl_read_ok_components(attrs: &HashSet<String>, components: &Map<String, Value>) -> bool {
+    if let Some(read) = components
         .get("acl")
         .and_then(|a| a.get("read"))
         .and_then(|r| r.as_array())
@@ -941,6 +940,11 @@ fn acl_read_ok(attrs: &HashSet<String>, e: &Entity) -> bool {
         }
     }
     true
+}
+
+// whether a worker with `attrs` may READ (be checked out) entity `e`
+fn acl_read_ok(attrs: &HashSet<String>, e: &Entity) -> bool {
+    acl_read_ok_components(attrs, &e.components)
 }
 
 fn worker_has_attr(state: &ServerState, wid: &str, attr: &str) -> bool {
@@ -1633,6 +1637,7 @@ struct ServerState {
     // (AddEntity + the component stream) and a client re-checks-out from the neighbour (checkout_all), so no view is lost.
     draining: bool,
     drain_exit: bool, // when a completed drain should std::process::exit(0) (a real rolling deploy); a test can drain-without-exit to assert conservation against the still-running neighbour.
+    monitor_last_tick_ms: u64, // last completed monitor tick wall-clock; health uses age so one old tick cannot fake liveness.
     tick_lag_ms: f64, // #3 metrics: how late the 300ms monitor tick actually fired vs schedule (the broker's saturation signal -- a healthy broker is ~0, a CPU-starved one lags). Measured in the monitor loop.
 }
 
@@ -1733,6 +1738,7 @@ impl ServerState {
             // metrics + assert the neighbour absorbed every entity. Both ADDITIVE: unset => no drain => unchanged.
             draining: std::env::var("GW_DRAIN_ON_START").is_ok(),
             drain_exit: std::env::var("GW_DRAIN_NO_EXIT").is_err(),
+            monitor_last_tick_ms: 0,
             tick_lag_ms: 0.0,
         }
     }
@@ -2047,6 +2053,12 @@ fn process_rss_bytes() -> u64 {
 // the SAME state.metrics the Inspector reads, so the two never diverge. Returned by the `Health` op (ungated: a
 // liveness prober holds no inspector attribute) and folded into the InspectorFrame too.
 fn health_snapshot(state: &ServerState) -> Value {
+    let now = now_millis();
+    let monitor_tick_age_ms = if state.monitor_last_tick_ms == 0 {
+        u64::MAX
+    } else {
+        now.saturating_sub(state.monitor_last_tick_ms)
+    };
     json!({
         "status": if state.draining { "draining" } else if state.wal_degraded { "degraded" } else { "ok" },
         "draining": state.draining,
@@ -2061,6 +2073,8 @@ fn health_snapshot(state: &ServerState) -> Value {
         "fenced_stale_handoffs": state.metrics.fenced_stale_handoffs,
         "wal_compactions": state.metrics.wal_compactions,
         "pending_mesh": state.pending_mesh.len(),
+        "monitor_last_tick_ms": state.monitor_last_tick_ms,
+        "monitor_tick_age_ms": monitor_tick_age_ms,
         "tick_lag_ms": state.tick_lag_ms,
         "lock_max_hold_ms": state.lock_max_hold_ms,
         "rss_bytes": process_rss_bytes(),
@@ -2069,7 +2083,7 @@ fn health_snapshot(state: &ServerState) -> Value {
         "my_region": state.my_region,
         "mesh_regions": state.mesh_regions.iter().cloned().collect::<Vec<String>>(),
         "boundaries": state.boundaries.clone(),
-        "t_server": now_millis(),
+        "t_server": now,
     })
 }
 
@@ -3683,10 +3697,10 @@ fn remove_ghost(state: &mut ServerState, eid: &str) {
     }
 }
 
-// Is this worker interested in a ghost at `pos`? (the ghost analogue of `visible` -- ghosts carry no ACL, so
-// it's just the geometric AOI test). A worker with an AOI covering the seam band sees the neighbour's ghosts.
+// Is this worker interested in and allowed to read a ghost? Ghosts carry the source component bag,
+// so read ACL must apply before a ghost row can feed queries, manifests, or QBI.
 fn ghost_visible(w: &WorkerHandle, g: &GhostEntity) -> bool {
-    w.interested_in(g.pos)
+    w.interested_in(g.pos) && acl_read_ok_components(&w.attributes, &g.components)
 }
 
 // Push a ghost's current state to the interested workers as the SAME AddEntity/ComponentUpdate stream a real
@@ -6210,6 +6224,19 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     return;
                 }
             }
+            // A snapshot cut must describe the canonical RAM state that the returned
+            // wal_offset can replay. Drain staged DurableTransitions first so the
+            // marker cannot name queued WAL records the live world has not published.
+            flush_pending_updates(state);
+            if state.wal_degraded {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","request_id":req_id,
+                    "reason":"wal_degraded: snapshot cut cannot be made while durable queues are unflushed"}),
+                );
+                return;
+            }
             // Record the marker in the WAL FIRST -> the restore replays UP TO this offset (the consistent cut).
             // If the marker is not durable, do not disable compaction or return a manifest for a cut recovery
             // cannot name.
@@ -7730,6 +7757,7 @@ async fn main() {
                 last_wake = Instant::now();
                 let lag = elapsed.as_secs_f64() * 1000.0 - nominal.as_secs_f64() * 1000.0;
                 let mut s = st.lock().await;
+                s.monitor_last_tick_ms = now_millis();
                 s.tick_lag_ms = if lag > 0.0 { lag } else { 0.0 };
                 let _t = Instant::now();
                 check_leases(&mut s);
@@ -8495,6 +8523,97 @@ mod tests {
     fn decode_test_frame(buf: &[u8]) -> Value {
         let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         serde_json::from_slice(&buf[4..4 + n]).unwrap()
+    }
+
+    #[test]
+    fn entity_query_filters_acl_protected_ghosts_before_rows_and_qbi() {
+        let mut state = ServerState::new(30.0);
+        let mut rx_public = add_test_worker_with_rx(&mut state, "public-observer", "OBS");
+        let mut rx_secret = add_test_worker_with_rx(&mut state, "secret-observer", "OBS");
+        for wid in ["public-observer", "secret-observer"] {
+            let worker = state.workers.get_mut(wid).unwrap();
+            worker.aoi_center = Some([0.0, 0.0]);
+            worker.aoi_radius = Some(10.0);
+        }
+        state
+            .workers
+            .get_mut("secret-observer")
+            .unwrap()
+            .attributes
+            .insert("secret_reader".to_string());
+
+        let mut components = Map::new();
+        components.insert("acl".to_string(), json!({"read": ["secret_reader"]}));
+        components.insert("hidden_logic".to_string(), json!({"server_only": true}));
+        state.ghosts.insert(
+            "secret-ghost".to_string(),
+            GhostEntity {
+                pos: [1.0, 0.0],
+                vel: [0.0, 0.0],
+                components,
+                owner_region: "E".to_string(),
+                last_seen: Instant::now(),
+            },
+        );
+
+        dispatch_inner(
+            &mut state,
+            "public-observer",
+            &json!({"op":"EntityQuery","request_id":"public-all","query":{"type":"all"}}),
+        );
+        let public_response =
+            decode_test_frame(&rx_public.try_recv().expect("public query response"));
+        assert_eq!(
+            public_response.get("count").and_then(Value::as_u64),
+            Some(0),
+            "public observer saw an ACL-protected ghost row: {public_response}"
+        );
+
+        dispatch_inner(
+            &mut state,
+            "public-observer",
+            &json!({"op":"EntityQuery","request_id":"public-qbi","query":{"type":"component","comp":"hidden_logic"}}),
+        );
+        let public_qbi = decode_test_frame(&rx_public.try_recv().expect("public qbi response"));
+        assert_eq!(
+            public_qbi.get("count").and_then(Value::as_u64),
+            Some(0),
+            "public QBI matched an ACL-protected ghost component: {public_qbi}"
+        );
+
+        dispatch_inner(
+            &mut state,
+            "secret-observer",
+            &json!({"op":"EntityQuery","request_id":"secret-all","query":{"type":"all"}}),
+        );
+        let secret_response =
+            decode_test_frame(&rx_secret.try_recv().expect("secret query response"));
+        assert_eq!(
+            secret_response.get("count").and_then(Value::as_u64),
+            Some(1),
+            "authorized observer should still see the ghost: {secret_response}"
+        );
+    }
+
+    #[test]
+    fn health_snapshot_reports_stale_and_fresh_monitor_tick_age() {
+        let mut state = ServerState::new(30.0);
+        let stale = health_snapshot(&state);
+        assert_eq!(
+            stale.get("monitor_tick_age_ms").and_then(Value::as_u64),
+            Some(u64::MAX),
+            "a never-ticked monitor loop must not look fresh: {stale}"
+        );
+
+        state.monitor_last_tick_ms = now_millis().saturating_sub(25);
+        let fresh = health_snapshot(&state);
+        assert!(
+            fresh
+                .get("monitor_tick_age_ms")
+                .and_then(Value::as_u64)
+                .is_some_and(|age| age <= 1_000),
+            "recent monitor tick should expose a fresh age: {fresh}"
+        );
     }
 
     #[test]
@@ -10718,6 +10837,91 @@ mod tests {
         assert!(full_report.error.is_none(), "{:?}", full_report.error);
         assert!(full_store.contains_key("pre-cut"));
         assert!(full_store.contains_key("post-cut"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_marker_flushes_pending_update_before_cut() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_snapshot_flush_pending_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        state.ensure_wal_header();
+        add_test_worker(&mut state, "w1", "W");
+        assert!(spawn_in_region(
+            &mut state,
+            "snapshot-ship",
+            [-1.0, 0.0],
+            [0.0, 0.0],
+            Map::new(),
+            Some("W"),
+            SpawnAuthoritySeed::default(),
+        ));
+
+        assert!(apply_one_update(
+            &mut state,
+            "w1",
+            "snapshot-ship",
+            "pos",
+            json!([4.0, 0.0]),
+            None,
+        ));
+        assert_eq!(state.pending_updates.len(), 1);
+        assert_eq!(state.entities["snapshot-ship"].pos, [-1.0, 0.0]);
+
+        let mut rx = add_test_worker_with_rx(&mut state, "snap", "OBS");
+        state
+            .workers
+            .get_mut("snap")
+            .unwrap()
+            .attributes
+            .insert("snapshot".to_string());
+
+        dispatch_test_frame(
+            &mut state,
+            "snap",
+            &json!({"op":"SnapshotMarker","request_id":"s1","snapshot_id":"flush-cut"}),
+        );
+
+        let manifest = decode_test_frame(&rx.try_recv().expect("snapshot manifest must emit"));
+        assert_eq!(manifest["op"], "SnapshotManifest");
+        let cut_offset = manifest["wal_offset"]
+            .as_u64()
+            .expect("manifest must expose a WAL cut offset");
+        assert!(state.pending_updates.is_empty());
+        assert_eq!(state.entities["snapshot-ship"].pos, [4.0, 0.0]);
+        drop(state.wal.take());
+
+        let (cut_store, _deleted, _cfg, cut_pending, _id_hwm, cut_report) =
+            recover_from_wal_report(&wal_path, Some(cut_offset));
+        assert!(cut_report.error.is_none(), "{:?}", cut_report.error);
+        let recovered = cut_store
+            .get("snapshot-ship")
+            .expect("snapshot cut must recover the updated entity");
+        assert_eq!(
+            recovered.pos,
+            [4.0, 0.0],
+            "restore from SnapshotManifest offset did not reproduce marker-time live state"
+        );
+        assert!(cut_pending.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
