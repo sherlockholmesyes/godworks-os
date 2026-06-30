@@ -9844,6 +9844,208 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_marker_restore_offset_rolls_back_post_cut_entities() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_snapshot_restore_cut_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        state.ensure_wal_header();
+
+        assert!(spawn_in_region(
+            &mut state,
+            "pre-cut",
+            [-1.0, 0.0],
+            [0.0, 0.0],
+            Map::new(),
+            Some("W"),
+            SpawnAuthoritySeed::default(),
+        ));
+
+        let mut rx = add_test_worker_with_rx(&mut state, "snap", "OBS");
+        state
+            .workers
+            .get_mut("snap")
+            .unwrap()
+            .attributes
+            .insert("snapshot".to_string());
+
+        dispatch_test_frame(
+            &mut state,
+            "snap",
+            &json!({"op":"SnapshotMarker","request_id":"s1","snapshot_id":"cut-1"}),
+        );
+
+        let manifest = decode_test_frame(&rx.try_recv().expect("snapshot manifest must emit"));
+        assert_eq!(manifest["op"], "SnapshotManifest");
+        assert_eq!(manifest["snapshot_id"], "cut-1");
+        let cut_offset = manifest["wal_offset"]
+            .as_u64()
+            .expect("manifest must expose a WAL cut offset");
+
+        assert!(spawn_in_region(
+            &mut state,
+            "post-cut",
+            [1.0, 0.0],
+            [0.0, 0.0],
+            Map::new(),
+            Some("E"),
+            SpawnAuthoritySeed::default(),
+        ));
+        drop(state.wal.take());
+
+        let (cut_store, _deleted, _cfg, cut_pending, _id_hwm, cut_report) =
+            recover_from_wal_report(&wal_path, Some(cut_offset));
+        assert!(cut_report.error.is_none(), "{:?}", cut_report.error);
+        assert_eq!(
+            cut_report.kind_counts.get("snapshot_marker").copied(),
+            Some(1)
+        );
+        assert!(cut_store.contains_key("pre-cut"));
+        assert!(
+            !cut_store.contains_key("post-cut"),
+            "restore-to-cut must not leak entities created after the snapshot marker"
+        );
+        assert!(cut_pending.is_empty());
+
+        let (full_store, _deleted, _cfg, _pending, _id_hwm, full_report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(full_report.error.is_none(), "{:?}", full_report.error);
+        assert!(full_store.contains_key("pre-cut"));
+        assert!(full_store.contains_key("post-cut"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_vector_restores_in_flight_mesh_handoff_exactly_once() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_snapshot_mesh_pending_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.my_region = "W".to_string();
+        state.region_lease_epoch.insert("W".to_string(), 7);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        state.ensure_wal_header();
+        add_test_worker(&mut state, "w1", "W");
+
+        let mut ship = test_physics_island_entity([-1.0, 2.0], "W");
+        stamp_expanded_physics_island_epochs(&mut ship);
+        state.entities.insert("ship".to_string(), ship);
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        let (tx, mut mesh_rx) = mpsc::unbounded_channel();
+        state.mesh.insert("E".to_string(), tx);
+        mesh_forward(&mut state, "ship", "E");
+        let handoff = decode_test_frame(
+            &mesh_rx
+                .try_recv()
+                .expect("mesh handoff must be emitted after durable mesh_out"),
+        );
+        assert_eq!(handoff["op"], "MeshHandoff");
+        assert!(!state.entities.contains_key("ship"));
+        assert!(state.pending_mesh.contains_key("ship"));
+
+        let mut rx = add_test_worker_with_rx(&mut state, "snap", "OBS");
+        state
+            .workers
+            .get_mut("snap")
+            .unwrap()
+            .attributes
+            .insert("snapshot".to_string());
+        dispatch_test_frame(
+            &mut state,
+            "snap",
+            &json!({"op":"SnapshotMarker","request_id":"s1","snapshot_id":"mesh-cut"}),
+        );
+        let manifest = decode_test_frame(&rx.try_recv().expect("snapshot manifest must emit"));
+        assert_eq!(manifest["op"], "SnapshotManifest");
+        assert_eq!(manifest["pending_mesh"], 1);
+        assert_eq!(
+            manifest["in_flight"]
+                .as_array()
+                .expect("manifest must list in-flight mesh handoffs")
+                .len(),
+            1
+        );
+        let cut_offset = manifest["wal_offset"]
+            .as_u64()
+            .expect("manifest must expose a WAL cut offset");
+
+        let (cut_store, _deleted, _cfg, cut_pending, _id_hwm, cut_report) =
+            recover_from_wal_report(&wal_path, Some(cut_offset));
+        assert!(cut_report.error.is_none(), "{:?}", cut_report.error);
+        assert!(
+            !cut_store.contains_key("ship"),
+            "source recovery at the cut must not resurrect a departed mesh entity"
+        );
+        let recovered_handoff = cut_pending
+            .get("ship")
+            .expect("mesh_out before the cut must recover as an in-flight handoff");
+        assert_eq!(recovered_handoff["kind"], "mesh_out");
+        assert_eq!(recovered_handoff["target"], "E");
+        assert_eq!(recovered_handoff["pos"], json!([-1.0, 2.0]));
+        let recovered_components = recovered_handoff["components"]
+            .as_object()
+            .expect("mesh_out must retain component payload");
+        for comp in ["rot", "lin", "ang", "at_rest"] {
+            assert!(
+                recovered_components.contains_key(comp),
+                "mesh_out must retain physics payload component {comp}"
+            );
+        }
+
+        assert!(record_mesh_ack(&mut state, "ship"));
+        drop(state.wal.take());
+
+        let (full_store, _deleted, _cfg, full_pending, _id_hwm, full_report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(full_report.error.is_none(), "{:?}", full_report.error);
+        assert!(
+            !full_store.contains_key("ship"),
+            "source full recovery must not regain an acked mesh entity"
+        );
+        assert!(
+            !full_pending.contains_key("ship"),
+            "mesh_acked after the cut must clear the recovered pending handoff"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn component_add_remove_wal_fail_does_not_mutate_ram() {
         let mut add_state = ServerState::new(30.0);
         add_state.wal_fail_inject = true;
