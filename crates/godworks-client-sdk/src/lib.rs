@@ -946,6 +946,71 @@ mod tests {
     }
 
     #[test]
+    fn bridge_snapshot_marks_ghost_rows_without_authority() {
+        let mut bridge = ClientBridge::new();
+        assert_eq!(
+            bridge.apply_stream_op(&Op::MeshGhost(MeshGhost {
+                fields: JsonFields {
+                    fields: Map::from_iter([
+                        ("entity".to_string(), json!("remote")),
+                        ("pos".to_string(), json!([8.0, 9.0])),
+                        ("owner_region".to_string(), json!("E")),
+                        ("components".to_string(), json!({"kind":"ghost"})),
+                    ]),
+                },
+            })),
+            ClientBridgeEvent::Stream(ClientCacheEvent::EntityAdded(EntityId::from("remote")))
+        );
+
+        let snapshot = bridge.snapshot();
+        assert_eq!(snapshot.entity_count, 1);
+        let row = &snapshot.entities[0];
+        assert_eq!(row.entity, "remote");
+        assert!(row.ghost);
+        assert_eq!(row.owner_region.as_deref(), Some("E"));
+        assert_eq!(row.position2, Some([8.0, 9.0]));
+        assert_eq!(row.components.get("kind"), Some(&json!("ghost")));
+        assert_eq!(row.components.get("ghost"), Some(&json!(true)));
+        assert_eq!(row.components.get("owner_region"), Some(&json!("E")));
+        assert!(row.authority.is_empty());
+
+        assert_eq!(
+            bridge.on_transport_closed(),
+            ClientBridgeEvent::PhaseChanged(ClientConnectionPhase::Disconnected)
+        );
+        assert_eq!(bridge.snapshot().entity_count, 0);
+        assert!(!bridge.cache().contains("remote"));
+    }
+
+    #[test]
+    fn bridge_snapshot_entity_order_is_stable() {
+        let mut bridge = ClientBridge::new();
+        for entity in ["zeta", "alpha", "middle"] {
+            bridge.apply_stream_op(&Op::AddEntity(AddEntity {
+                entity: EntityId::from(entity),
+                components: Some(json!({"pos":[0.0,0.0]})),
+            }));
+        }
+        bridge.apply_stream_op(&Op::MeshGhost(MeshGhost {
+            fields: JsonFields {
+                fields: Map::from_iter([
+                    ("entity".to_string(), json!("beta")),
+                    ("pos".to_string(), json!([1.0, 1.0])),
+                    ("owner_region".to_string(), json!("E")),
+                ]),
+            },
+        }));
+
+        let snapshot = bridge.snapshot();
+        let names: Vec<_> = snapshot
+            .entities
+            .iter()
+            .map(|row| row.entity.as_str())
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta", "middle", "zeta"]);
+    }
+
+    #[test]
     fn cache_critical_section_depth_never_underflows_across_reconnect() {
         let mut cache = ClientCache::new();
         cache.apply_op(&Op::CriticalSection(CriticalSection {
