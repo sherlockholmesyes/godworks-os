@@ -48,6 +48,7 @@ impl PeerRole {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     WorkerConnect(WorkerConnect),
+    AuthReject(AuthReject),
     Disconnect,
     Heartbeat(Heartbeat),
     Interest(Interest),
@@ -96,6 +97,7 @@ pub struct WorkerConnect {
     pub region: RegionId,
     pub proto: Option<u64>,
     pub attributes: Vec<String>,
+    pub auth_token: Option<String>,
 }
 
 impl WorkerConnect {
@@ -106,6 +108,13 @@ impl WorkerConnect {
     pub fn protocol_is_supported(&self) -> bool {
         self.proto.map(supports_protocol).unwrap_or(true)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthReject {
+    pub worker_id: Option<PeerId>,
+    pub error: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -440,6 +449,7 @@ mod tests {
             region: RegionId::from("W"),
             proto: None,
             attributes: Vec::new(),
+            auth_token: None,
         };
         let future = WorkerConnect {
             proto: Some(PROTOCOL_VERSION + 1),

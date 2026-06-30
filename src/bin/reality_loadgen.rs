@@ -51,6 +51,24 @@ async fn write_raw(stream: &mut TcpStream, v: &Value) -> std::io::Result<()> {
     stream.write_all(&frame(v)).await
 }
 
+fn auth_token() -> Option<String> {
+    env::var("GW_AUTH_TOKEN").ok().filter(|s| !s.is_empty())
+}
+
+fn worker_connect_value(wid: &str, region: &str, attributes: &[&str]) -> Value {
+    let mut value = json!({
+        "op":"WorkerConnect",
+        "worker_id":wid,
+        "region":region,
+        "attributes":attributes,
+        "proto":1
+    });
+    if let Some(token) = auth_token() {
+        value["auth_token"] = json!(token);
+    }
+    value
+}
+
 #[derive(Default)]
 struct Counters {
     add_entity: AtomicU64,
@@ -144,14 +162,8 @@ async fn connect_endpoint(
     let stream = TcpStream::connect((host, port)).await?;
     stream.set_nodelay(true).ok();
     let (rd, mut wr) = stream.into_split();
-    wr.write_all(&frame(&json!({
-        "op":"WorkerConnect",
-        "worker_id":wid,
-        "region":region,
-        "attributes":attributes,
-        "proto":1
-    })))
-    .await?;
+    wr.write_all(&frame(&worker_connect_value(wid, region, attributes)))
+        .await?;
     Ok(Endpoint {
         rd,
         wr: Arc::new(Mutex::new(wr)),
@@ -163,7 +175,7 @@ async fn connect_slow_viewer(host: &str, port: u16, wid: &str) -> std::io::Resul
     stream.set_nodelay(true).ok();
     write_raw(
         &mut stream,
-        &json!({"op":"WorkerConnect","worker_id":wid,"region":"OBS","attributes":["observer"],"proto":1}),
+        &worker_connect_value(wid, "OBS", &["observer"]),
     )
     .await?;
     write_raw(

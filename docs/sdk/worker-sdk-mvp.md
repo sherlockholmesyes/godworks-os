@@ -7,6 +7,7 @@ This product-hardening slice adds a small Rust Worker SDK over the typed v1 prot
 Included:
 
 - worker registration through `WorkerConnect`;
+- optional `auth_token` forwarding for brokers configured with `GW_AUTH_TOKEN`;
 - AOI / `Interest` helpers;
 - length-prefixed JSON frame read/write helpers;
 - typed send helpers for `UpdateComponent` and `BatchUpdate`;

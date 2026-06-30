@@ -44,8 +44,8 @@ use godworks_protocol::{
     AddEntity, AuthorityChange, BatchUpdate, ComponentUpdate, Op, RemoveEntity, UpdateRejected,
 };
 use godworks_worker_sdk::{
-    batch_entry, circle_interest, create_entity_op, disconnect_op, fold_op, heartbeat_op,
-    legacy_worker_connect_op, read_op, write_op,
+    batch_entry, circle_interest, create_entity_op, disconnect_op, fold_op, heartbeat_op, read_op,
+    worker_connect_op, write_op,
 };
 use rapier2d::prelude::*;
 use serde_json::{json, Value};
@@ -132,6 +132,10 @@ async fn main() {
     let port: u16 = env_u64("GW_ZW_PORT", 7777) as u16;
     let region = env_str("GW_ZW_REGION", "W");
     let wid = env_str("GW_ZW_ID", &format!("zw-{region}"));
+    let auth_token = env::var("GW_ZW_AUTH_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| env::var("GW_AUTH_TOKEN").ok().filter(|s| !s.is_empty()));
     let hz = env_f32("GW_ZW_HZ", 30.0).max(1.0);
     let dt = 1.0 / hz;
     let spawn_n = env_u64("GW_ZW_SPAWN", 0);
@@ -205,7 +209,7 @@ async fn main() {
 
     write_op(
         &mut wr,
-        &legacy_worker_connect_op(wid.clone(), region.clone()),
+        &worker_connect_op(wid.clone(), region.clone(), auth_token),
     )
     .await
     .ok();

@@ -8,20 +8,27 @@ use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId, 
 use serde_json::{json, Map, Value};
 
 use crate::{
-    AddComponent, AddEntity, AuthorityChange, BatchUpdate, BatchUpdateEntry, CommandRequest,
-    CommandResponse, ComponentUpdate, CreateEntity, CreateEntityResponse, CriticalSection,
-    DeleteEntity, DeleteEntityResponse, EntityEvent, EntityQuery, EntityQueryResponse, FlagUpdate,
-    Fold, Heartbeat, InspectorFrame, InspectorQuery, Interest, JsonFields, LogMessage, MeshAck,
-    MeshGhost, MeshGhostRemove, MeshHandoff, Metrics, Op, ProtocolError, RemoveComponent,
-    RemoveEntity, ReserveEntityIds, ReserveEntityIdsResponse, SetComponentAuthority,
-    SetComponentAuthorityResponse, SnapshotMarker, ThresholdTx, ThresholdTxResponse,
-    UpdateComponent, UpdateRejected, WorkerConnect,
+    AddComponent, AddEntity, AuthReject, AuthorityChange, BatchUpdate, BatchUpdateEntry,
+    CommandRequest, CommandResponse, ComponentUpdate, CreateEntity, CreateEntityResponse,
+    CriticalSection, DeleteEntity, DeleteEntityResponse, EntityEvent, EntityQuery,
+    EntityQueryResponse, FlagUpdate, Fold, Heartbeat, InspectorFrame, InspectorQuery, Interest,
+    JsonFields, LogMessage, MeshAck, MeshGhost, MeshGhostRemove, MeshHandoff, Metrics, Op,
+    ProtocolError, RemoveComponent, RemoveEntity, ReserveEntityIds, ReserveEntityIdsResponse,
+    SetComponentAuthority, SetComponentAuthorityResponse, SnapshotMarker, ThresholdTx,
+    ThresholdTxResponse, UpdateComponent, UpdateRejected, WorkerConnect,
 };
 
 pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
     let op = required_str(value, "op")?;
     match op {
         "WorkerConnect" => decode_worker_connect(value),
+        "AuthReject" => Ok(Op::AuthReject(AuthReject {
+            worker_id: optional_str(value, "worker_id").map(PeerId::from),
+            error: optional_str(value, "error")
+                .unwrap_or("auth_error")
+                .to_string(),
+            reason: optional_str(value, "reason").unwrap_or("").to_string(),
+        })),
         "Disconnect" => Ok(Op::Disconnect),
         "Heartbeat" => Ok(Op::Heartbeat(Heartbeat {
             worker_id: optional_str(value, "worker_id").map(PeerId::from),
@@ -152,6 +159,7 @@ pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
 pub fn encode_json_value(op: &Op) -> Value {
     match op {
         Op::WorkerConnect(op) => encode_worker_connect(op),
+        Op::AuthReject(op) => encode_auth_reject(op),
         Op::Disconnect => json!({ "op": "Disconnect" }),
         Op::Heartbeat(op) => encode_heartbeat(op),
         Op::Interest(op) => encode_interest(op),
@@ -222,6 +230,7 @@ fn decode_worker_connect(value: &Value) -> Result<Op, ProtocolError> {
         region: RegionId::from(required_str(value, "region")?),
         proto,
         attributes,
+        auth_token: optional_str(value, "auth_token").map(str::to_string),
     }))
 }
 
@@ -358,6 +367,19 @@ fn encode_worker_connect(op: &WorkerConnect) -> Value {
     if !op.attributes.is_empty() {
         obj.insert("attributes".to_string(), json!(&op.attributes));
     }
+    if let Some(auth_token) = &op.auth_token {
+        obj.insert("auth_token".to_string(), json!(auth_token));
+    }
+    Value::Object(obj)
+}
+
+fn encode_auth_reject(op: &AuthReject) -> Value {
+    let mut obj = object_with_op("AuthReject");
+    if let Some(worker_id) = &op.worker_id {
+        obj.insert("worker_id".to_string(), json!(worker_id.as_ref()));
+    }
+    obj.insert("error".to_string(), json!(op.error));
+    obj.insert("reason".to_string(), json!(op.reason));
     Value::Object(obj)
 }
 
@@ -658,6 +680,22 @@ mod tests {
             "region": "W",
             "attributes": ["physics", "server"],
             "proto": PROTOCOL_VERSION,
+        }));
+    }
+
+    #[test]
+    fn worker_connect_auth_token_roundtrips() {
+        assert_roundtrip(json!({
+            "op": "WorkerConnect",
+            "worker_id": "zw-W",
+            "region": "W",
+            "auth_token": "test-token"
+        }));
+        assert_roundtrip(json!({
+            "op": "AuthReject",
+            "worker_id": "zw-W",
+            "error": "auth_error",
+            "reason": "authentication required"
         }));
     }
 

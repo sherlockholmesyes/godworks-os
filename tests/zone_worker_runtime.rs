@@ -40,8 +40,12 @@ fn wait_for_port(port: u16) {
 }
 
 fn start_broker(label: &str, port: u16) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_godworks_broker"))
-        .env("GW_HOST", "127.0.0.1")
+    start_broker_with_auth(label, port, None)
+}
+
+fn start_broker_with_auth(label: &str, port: u16, auth_token: Option<&str>) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_godworks_broker"));
+    cmd.env("GW_HOST", "127.0.0.1")
         .env("GW_PORT", port.to_string())
         .env("GW_WAL", unique_wal(label))
         .env("GW_DURABLE_FLUSH_MS", "5")
@@ -49,9 +53,13 @@ fn start_broker(label: &str, port: u16) -> Child {
         .env_remove("GW_BOUNDARIES")
         .env_remove("GW_GRID2D")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn broker");
+        .stderr(Stdio::null());
+    if let Some(token) = auth_token {
+        cmd.env("GW_AUTH_TOKEN", token);
+    } else {
+        cmd.env_remove("GW_AUTH_TOKEN");
+    }
+    let child = cmd.spawn().expect("spawn broker");
     wait_for_port(port);
     child
 }
@@ -64,6 +72,19 @@ fn start_worker(
     spawn_n: usize,
     spawn_box: Option<&str>,
     duration: &str,
+) -> Child {
+    start_worker_with_auth(port, region, worker_id, spawn_n, spawn_box, duration, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_worker_with_auth(
+    port: u16,
+    region: &str,
+    worker_id: &str,
+    spawn_n: usize,
+    spawn_box: Option<&str>,
+    duration: &str,
+    auth_token: Option<&str>,
 ) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zone_worker"));
     cmd.env("GW_ZW_HOST", "127.0.0.1")
@@ -78,6 +99,12 @@ fn start_worker(
         .env("GW_ZW_SEED", "42")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    if let Some(token) = auth_token {
+        cmd.env("GW_ZW_AUTH_TOKEN", token);
+    } else {
+        cmd.env_remove("GW_ZW_AUTH_TOKEN");
+        cmd.env_remove("GW_AUTH_TOKEN");
+    }
     if let Some(b) = spawn_box {
         cmd.env("GW_ZW_SPAWN_BOX", b);
     } else {
@@ -255,6 +282,31 @@ fn create_storm_named_region_every_created_entity_ends_owned() {
     assert_eq!(summary_usize(&summary, "auth_loss"), 0, "{stderr}");
     assert_eq!(summary_usize(&summary, "rejects"), 0, "{stderr}");
     assert_eq!(summary_usize(&summary, "owned"), 100, "{stderr}");
+}
+
+#[test]
+fn zone_worker_auth_token_connects_to_auth_broker() {
+    let port = free_port();
+    let mut broker = start_broker_with_auth("auth_zone_worker", port, Some("test-shared-secret"));
+    let worker = start_worker_with_auth(
+        port,
+        "EARTH",
+        "zw-auth",
+        4,
+        Some("1,2,1,2"),
+        "1.4",
+        Some("test-shared-secret"),
+    );
+    let out = wait_output(worker);
+    stop(&mut broker);
+    assert!(out.status.success(), "zone_worker failed: {:?}", out.status);
+    let stderr = stderr_text(&out);
+    let summary = parse_summary(&stderr);
+    assert_eq!(summary.get("region").and_then(Value::as_str), Some("EARTH"));
+    assert_eq!(summary_usize(&summary, "auth_gain"), 4, "{stderr}");
+    assert_eq!(summary_usize(&summary, "auth_loss"), 0, "{stderr}");
+    assert_eq!(summary_usize(&summary, "rejects"), 0, "{stderr}");
+    assert_eq!(summary_usize(&summary, "owned"), 4, "{stderr}");
 }
 
 #[test]

@@ -38,6 +38,7 @@ full SpatialOS replacement
 - Coarse fidelity updates.
 - Backpressure and bounded egress channels.
 - Max frame size and basic per-peer ingress frame rate limits.
+- Basic shared-token WorkerConnect authentication.
 - Health/inspector-oriented runtime state.
 - Rapier2D physics worker demo.
 - Reality/load harness.
@@ -81,7 +82,7 @@ The runtime needs a repeatable operations story:
 
 The product needs a formal security layer:
 
-- worker/client authentication;
+- stronger worker/client authentication and identity binding;
 - mesh authentication;
 - broader per-principal rate-limit policy;
 - observer/global-interest permissions;

@@ -68,6 +68,10 @@ fn parse_nonnegative_f64_env(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn parse_nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.is_empty())
+}
+
 // ── DYNAMIC SPLITTING (load-based capacity-add, not just the W|E boundary-shift) ──
 // A coarse region under sustained high load SPLITS into sub-bands, each owned by a fresh
 // standby worker -- this ADDS capacity (rebalance() only shifts the W|E line between two
@@ -1476,6 +1480,7 @@ struct ServerState {
     load_level: u8, // L3 graceful-degradation: 0 normal / 1 stressed / 2 overloaded (derived from the egress backlog); degradation keys off this; recovers when load clears
     ingress_rate_per_sec: f64, // Security v0: frame token refill per worker/peer
     ingress_burst_frames: f64, // Security v0: max accumulated inbound frame tokens per worker/peer
+    connect_auth_token: Option<String>, // Security v0: optional shared secret required on WorkerConnect before registration
     mesh: HashMap<String, UnboundedSender<Vec<u8>>>, // region -> link to the neighbour BROKER owning it (N-neighbour cross-broker mesh)
     // B1 cross-broker seam: entities handed EAST but not yet ACK'd by the neighbour. The forward removes
     // the entity from `entities` but parks it here (the MeshHandoff frame + when-sent) until a MeshAck
@@ -1592,6 +1597,7 @@ impl ServerState {
                 DEFAULT_INGRESS_BURST_FRAMES,
             )
             .max(1.0),
+            connect_auth_token: parse_nonempty_env("GW_AUTH_TOKEN"),
             mesh: HashMap::new(),
             pending_mesh: HashMap::new(),
             mesh_regions: HashSet::new(),
@@ -2626,6 +2632,19 @@ fn frame(v: &Value) -> Vec<u8> {
     out.extend_from_slice(&n.to_be_bytes());
     out.extend_from_slice(&body);
     out
+}
+
+fn worker_connect_frame(worker_id: &str, region: &str, auth_token: Option<&str>) -> Vec<u8> {
+    let mut v = json!({
+        "op": "WorkerConnect",
+        "worker_id": worker_id,
+        "region": region,
+        "proto": PROTOCOL_VERSION
+    });
+    if let Some(token) = auth_token {
+        v["auth_token"] = json!(token);
+    }
+    frame(&v)
 }
 
 fn emit(state: &ServerState, wid: &str, v: Value) {
@@ -6642,6 +6661,10 @@ async fn read_frame<R: AsyncReadExt + Unpin>(rd: &mut R) -> Option<Value> {
     serde_json::from_slice(&body).ok()
 }
 
+fn auth_token_matches(required: Option<&str>, provided: Option<&str>) -> bool {
+    required.is_none_or(|expected| provided == Some(expected))
+}
+
 async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>) {
     sock.set_nodelay(true).ok();
     let (mut rd, mut wr) = sock.into_split();
@@ -6689,6 +6712,27 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
             println!("[broker] worker '{wid}' REJECTED -- incompatible proto {proto} (broker {PROTOCOL_VERSION}, min {MIN_PROTO})");
             return; // do NOT register; the connection drops as wr/rd go out of scope
         }
+    }
+
+    // Security v0: optional shared-secret connect gate. This is intentionally BEFORE worker registration,
+    // before region lease, before egress channel allocation, and before the peer can claim privileged
+    // attributes. Unset GW_AUTH_TOKEN preserves the dev/test wire shape. Set GW_AUTH_TOKEN makes the broker
+    // fail closed for WorkerConnect frames whose auth_token is absent or mismatched. The token is never logged.
+    let required_auth = {
+        let s = state.lock().await;
+        s.connect_auth_token.clone()
+    };
+    let provided_auth = first.get("auth_token").and_then(|v| v.as_str());
+    if !auth_token_matches(required_auth.as_deref(), provided_auth) {
+        let rej = frame(&json!({
+            "op": "AuthReject",
+            "worker_id": wid,
+            "error": "auth_error",
+            "reason": "authentication required"
+        }));
+        let _ = wr.write_all(&rej).await;
+        println!("[broker] worker '{wid}' REJECTED -- auth failed");
+        return; // do NOT register; the connection drops as wr/rd go out of scope
     }
 
     // T1: BOUNDED egress channel (capacity CHANNEL_CAP). A stuck consumer can hold AT MOST CHANNEL_CAP unsent
@@ -6889,8 +6933,14 @@ fn spawn_mesh_link_dynamic(st: Arc<Mutex<ServerState>>, region: String, reg_dir:
                 if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
                     stream.set_nodelay(true).ok();
                     let (mut rd, mut wr) = stream.into_split();
-                    let hs = frame(
-                        &json!({"op":"WorkerConnect","worker_id":format!("mesh-link-{region}"),"region":"MESH","proto":PROTOCOL_VERSION}),
+                    let token = {
+                        let s = st.lock().await;
+                        s.connect_auth_token.clone()
+                    };
+                    let hs = worker_connect_frame(
+                        &format!("mesh-link-{region}"),
+                        "MESH",
+                        token.as_deref(),
                     );
                     if wr.write_all(&hs).await.is_ok() {
                         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -7179,6 +7229,112 @@ mod tests {
             .expect("oversized header should return before reading a body");
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn worker_connect_auth_token_matcher_is_fail_closed_when_configured() {
+        assert!(auth_token_matches(None, None));
+        assert!(auth_token_matches(None, Some("anything")));
+        assert!(auth_token_matches(Some("secret"), Some("secret")));
+        assert!(!auth_token_matches(Some("secret"), None));
+        assert!(!auth_token_matches(Some("secret"), Some("wrong")));
+    }
+
+    #[tokio::test]
+    async fn worker_connect_auth_rejects_before_registration() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            s.connect_auth_token = Some("secret".to_string());
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"intruder",
+                "region":"W"
+            })))
+            .await
+            .unwrap();
+
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await.unwrap();
+        let n = u32::from_be_bytes(hdr) as usize;
+        let mut body = vec![0u8; n];
+        client.read_exact(&mut body).await.unwrap();
+        let reject: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(reject["op"], "AuthReject");
+        assert_eq!(reject["error"], "auth_error");
+        assert_eq!(reject["worker_id"], "intruder");
+        server.await.unwrap();
+
+        let s = state.lock().await;
+        assert!(
+            !s.workers.contains_key("intruder"),
+            "failed auth must not register a worker"
+        );
+        assert!(
+            !matches!(s.region_worker.get("W"), Some(w) if w == "intruder"),
+            "failed auth must not claim region ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_connect_auth_accepts_matching_token_before_disconnect() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            s.connect_auth_token = Some("secret".to_string());
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"worker-ok",
+                "region":"W",
+                "auth_token":"secret"
+            })))
+            .await
+            .unwrap();
+
+        let mut registered = false;
+        for _ in 0..20 {
+            {
+                let s = state.lock().await;
+                registered = s.workers.contains_key("worker-ok")
+                    && matches!(s.region_worker.get("W"), Some(w) if w == "worker-ok");
+            }
+            if registered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(registered, "matching auth token must register the worker");
+
+        client
+            .write_all(&frame(&json!({"op":"Disconnect"})))
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     #[test]
@@ -8884,8 +9040,14 @@ async fn main() {
                 if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
                     stream.set_nodelay(true).ok();
                     let (mut rd, mut wr) = stream.into_split();
-                    let hs = frame(
-                        &json!({"op":"WorkerConnect","worker_id":format!("mesh-link-{region}"),"region":"MESH","proto":PROTOCOL_VERSION}),
+                    let token = {
+                        let s = st.lock().await;
+                        s.connect_auth_token.clone()
+                    };
+                    let hs = worker_connect_frame(
+                        &format!("mesh-link-{region}"),
+                        "MESH",
+                        token.as_deref(),
                     );
                     if wr.write_all(&hs).await.is_ok() {
                         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();

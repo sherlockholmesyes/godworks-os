@@ -37,7 +37,12 @@ fn wait_for_port(port: u16) {
     panic!("broker did not open port {port}");
 }
 
-fn start_broker(port: u16, region: &str, mesh: Option<(String, u16)>) -> Child {
+fn start_broker(
+    port: u16,
+    region: &str,
+    mesh: Option<(String, u16)>,
+    auth_token: Option<&str>,
+) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_godworks_broker"));
     cmd.env("GW_HOST", "127.0.0.1")
         .env("GW_PORT", port.to_string())
@@ -54,6 +59,11 @@ fn start_broker(port: u16, region: &str, mesh: Option<(String, u16)>) -> Child {
         );
     } else {
         cmd.env_remove("GW_MESH");
+    }
+    if let Some(token) = auth_token {
+        cmd.env("GW_AUTH_TOKEN", token);
+    } else {
+        cmd.env_remove("GW_AUTH_TOKEN");
     }
     let child = cmd.spawn().expect("spawn broker");
     wait_for_port(port);
@@ -86,18 +96,17 @@ fn metric_u64(metrics: &HashMap<String, String>, key: &str) -> u64 {
         .unwrap_or_else(|_| panic!("bad integer metric {key}: {metrics:?}"))
 }
 
-#[test]
-fn cross_broker_reality_loadgen_requires_mesh_adoption() {
+fn run_cross_broker_reality_loadgen(auth_token: Option<&str>) {
     let port_w = free_port();
     let port_e = free_port();
     assert_ne!(port_w, port_e);
 
-    let mut broker_e = start_broker(port_e, "E", None);
-    let mut broker_w = start_broker(port_w, "W", Some(("E".to_string(), port_e)));
+    let mut broker_e = start_broker(port_e, "E", None, auth_token);
+    let mut broker_w = start_broker(port_w, "W", Some(("E".to_string(), port_e)), auth_token);
     sleep(Duration::from_millis(900));
 
-    let output = Command::new(env!("CARGO_BIN_EXE_reality_loadgen"))
-        .env("GW_HOST", "127.0.0.1")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_reality_loadgen"));
+    cmd.env("GW_HOST", "127.0.0.1")
         .env("GW_TARGET", port_w.to_string())
         .env("GW_TARGET_E", port_e.to_string())
         .env("GW_ENTITIES", "4")
@@ -105,9 +114,13 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         .env("GW_HZ", "35")
         .env("GW_EVENT_BURST", "6")
         .env("GW_REQUIRE_MESH", "1")
-        .env("GW_SLOW_VIEWER", "1")
-        .output()
-        .expect("run reality_loadgen");
+        .env("GW_SLOW_VIEWER", "1");
+    if let Some(token) = auth_token {
+        cmd.env("GW_AUTH_TOKEN", token);
+    } else {
+        cmd.env_remove("GW_AUTH_TOKEN");
+    }
+    let output = cmd.output().expect("run reality_loadgen");
 
     stop(&mut broker_w);
     stop(&mut broker_e);
@@ -136,4 +149,14 @@ fn cross_broker_reality_loadgen_requires_mesh_adoption() {
         metric_u64(&metrics, "east_visible") > 0,
         "east broker never saw the crossed bodies: {metrics:?}"
     );
+}
+
+#[test]
+fn cross_broker_reality_loadgen_requires_mesh_adoption() {
+    run_cross_broker_reality_loadgen(None);
+}
+
+#[test]
+fn cross_broker_reality_loadgen_with_worker_auth_still_adopts_mesh() {
+    run_cross_broker_reality_loadgen(Some("test-shared-secret"));
 }

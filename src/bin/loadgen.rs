@@ -29,6 +29,18 @@ fn frame(v: &Value) -> Vec<u8> {
     o
 }
 
+fn auth_token() -> Option<String> {
+    env::var("GW_AUTH_TOKEN").ok().filter(|s| !s.is_empty())
+}
+
+fn worker_connect_value(worker_id: String, region: &str) -> Value {
+    let mut value = json!({"op":"WorkerConnect","worker_id":worker_id,"region":region});
+    if let Some(token) = auth_token() {
+        value["auth_token"] = json!(token);
+    }
+    value
+}
+
 async fn read_frame<R: AsyncReadExt + Unpin>(rd: &mut R) -> Option<Value> {
     let mut h = [0u8; 4];
     rd.read_exact(&mut h).await.ok()?;
@@ -59,9 +71,10 @@ async fn drive_zone(
     vs.set_nodelay(true).ok();
     let (mut vrd, vwr) = vs.into_split();
     let mut vwr = vwr;
-    vwr.write_all(&frame(
-        &json!({"op":"WorkerConnect","worker_id":format!("lg-obs-{region}"),"region":"OBS"}),
-    ))
+    vwr.write_all(&frame(&worker_connect_value(
+        format!("lg-obs-{region}"),
+        "OBS",
+    )))
     .await
     .unwrap();
     let recv2 = recv.clone();
@@ -87,9 +100,10 @@ async fn drive_zone(
         .expect("owner connect");
     owner.set_nodelay(true).ok();
     let (mut ord, mut owr) = owner.into_split();
-    owr.write_all(&frame(
-        &json!({"op":"WorkerConnect","worker_id":format!("lg-{region}"),"region":region}),
-    ))
+    owr.write_all(&frame(&worker_connect_value(
+        format!("lg-{region}"),
+        region,
+    )))
     .await
     .unwrap();
     owr.write_all(&frame(&json!({"op":"CreateEntity","entity":eid,"region":region,"components":{"pos":[x_base,0.0,0.0]}}))).await.unwrap();

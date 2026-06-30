@@ -10,9 +10,10 @@ use std::io;
 use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId};
 use godworks_protocol::json::{decode_json_value, encode_json_value};
 use godworks_protocol::{
-    AddEntity, AuthorityChange, BatchUpdate, BatchUpdateEntry, CommandRequest, ComponentUpdate,
-    CreateEntity, CriticalSection, EntityEvent, Fold, Heartbeat, Interest, JsonFields, MeshHandoff,
-    Op, UpdateComponent, UpdateRejected, WorkerConnect, DEFAULT_MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    AddEntity, AuthReject, AuthorityChange, BatchUpdate, BatchUpdateEntry, CommandRequest,
+    ComponentUpdate, CreateEntity, CriticalSection, EntityEvent, Fold, Heartbeat, Interest,
+    JsonFields, MeshHandoff, Op, UpdateComponent, UpdateRejected, WorkerConnect,
+    DEFAULT_MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -66,6 +67,7 @@ pub struct WorkerConfig {
     pub region: RegionId,
     pub attributes: Vec<String>,
     pub proto: Option<u64>,
+    pub auth_token: Option<String>,
 }
 
 impl WorkerConfig {
@@ -75,11 +77,17 @@ impl WorkerConfig {
             region: region.into(),
             attributes: Vec::new(),
             proto: Some(PROTOCOL_VERSION),
+            auth_token: None,
         }
     }
 
     pub fn with_attribute(mut self, attribute: impl Into<String>) -> Self {
         self.attributes.push(attribute.into());
+        self
+    }
+
+    pub fn with_auth_token(mut self, auth_token: impl Into<String>) -> Self {
+        self.auth_token = Some(auth_token.into());
         self
     }
 
@@ -89,6 +97,7 @@ impl WorkerConfig {
             region: self.region.clone(),
             proto: self.proto,
             attributes: self.attributes.clone(),
+            auth_token: self.auth_token.clone(),
         })
     }
 }
@@ -171,6 +180,7 @@ where
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerFrameKind {
+    AuthReject,
     Checkout,
     EntityAdded,
     EntityRemoved,
@@ -195,6 +205,7 @@ impl WorkerFrame {
 
     pub fn kind(&self) -> WorkerFrameKind {
         match &self.op {
+            Op::AuthReject(_) => WorkerFrameKind::AuthReject,
             Op::CriticalSection(_) => WorkerFrameKind::Checkout,
             Op::AddEntity(_) => WorkerFrameKind::EntityAdded,
             Op::RemoveEntity(_) => WorkerFrameKind::EntityRemoved,
@@ -219,6 +230,13 @@ impl WorkerFrame {
     pub fn checkout(&self) -> Option<&CriticalSection> {
         match &self.op {
             Op::CriticalSection(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn auth_reject(&self) -> Option<&AuthReject> {
+        match &self.op {
+            Op::AuthReject(value) => Some(value),
             _ => None,
         }
     }
@@ -295,11 +313,20 @@ pub fn batch_entry(
 }
 
 pub fn legacy_worker_connect_op(worker_id: impl Into<PeerId>, region: impl Into<RegionId>) -> Op {
+    worker_connect_op(worker_id, region, None)
+}
+
+pub fn worker_connect_op(
+    worker_id: impl Into<PeerId>,
+    region: impl Into<RegionId>,
+    auth_token: Option<String>,
+) -> Op {
     Op::WorkerConnect(WorkerConnect {
         worker_id: worker_id.into(),
         region: region.into(),
         proto: None,
         attributes: Vec::new(),
+        auth_token,
     })
 }
 
@@ -471,6 +498,14 @@ mod tests {
             json!({"op":"WorkerConnect","worker_id":"zw-W","region":"W"})
         );
         assert_eq!(
+            encode_json_value(&worker_connect_op(
+                "zw-W",
+                "W",
+                Some("test-token".to_string())
+            )),
+            json!({"op":"WorkerConnect","worker_id":"zw-W","region":"W","auth_token":"test-token"})
+        );
+        assert_eq!(
             encode_json_value(&Op::Interest(circle_interest(
                 Position2::new(0.0, 0.0),
                 100.0,
@@ -599,5 +634,30 @@ mod tests {
         let second = worker.recv_frame().await.unwrap().unwrap();
         assert_eq!(second.kind(), WorkerFrameKind::EntityEvent);
         assert!(second.entity_event().is_some());
+    }
+
+    #[tokio::test]
+    async fn worker_receives_auth_reject_as_typed_frame() {
+        let (mut broker_stream, worker_stream) = duplex(8192);
+        let mut worker = WorkerSession::new(worker_stream);
+
+        let auth_reject = decode_frame_payload(
+            json!({
+                "op": "AuthReject",
+                "worker_id": "zw-W",
+                "error": "auth_error",
+                "reason": "authentication required"
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        write_op(&mut broker_stream, &auth_reject).await.unwrap();
+
+        let frame = worker.recv_frame().await.unwrap().unwrap();
+        assert_eq!(frame.kind(), WorkerFrameKind::AuthReject);
+        let reject = frame.auth_reject().unwrap();
+        assert_eq!(reject.error, "auth_error");
+        assert_eq!(reject.reason, "authentication required");
     }
 }
