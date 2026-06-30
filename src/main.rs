@@ -546,6 +546,25 @@ struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    fn has_global_observer_claim(&self) -> bool {
+        self.attributes
+            .iter()
+            .any(|a| a == "observer" || a == "debug" || a == "inspector")
+    }
+
+    fn default_region_interest(&self, pos: [f64; 2]) -> bool {
+        match self.region.as_str() {
+            "OBS" => self.has_global_observer_claim(),
+            "MESH" => false, // a cross-broker mesh link is a conduit, not an interest-holder
+            "W" => pos[0] < H + INTEREST_MARGIN,
+            _ => pos[0] >= -H - INTEREST_MARGIN,
+        }
+    }
+
+    fn should_be_global_interest_holder(&self) -> bool {
+        self.aoi_center.is_some() || self.default_region_interest([0.0, 0.0])
+    }
+
     fn interested_in(&self, pos: [f64; 2]) -> bool {
         if let Some(c) = self.aoi_center {
             let r = self.aoi_radius.unwrap_or(0.0);
@@ -553,12 +572,7 @@ impl WorkerHandle {
             let dy = pos[1] - c[1];
             return dx * dx + dy * dy <= r * r;
         }
-        match self.region.as_str() {
-            "OBS" => true,
-            "MESH" => false, // a cross-broker mesh link is a conduit, not an interest-holder
-            "W" => pos[0] < H + INTEREST_MARGIN,
-            _ => pos[0] >= -H - INTEREST_MARGIN,
-        }
+        self.default_region_interest(pos)
     }
 
     fn full_fidelity_for(&self, pos: [f64; 2]) -> bool {
@@ -3632,21 +3646,26 @@ fn remove_from_interest_grid(state: &mut ServerState, wid: &str) {
     }
 }
 
-// recompute a worker's grid cells from its current AOI. A worker with no aoi_center (region/global holder:
-// W/E/OBS) OR an AOI too large to index lands in global_workers (propagate always checks it); otherwise it
-// is indexed in interest_grid. Called on connect (default -> global) and on each Interest op.
+// recompute a worker's grid cells from its current AOI. A worker with no aoi_center only lands in
+// global_workers if its broker-owned role has default regional/global interest (W/E-style region owners,
+// or OBS with an explicit observer/debug/inspector claim). A concrete AOI too large to index also lands in
+// global_workers, but interested_in() remains the exact narrowphase. Called on connect and on each Interest op.
 fn update_interest_grid(state: &mut ServerState, wid: &str) {
     remove_from_interest_grid(state, wid);
-    let cells = match state.workers.get(wid) {
+    let (cells, should_be_global) = match state.workers.get(wid) {
         Some(w) => match (w.aoi_center, w.aoi_radius) {
-            (Some(c), Some(r)) => interest_cells_for(c, r),
-            _ => Vec::new(),
+            (Some(c), Some(r)) => {
+                let cells = interest_cells_for(c, r);
+                let too_large_for_grid = cells.is_empty();
+                (cells, too_large_for_grid)
+            }
+            _ => (Vec::new(), w.should_be_global_interest_holder()),
         },
         None => return,
     };
-    if cells.is_empty() {
+    if cells.is_empty() && should_be_global {
         state.global_workers.insert(wid.to_string());
-    } else {
+    } else if !cells.is_empty() {
         for cell in &cells {
             state
                 .interest_grid
@@ -4956,6 +4975,11 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0)
                 .clamp(0.0, 1_000_000.0);
+            let global_obs_denied = center.is_none()
+                && state
+                    .workers
+                    .get(wid)
+                    .is_some_and(|w| w.region == "OBS" && !w.has_global_observer_claim());
             if let Some(w) = state.workers.get_mut(wid) {
                 w.aoi_center = center;
                 w.aoi_radius = radius;
@@ -4965,6 +4989,14 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 w.fidelity_seq.clear();
             }
             update_interest_grid(state, wid); // Interest: re-index this worker's AOI into the spatial grid
+            if global_obs_denied {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"UpdateRejected","comp":"interest",
+                    "reason":"global OBS interest requires the observer/debug/inspector attribute"}),
+                );
+            }
             let eids: Vec<String> = state.entities.keys().cloned().collect();
             for eid in eids {
                 let inside = visible(&state.workers[wid], &state.entities[&eid]);
@@ -7608,6 +7640,91 @@ mod tests {
     fn decode_test_frame(buf: &[u8]) -> Value {
         let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         serde_json::from_slice(&buf[4..4 + n]).unwrap()
+    }
+
+    #[test]
+    fn obs_without_observer_attr_cannot_query_global_entities() {
+        let mut state = ServerState::new(30.0);
+        assert!(spawn_in_region(
+            &mut state,
+            "visible-if-authorized",
+            [0.0, 0.0],
+            [0.0, 0.0],
+            Map::new(),
+            Some("W"),
+            SpawnAuthoritySeed::default(),
+        ));
+        let mut rx = add_test_worker_with_rx(&mut state, "viewer", "OBS");
+
+        dispatch(
+            &mut state,
+            "viewer",
+            &json!({"op":"EntityQuery","request_id":"q1","query":{"type":"all"}}),
+        );
+
+        let response = decode_test_frame(&rx.try_recv().expect("query must respond"));
+        assert_eq!(response["op"], "EntityQueryResponse");
+        assert_eq!(response["count"], 0);
+        assert_eq!(response["entities"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn obs_with_observer_attr_can_query_global_entities() {
+        let mut state = ServerState::new(30.0);
+        assert!(spawn_in_region(
+            &mut state,
+            "visible-to-observer",
+            [0.0, 0.0],
+            [0.0, 0.0],
+            Map::new(),
+            Some("W"),
+            SpawnAuthoritySeed::default(),
+        ));
+        let mut rx = add_test_worker_with_rx(&mut state, "observer", "OBS");
+        state
+            .workers
+            .get_mut("observer")
+            .unwrap()
+            .attributes
+            .insert("observer".to_string());
+        update_interest_grid(&mut state, "observer");
+        assert!(state.global_workers.contains("observer"));
+
+        dispatch(
+            &mut state,
+            "observer",
+            &json!({"op":"EntityQuery","request_id":"q1","query":{"type":"all"}}),
+        );
+
+        let response = decode_test_frame(&rx.try_recv().expect("query must respond"));
+        assert_eq!(response["op"], "EntityQueryResponse");
+        assert_eq!(response["count"], 1);
+        assert_eq!(response["entities"][0]["entity"], "visible-to-observer");
+    }
+
+    #[test]
+    fn obs_without_observer_attr_no_center_interest_is_rejected_and_not_global() {
+        let mut state = ServerState::new(30.0);
+        let mut rx = add_test_worker_with_rx(&mut state, "viewer", "OBS");
+        update_interest_grid(&mut state, "viewer");
+        assert!(
+            !state.global_workers.contains("viewer"),
+            "plain OBS peer must not start as a global observer"
+        );
+
+        dispatch(&mut state, "viewer", &json!({"op":"Interest"}));
+
+        let rejected = decode_test_frame(&rx.try_recv().expect("global OBS interest must reject"));
+        assert_eq!(rejected["op"], "UpdateRejected");
+        assert_eq!(rejected["comp"], "interest");
+        assert!(rejected["reason"]
+            .as_str()
+            .unwrap()
+            .contains("global OBS interest requires"));
+        assert!(
+            !state.global_workers.contains("viewer"),
+            "rejected plain OBS interest must not enter global_workers"
+        );
     }
 
     #[tokio::test]

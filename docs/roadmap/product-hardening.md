@@ -49,6 +49,7 @@ with compatibility tests rather than rebuilding a second protocol path.
 - Basic broker ingress frame rate limits.
 - Basic WorkerConnect auth.
 - Token-bound WorkerConnect region/attribute claims.
+- Global OBS visibility gated by observer/debug/inspector claims.
 - Stronger worker/client role and authorization policy.
 - Mesh auth beyond the current token-claim baseline.
 - Broader per-principal rate-limit policy.
