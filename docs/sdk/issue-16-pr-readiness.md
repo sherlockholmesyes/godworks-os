@@ -1,14 +1,15 @@
 # Issue 16 PR Readiness: Zone Worker SDK Frame Boundary
 
-This packet summarizes the narrow issue #16 slice: `src/bin/zone_worker.rs`
-routes its TCP frame read/write and stable outbound worker operations through
-`godworks-worker-sdk` while preserving broker runtime behavior and JSON wire
-shape.
+This packet summarizes the issue #16 slice as it exists on `main`:
+`src/bin/zone_worker.rs` routes its TCP frame read/write and stable worker
+operations through `godworks-worker-sdk` while preserving broker runtime
+behavior and JSON wire shape.
 
-Branch:
+Merged history:
 
 ```text
-codex/issue16-zone-worker-sdk-clean
+PR #17: SDK frame boundary and outbound helpers
+PR #18: typed inbound handling and JSON bridge removal
 ```
 
 ## Scope
@@ -21,8 +22,8 @@ Changed in this branch:
 - emits stable outbound worker operations through SDK helpers:
   `WorkerConnect`, `Interest`, `CreateEntity`, `Fold`, `BatchUpdate(pos)`,
   `BatchUpdate(vel)`, `Heartbeat`, and `Disconnect`;
-- preserves the existing `apply_op` game-loop handler by converting the typed
-  received `Op` back to JSON at the tick boundary;
+- handles inbound broker frames as typed `Op` variants instead of routing
+  through a local JSON dispatcher bridge;
 - keeps component payloads as explicit `serde_json::Value` data bags until a
   separate schema/codegen slice exists.
 
@@ -31,7 +32,6 @@ Not changed in this branch:
 - broker authority, WAL, mesh, handoff, or recovery behavior;
 - protocol JSON wire shape;
 - physics/gameplay behavior in `zone_worker`;
-- inbound `apply_op` game-loop logic;
 - Godot/client, 3D, cloud/control-plane, or broad game-framework work.
 
 ## Migrated Sites
@@ -40,7 +40,7 @@ Not changed in this branch:
 
 ```rust
 batch_entry, circle_interest, create_entity_op, disconnect_op, fold_op,
-heartbeat_op, legacy_worker_connect_op, read_op, write_op
+heartbeat_op, read_op, worker_connect_op, write_op
 ```
 
 The old local frame helpers were removed. `zone_worker` reads with `read_op`
@@ -48,7 +48,7 @@ and writes with `write_op`.
 
 Outbound frames migrated to SDK helpers:
 
-- worker connection: `legacy_worker_connect_op`;
+- worker connection: `worker_connect_op` with optional `auth_token`;
 - AOI interest: `circle_interest`;
 - entity creation: `create_entity_op`;
 - fold/handoff request: `fold_op`;
@@ -62,12 +62,10 @@ These remain intentionally raw in this PR:
 
 - component payload values such as `pos`, `vel`, `mass`;
 - `json!` values used as entity component bags;
-- `apply_op`, which is the existing game-loop dispatcher and is intentionally
-  preserved for this narrow PR;
-- conversion of received typed `Op` back to JSON before `apply_op`.
+- runtime summary and test fixture JSON.
 
-Those are not frame-boundary code. They should move only in a later typed
-component/schema slice.
+Those are data payloads, not frame-boundary code. They should move only in a
+later typed component/schema slice.
 
 ## Reviewer Gate
 

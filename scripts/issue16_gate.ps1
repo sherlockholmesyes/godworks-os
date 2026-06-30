@@ -28,7 +28,7 @@ function Assert-ZoneWorkerUsesSdkBoundary {
     if ($source -notmatch "use\s+godworks_worker_sdk::") {
         throw "$path does not import godworks_worker_sdk"
     }
-    foreach ($needle in @("read_op", "write_op", "legacy_worker_connect_op", "create_entity_op", "fold_op", "heartbeat_op", "disconnect_op")) {
+    foreach ($needle in @("read_op", "write_op", "worker_connect_op", "create_entity_op", "fold_op", "heartbeat_op", "disconnect_op")) {
         if ($source -notmatch "\b$needle\b") {
             throw "$path is missing SDK helper '$needle'"
         }
