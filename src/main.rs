@@ -1558,6 +1558,7 @@ struct ServerState {
     pending_gen: u64, // highest WAL-appended-but-not-yet-fsynced transition generation
     pending_updates: Vec<PreparedUpdate>, // staged component writes waiting for the group fsync barrier
     pending_handoffs: Vec<PreparedHandoff>, // staged same-broker authority transfers waiting for the same durability law
+    pending_remote_handoffs: Vec<PendingRemoteHandoff>, // non-durable cross-broker seam intents; flushed after the current durable batch finishes applying
     pending_failovers: Vec<PreparedFailover>, // staged grant-only lease failovers waiting for the durable authority watermark
     pending_block_migrations: Vec<PreparedBlockMigration>, // staged 2D rebalance block moves; one block == one atomic durable group
     zone_topology_rev: u64, // R0.2: bumped on every boundary/split change; the latest partition_config restores on recovery
@@ -1662,6 +1663,7 @@ impl ServerState {
             pending_gen: 0,
             pending_updates: Vec::new(),
             pending_handoffs: Vec::new(),
+            pending_remote_handoffs: Vec::new(),
             pending_failovers: Vec::new(),
             pending_block_migrations: Vec::new(),
             zone_topology_rev: 0,
@@ -3887,13 +3889,57 @@ fn handoff_with_position(
     new: &str,
     pos_override: Option<[f64; 2]>,
 ) -> bool {
-    // Remote process seam: keep the existing mesh path, which already WALs mesh_out before send.
+    // Remote process seam: defer the actual mesh_out until the current durable batch has applied all
+    // same-entity writes. mesh_forward still WALs+fsyncs before send; the queue only prevents an
+    // inline remove from tearing the batch and dropping later component writes.
     if state.mesh_regions.contains(new) && !state.region_worker.contains_key(new) {
-        mesh_forward(state, eid, new);
-        return true;
+        return queue_remote_handoff(state, eid, new);
     }
 
     queue_local_handoff(state, eid, old, new, pos_override, "handoff")
+}
+
+fn queue_remote_handoff(state: &mut ServerState, eid: &str, target: &str) -> bool {
+    if !state.entities.contains_key(eid) {
+        return false;
+    }
+    if let Some(existing) = state
+        .pending_remote_handoffs
+        .iter_mut()
+        .find(|h| h.eid == eid)
+    {
+        existing.target = target.to_string();
+        return true;
+    }
+    state.pending_remote_handoffs.push(PendingRemoteHandoff {
+        eid: eid.to_string(),
+        target: target.to_string(),
+    });
+    true
+}
+
+fn flush_pending_remote_handoffs(state: &mut ServerState) {
+    if state.pending_remote_handoffs.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut state.pending_remote_handoffs);
+    for h in pending {
+        if remote_handoff_target_still_current(state, &h.eid, &h.target) {
+            mesh_forward(state, &h.eid, &h.target);
+        }
+    }
+}
+
+fn remote_handoff_target_still_current(state: &ServerState, eid: &str, target: &str) -> bool {
+    let Some(e) = state.entities.get(eid) else {
+        return false;
+    };
+    let next = if let Some((c, r, cw, ch)) = state.grid2d {
+        region_2d_after(e.pos, &e.region, c, r, cw, ch)
+    } else {
+        movement_region_after(e.pos[0], &e.region, &state.boundaries, &state.splits)
+    };
+    next == target && state.mesh_regions.contains(&next) && !state.region_worker.contains_key(&next)
 }
 
 fn queue_local_handoff(
@@ -4670,6 +4716,12 @@ struct PreparedHandoff {
 }
 
 #[derive(Clone)]
+struct PendingRemoteHandoff {
+    eid: String,
+    target: String,
+}
+
+#[derive(Clone)]
 struct PreparedFailoverGrant {
     eid: String,
     version: u64,
@@ -4959,7 +5011,9 @@ fn zone_and_propagate(state: &mut ServerState, eid: &str, comp: &str, value: &Va
             .unwrap_or(false);
         if !is_child {
             let (pos, cur) = {
-                let e = &state.entities[eid];
+                let Some(e) = state.entities.get(eid) else {
+                    return;
+                };
                 (e.pos, e.region.clone())
             };
             if let Some((c, r, cw, ch)) = state.grid2d {
@@ -5249,6 +5303,7 @@ fn flush_pending_updates(state: &mut ServerState) {
         flush_pending_handoffs(state);
         flush_pending_failovers(state);
         flush_pending_block_migrations(state);
+        flush_pending_remote_handoffs(state);
         return;
     }
     let pending = std::mem::take(&mut state.pending_updates);
@@ -5277,6 +5332,7 @@ fn flush_pending_updates(state: &mut ServerState) {
     flush_pending_handoffs(state);
     flush_pending_failovers(state);
     flush_pending_block_migrations(state);
+    flush_pending_remote_handoffs(state);
 }
 
 fn record_mesh_ack(state: &mut ServerState, eid: &str) -> bool {
@@ -5488,6 +5544,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 return;
             }
             flush_pending_handoffs(state);
+            flush_pending_remote_handoffs(state);
             if let Some(np) = state.entities.get(&eid).map(|e| e.pos) {
                 propagate(state, &eid, "pos", &json!(np));
             }
@@ -8535,6 +8592,108 @@ mod tests {
         assert!(state.pending_mesh.is_empty());
         assert!(rx.try_recv().is_err());
         assert!(state.wal_degraded);
+    }
+
+    #[test]
+    fn cross_broker_handoff_flushes_after_same_batch_writes() {
+        let mut state = ServerState::new(30.0);
+        state.boundaries = vec![0.0];
+        state.grid2d = None;
+        state.my_region = "W".to_string();
+        state.region_lease_epoch.insert("W".to_string(), 1);
+        add_test_worker(&mut state, "zw-W", "W");
+        state.mesh_regions.insert("E".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.mesh.insert("E".to_string(), tx);
+
+        let mut ship = test_entity([-1.0, 0.0], "W");
+        ship.components.insert("hp".to_string(), json!(1));
+        state.entities.insert("ship".to_string(), ship);
+        state.pending_updates.push(PreparedUpdate {
+            gen: 1,
+            eid: "ship".to_string(),
+            comp: "pos".to_string(),
+            value: json!([1.0, 0.0]),
+            version: 2,
+            writer: "zw-W".to_string(),
+        });
+        state.pending_updates.push(PreparedUpdate {
+            gen: 2,
+            eid: "ship".to_string(),
+            comp: "hp".to_string(),
+            value: json!(2),
+            version: 3,
+            writer: "zw-W".to_string(),
+        });
+        state.pending_gen = 2;
+
+        flush_pending_updates(&mut state);
+
+        assert!(
+            !state.entities.contains_key("ship"),
+            "entity should leave only after the whole durable update batch applies"
+        );
+        assert!(state.pending_mesh.contains_key("ship"));
+        let handoff = decode_test_frame(
+            &rx.try_recv()
+                .expect("cross-broker handoff should be sent after batch flush"),
+        );
+        assert_eq!(handoff["op"], "MeshHandoff");
+        assert_eq!(handoff["entity"], "ship");
+        assert_eq!(handoff["components"]["hp"], json!(2));
+        assert!(
+            state.pending_remote_handoffs.is_empty(),
+            "remote intent queue should drain after sending mesh_out"
+        );
+    }
+
+    #[test]
+    fn cross_broker_handoff_intent_is_rechecked_after_same_batch_return() {
+        let mut state = ServerState::new(30.0);
+        state.boundaries = vec![0.0];
+        state.grid2d = None;
+        state.my_region = "W".to_string();
+        state.region_lease_epoch.insert("W".to_string(), 1);
+        add_test_worker(&mut state, "zw-W", "W");
+        state.mesh_regions.insert("E".to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.mesh.insert("E".to_string(), tx);
+
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        state.pending_updates.push(PreparedUpdate {
+            gen: 1,
+            eid: "ship".to_string(),
+            comp: "pos".to_string(),
+            value: json!([1.0, 0.0]),
+            version: 2,
+            writer: "zw-W".to_string(),
+        });
+        state.pending_updates.push(PreparedUpdate {
+            gen: 2,
+            eid: "ship".to_string(),
+            comp: "pos".to_string(),
+            value: json!([-1.0, 0.0]),
+            version: 3,
+            writer: "zw-W".to_string(),
+        });
+        state.pending_gen = 2;
+
+        flush_pending_updates(&mut state);
+
+        let ship = state
+            .entities
+            .get("ship")
+            .expect("same-batch return to W must keep the entity local");
+        assert_eq!(ship.region, "W");
+        assert_eq!(ship.pos, [-1.0, 0.0]);
+        assert!(state.pending_mesh.is_empty());
+        assert!(state.pending_remote_handoffs.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "stale remote handoff intent must not send after final batch position returns local"
+        );
     }
 
     fn decode_test_frame(buf: &[u8]) -> Value {
