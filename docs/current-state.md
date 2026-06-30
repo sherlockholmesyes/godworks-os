@@ -38,7 +38,8 @@ full SpatialOS replacement
 - Interest management / AOI.
 - Coarse fidelity updates.
 - Backpressure and bounded egress channels.
-- Max frame size and basic per-peer ingress frame rate limits.
+- Max frame size and per-peer ingress cost limits: peers are charged by op
+  class and large valid JSON payload size before dispatch.
 - WorkerConnect authentication with both legacy shared-token mode and strict
   token-bound region/attribute claims.
 - Global OBS visibility is claim-gated: an OBS peer needs `observer`, `debug`,

@@ -20,7 +20,14 @@ A broker must reject oversized frames before allocating the full body.
 A broker must reject peers that exceed their inbound frame budget before the op is dispatched.
 ```
 
-The typed protocol crate exposes `DEFAULT_MAX_FRAME_BYTES`; broker enforcement is wired into the frame reader. The broker also applies a per-peer token bucket (`GW_INGRESS_RATE_PER_SEC`, `GW_INGRESS_BURST_FRAMES`) and returns structured `rate_limit_error` rejections when a peer exhausts its frame budget.
+The typed protocol crate exposes `DEFAULT_MAX_FRAME_BYTES`; broker enforcement
+is wired into the frame reader. The broker also applies a per-peer token bucket
+(`GW_INGRESS_RATE_PER_SEC`, `GW_INGRESS_BURST_FRAMES`) and returns structured
+`rate_limit_error` rejections when a peer exhausts its ingress cost budget. The
+budget is cost-based, not a raw frame count: expensive ops such as
+`CreateEntity`, `EntityQuery`, `BatchUpdate`, and authority/control ops consume
+more units, and large-but-valid JSON payloads are charged from the received wire
+body length.
 
 ## Version negotiation
 
