@@ -40,8 +40,10 @@ full SpatialOS replacement
 - Backpressure and bounded egress channels.
 - Max frame size and per-peer ingress cost limits: peers are charged by op
   class and large valid JSON payload size before dispatch.
-- WorkerConnect authentication with both legacy shared-token mode and strict
-  token-bound region/attribute claims.
+- WorkerConnect authentication with legacy shared-token mode and strict
+  token-bound region/attribute claims. Strict claims mode is exclusive: once
+  `GW_AUTH_CLAIMS` is configured, every peer uses a claim token and the shared
+  token fallback is disabled.
 - Broker-side peer roles for worker/client/observer/mesh op-family policy.
   Clients cannot lease worker regions, observers cannot mutate entity state, and
   mesh links cannot act as gameplay workers.
