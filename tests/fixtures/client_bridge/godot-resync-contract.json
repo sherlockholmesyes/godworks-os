@@ -96,6 +96,17 @@
           }
         ]
       }
+    },
+    {
+      "kind": "stream",
+      "op": {
+        "op": "BatchUpdate",
+        "comp": "pos",
+        "updates": [
+          ["fresh", [4.0, 5.0], 9],
+          ["remote", [10.0, 2.0]]
+        ]
+      }
     }
   ],
   "expected_snapshot": {
@@ -108,7 +119,7 @@
         "entity": "fresh",
         "ghost": false,
         "owner_region": null,
-        "position2": [2.0, 3.0],
+        "position2": [4.0, 5.0],
         "component_keys": ["kind", "pos", "region"],
         "authority": {
           "pos": {
@@ -122,7 +133,7 @@
         "entity": "remote",
         "ghost": true,
         "owner_region": "W",
-        "position2": [9.0, 1.0],
+        "position2": [10.0, 2.0],
         "component_keys": ["ghost", "kind", "owner_region", "pos"],
         "authority": {}
       }
