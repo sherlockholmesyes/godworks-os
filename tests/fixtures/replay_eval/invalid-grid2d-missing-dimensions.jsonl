@@ -1,0 +1,1 @@
+{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"grid2d"},"path":"cross_broker_emit","entity":"ship-1","authority_epoch":3,"durable_gen":8}
