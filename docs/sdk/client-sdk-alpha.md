@@ -75,3 +75,14 @@ Two fail-under-broken tests pin the contract:
 - `bridge_ordinary_query_response_does_not_replace_live_cache` fails if a
   partial `EntityQueryResponse` in normal live mode is accidentally treated as
   the canonical reconnect checkout.
+
+The shared bridge transcript fixture is
+`tests/fixtures/client_bridge/godot-resync-contract.json`. It is intentionally
+wire-shaped JSON decoded through `godworks-protocol` and replayed into
+`ClientBridge`. A Godot bridge should use this fixture as its first behavior
+contract before adding scene-node lifecycle:
+
+- stale stream rows are cleared on reconnect;
+- the full checkout becomes the canonical live view;
+- ghost rows remain read-only projections with no local authority;
+- snapshot row ordering is deterministic for simple engine diffing.

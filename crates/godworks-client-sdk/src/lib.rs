@@ -535,7 +535,7 @@ fn position2_from_value(value: &Value) -> Option<[f64; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use godworks_protocol::{BatchUpdateEntry, MeshGhostRemove};
+    use godworks_protocol::{json::decode_json_value, BatchUpdateEntry, MeshGhostRemove};
     use serde_json::json;
 
     #[test]
@@ -1011,6 +1011,58 @@ mod tests {
     }
 
     #[test]
+    fn bridge_replays_godot_resync_contract_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/client_bridge/godot-resync-contract.json"
+        ))
+        .expect("valid client bridge contract fixture");
+        let mut bridge = ClientBridge::new();
+        let steps = fixture
+            .get("steps")
+            .and_then(Value::as_array)
+            .expect("steps array");
+
+        for step in steps {
+            match step.get("kind").and_then(Value::as_str).unwrap_or("") {
+                "stream" => {
+                    let op = decode_json_value(step.get("op").expect("stream op"))
+                        .expect("stream op decodes");
+                    bridge.apply_stream_op(&op);
+                }
+                "mark_live" => {
+                    bridge.mark_live();
+                }
+                "transport_closed" => {
+                    bridge.on_transport_closed();
+                }
+                "transport_connecting" => {
+                    bridge.on_transport_connecting();
+                }
+                "begin_full_resync" => {
+                    bridge.begin_full_resync();
+                }
+                "finish_full_resync" => {
+                    let op = decode_json_value(step.get("op").expect("resync op"))
+                        .expect("resync op decodes");
+                    let Op::EntityQueryResponse(response) = op else {
+                        panic!("finish_full_resync requires EntityQueryResponse");
+                    };
+                    bridge.finish_full_resync(&response);
+                }
+                other => panic!("unknown client bridge fixture step kind: {other}"),
+            }
+        }
+
+        assert_eq!(
+            bridge_snapshot_contract_value(&bridge.snapshot()),
+            fixture
+                .get("expected_snapshot")
+                .expect("expected_snapshot object")
+                .clone()
+        );
+    }
+
+    #[test]
     fn cache_critical_section_depth_never_underflows_across_reconnect() {
         let mut cache = ClientCache::new();
         cache.apply_op(&Op::CriticalSection(CriticalSection {
@@ -1035,5 +1087,45 @@ mod tests {
             cache.connection_phase(),
             ClientConnectionPhase::Disconnected
         );
+    }
+
+    fn bridge_snapshot_contract_value(snapshot: &ClientBridgeSnapshot) -> Value {
+        let entities: Vec<Value> = snapshot
+            .entities
+            .iter()
+            .map(|row| {
+                let component_keys: Vec<_> = row.components.keys().cloned().collect();
+                let authority: Map<String, Value> = row
+                    .authority
+                    .iter()
+                    .map(|(component, auth)| {
+                        (
+                            component.clone(),
+                            json!({
+                                "authoritative": auth.authoritative,
+                                "authority_epoch": auth.authority_epoch,
+                                "mode": auth.mode,
+                            }),
+                        )
+                    })
+                    .collect();
+                json!({
+                    "entity": row.entity,
+                    "ghost": row.ghost,
+                    "owner_region": row.owner_region,
+                    "position2": row.position2,
+                    "component_keys": component_keys,
+                    "authority": authority,
+                })
+            })
+            .collect();
+
+        json!({
+            "phase": format!("{:?}", snapshot.phase),
+            "critical_depth": snapshot.critical_depth,
+            "entity_count": snapshot.entity_count,
+            "rejection_count": snapshot.rejection_count,
+            "entities": entities,
+        })
     }
 }
