@@ -110,7 +110,7 @@ links.
 | `AuthReject` | broker -> peer | no | Reject a connection before registration when connect auth fails. |
 | `Disconnect` | peer -> broker | no | Graceful connection close. |
 | `Heartbeat` | worker -> broker | no | Renew region lease for owned regions. |
-| `Health` | peer -> broker | no | Request liveness/health snapshot. |
+| `Health` | peer -> broker | no | Request liveness/health snapshot, including monitor tick freshness. |
 
 ### Interest and visibility
 
@@ -194,7 +194,7 @@ their response frames are transient result frames.
 |---|---|---:|---|
 | `InspectorQuery` | inspector -> broker | no | Request full debug/ops state frame. |
 | `InspectorFrame` | broker -> inspector | no | Debug/ops state frame. |
-| `SnapshotMarker` | admin -> broker | yes | Mark coordinated snapshot/restore boundary. |
+| `SnapshotMarker` | admin -> broker | yes | Flush staged durable transitions and mark coordinated snapshot/restore boundary. |
 | `SnapshotManifest` | broker -> admin | no | Return snapshot cut metadata and schema/version contract. |
 
 ## JSON codec coverage
