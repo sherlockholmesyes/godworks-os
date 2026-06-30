@@ -11,6 +11,22 @@ permissions:
   contents: read
 
 jobs:
+  agent-reality-gate:
+    name: Agent reality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate agent reality gate scaffold
+        run: |
+          python3 tools/agent_reality_gate_lint.py \
+            --schema docs/ops/agent-trace.schema.json \
+            --evals docs/ops/agent-eval-cases.jsonl \
+            --trace docs/ops/examples/agent-trace.example.json
+
   rust-baseline:
     name: Rust baseline
     runs-on: ubuntu-latest

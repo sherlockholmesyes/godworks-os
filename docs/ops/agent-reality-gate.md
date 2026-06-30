@@ -12,6 +12,23 @@ layer around agent contributions:
 agent work -> trace -> eval case -> promotion gate -> repo change
 ```
 
+## CI Gate
+
+CI validates this scaffold directly:
+
+```bash
+python3 tools/agent_reality_gate_lint.py \
+  --schema docs/ops/agent-trace.schema.json \
+  --evals docs/ops/agent-eval-cases.jsonl \
+  --trace docs/ops/examples/agent-trace.example.json
+```
+
+This keeps the trace schema, eval ledger, example trace, and linter executable.
+It does not require every ordinary manual PR to include a new trace. A
+PR-specific trace is required only when a maintainer marks the work as
+agent-produced, promotes an external-review output into repo rules, or asks for
+an explicit reality gate on that change.
+
 ## What To Record
 
 Every material agent contribution should have a trace:
