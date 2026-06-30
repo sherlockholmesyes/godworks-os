@@ -29,8 +29,8 @@ use godworks_broker::wal::{
     crc32_ieee, read_wal_events, wal_v1_envelope_line, wal_v1_header_line, WalReadReport,
 };
 use godworks_core::{
-    PartitionSchema, SpatialSchema, COORDINATE_CODEC_VERSION, SPATIAL_SCHEMA_VERSION,
-    STANDARD_COMPONENT_REGISTRY_VERSION,
+    AuthorityMode, PartitionSchema, SpatialSchema, COORDINATE_CODEC_VERSION,
+    SPATIAL_SCHEMA_VERSION, STANDARD_COMPONENT_REGISTRY_VERSION,
 };
 use godworks_protocol::{
     operation_semantics, DEFAULT_MAX_FRAME_BYTES, SNAPSHOT_MANIFEST_VERSION,
@@ -510,38 +510,6 @@ fn is_platform_reserved_component(comp: &str) -> bool {
         || comp == "authority.mode"
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AuthorityMode {
-    ClientForwardSparse,
-    ServerArbitrated,
-    ServerPhysicsIsland,
-    ThresholdOverlap,
-    PersistentKernelLock,
-}
-
-impl AuthorityMode {
-    fn as_str(&self) -> &'static str {
-        match self {
-            AuthorityMode::ClientForwardSparse => "client_forward_sparse",
-            AuthorityMode::ServerArbitrated => "server_arbitrated",
-            AuthorityMode::ServerPhysicsIsland => "server_physics_island",
-            AuthorityMode::ThresholdOverlap => "threshold_overlap",
-            AuthorityMode::PersistentKernelLock => "persistent_kernel_lock",
-        }
-    }
-
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "client_forward_sparse" => Some(AuthorityMode::ClientForwardSparse),
-            "server_arbitrated" => Some(AuthorityMode::ServerArbitrated),
-            "server_physics_island" => Some(AuthorityMode::ServerPhysicsIsland),
-            "threshold_overlap" => Some(AuthorityMode::ThresholdOverlap),
-            "persistent_kernel_lock" => Some(AuthorityMode::PersistentKernelLock),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 struct ComponentAuthority {
     owner: Option<String>,
@@ -710,11 +678,11 @@ fn is_spatial_component(comp: &str) -> bool {
 
 fn authority_mode_from_value(v: &Value) -> Option<AuthorityMode> {
     if let Some(s) = v.as_str() {
-        AuthorityMode::from_str(s)
+        AuthorityMode::from_wire_str(s)
     } else {
         v.get("mode")
             .and_then(|m| m.as_str())
-            .and_then(AuthorityMode::from_str)
+            .and_then(AuthorityMode::from_wire_str)
     }
 }
 
@@ -809,7 +777,7 @@ fn authority_to_json(authority: &HashMap<String, ComponentAuthority>) -> Value {
             json!({
                 "owner": ca.owner.clone(),
                 "authority_epoch": ca.epoch,
-                "mode": ca.mode.as_str()
+                "mode": ca.mode.as_wire_str()
             }),
         );
     }
@@ -1058,7 +1026,7 @@ fn grant_authority(state: &mut ServerState, wid: &str, eid: &str, comp: &str) {
             ensure_component_authority(e, comp);
             let ca = e.authority.get_mut(comp).unwrap();
             ca.owner = Some(wid.to_string());
-            (ca.epoch, ca.mode.as_str())
+            (ca.epoch, ca.mode.as_wire_str())
         }
         None => return,
     };
@@ -1081,7 +1049,7 @@ fn revoke_authority(state: &mut ServerState, wid: &str, eid: &str, comp: &str) {
             if ca.owner.as_deref() == Some(wid) {
                 ca.owner = None;
             }
-            (ca.epoch, ca.mode.as_str())
+            (ca.epoch, ca.mode.as_wire_str())
         }
         None => (0, "server_arbitrated"),
     };
@@ -2444,7 +2412,9 @@ fn apply_wal_events(events: &[&Value]) -> ReplayStore {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
                         ca.epoch = ev["authority_epoch"].as_u64().unwrap_or(ca.epoch);
-                        if let Some(mode) = ev["mode"].as_str().and_then(AuthorityMode::from_str) {
+                        if let Some(mode) =
+                            ev["mode"].as_str().and_then(AuthorityMode::from_wire_str)
+                        {
                             ca.mode = mode;
                         }
                     }
@@ -6377,7 +6347,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             let mode = f
                 .get("mode")
                 .and_then(|v| v.as_str())
-                .and_then(AuthorityMode::from_str);
+                .and_then(AuthorityMode::from_wire_str);
             let requested_epoch = frame_authority_epoch(f);
             let old_owner = state
                 .entities
@@ -6393,7 +6363,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 ca.owner = owner.clone();
                 ca.epoch = requested_epoch.unwrap_or_else(|| ca.epoch.saturating_add(1));
                 next.version = next.version.saturating_add(1);
-                (next.version, ca.epoch, ca.mode.as_str().to_string())
+                (next.version, ca.epoch, ca.mode.as_wire_str().to_string())
             } else {
                 return;
             };
