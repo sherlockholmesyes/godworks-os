@@ -154,24 +154,29 @@ fn summary_usize(summary: &Value, key: &str) -> usize {
         .unwrap_or_else(|| panic!("summary missing numeric key {key}: {summary}")) as usize
 }
 
-fn assert_expected_stale_owner_rejects(stderr: &str, expected_owner: &str, max: usize) {
-    let rejects: Vec<&str> = stderr
-        .lines()
-        .filter(|line| line.contains("REJECTED"))
-        .collect();
-    assert!(
-        rejects.len() <= max,
-        "too many stale-owner rejects: max={max}, got={}\n{stderr}",
-        rejects.len()
+fn reject_class_count(summary: &Value, class: &str) -> usize {
+    summary
+        .get("reject_classes")
+        .and_then(|classes| classes.get(class))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
+fn assert_only_reject_class(summary: &Value, class: &str, expected: usize) {
+    let classes = summary
+        .get("reject_classes")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("summary missing reject_classes object: {summary}"));
+    assert_eq!(
+        classes.len(),
+        usize::from(expected > 0),
+        "unexpected reject classes in summary: {summary}"
     );
-    for line in rejects {
-        assert!(
-            line.contains("comp=vel")
-                && line.contains("not authoritative")
-                && line.contains(expected_owner),
-            "unexpected reject line: {line}\n{stderr}"
-        );
-    }
+    assert_eq!(
+        reject_class_count(summary, class),
+        expected,
+        "unexpected reject class count for {class}: {summary}"
+    );
 }
 
 fn extract_eid(line: &str) -> Option<String> {
@@ -402,8 +407,13 @@ fn moving_w_bodies_handoff_to_e_with_epoch_fencing_and_no_stale_ownership() {
         west_rejects <= 24,
         "west should only see bounded old-owner fences, not a reject storm\n{west_stderr}"
     );
-    assert_expected_stale_owner_rejects(&west_stderr, "owner=zw-E-lifecycle", 24);
+    assert_only_reject_class(
+        &west_summary,
+        "comp=vel|reason=not_authoritative|owner=zw-E-lifecycle",
+        west_rejects,
+    );
     assert_eq!(summary_usize(&east_summary, "rejects"), 0, "{east_stderr}");
+    assert_only_reject_class(&east_summary, "unused", 0);
     assert_eq!(summary_usize(&west_summary, "owned"), 0, "{west_stderr}");
 
     let entities = frame

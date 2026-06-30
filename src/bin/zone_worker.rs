@@ -35,7 +35,7 @@
 //!   GW_ZW_CELL("x0,x1,y0,y1" this worker's authoritative cell -> presence selects FOLD mode)
 //!   GW_ZW_NEIGHBORS("xlo:R,xhi:R,ylo:R,yhi:R" neighbour region by exit edge; for FOLD mode)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::time::{Duration, Instant};
 
@@ -117,6 +117,7 @@ struct WorkerMetrics {
     auth_loss: u64,
     loss_imminent: u64,
     rejects: u64,
+    reject_classes: BTreeMap<String, u64>,
 }
 
 // agar.io cell sizing: a cell's AREA scales with mass, so radius = base * sqrt(mass). Used by the body
@@ -485,6 +486,7 @@ async fn main() {
             "owned": bots.len(),
             "view": view_pos.len(),
             "rejects": metrics.rejects,
+            "reject_classes": &metrics.reject_classes,
             "auth_gain": metrics.auth_gain,
             "auth_loss": metrics.auth_loss,
             "loss_imminent": metrics.loss_imminent,
@@ -562,8 +564,67 @@ fn update_rejected_log_line(region: &str, rejected: &UpdateRejected) -> String {
     )
 }
 
+fn reject_reason_kind(reason: &str) -> &'static str {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("not authoritative") {
+        "not_authoritative"
+    } else if lower.contains("stale") && lower.contains("epoch") {
+        "stale_epoch"
+    } else if lower.contains("ghost") || lower.contains("read-only") {
+        "ghost_read_only"
+    } else if lower.contains("acl") {
+        "acl"
+    } else if lower.contains("reserved") || lower.contains("kernel") {
+        "reserved"
+    } else {
+        "other"
+    }
+}
+
+fn reject_owner(rejected: &UpdateRejected) -> String {
+    for key in ["owner_region", "owner", "target_owner"] {
+        if let Some(owner) = rejected.fields.fields.get(key).and_then(Value::as_str) {
+            if !owner.is_empty() {
+                return owner.to_string();
+            }
+        }
+    }
+    if let Some(owner) = rejected.reason.split("owner=").nth(1) {
+        let owner = owner
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ')' | '\'' | '"'))
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !owner.is_empty() {
+            return owner.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn reject_component(rejected: &UpdateRejected) -> &str {
+    rejected
+        .component
+        .as_ref()
+        .map(|component| component.as_ref())
+        .unwrap_or("unknown")
+}
+
+fn reject_class_key(rejected: &UpdateRejected) -> String {
+    format!(
+        "comp={}|reason={}|owner={}",
+        reject_component(rejected),
+        reject_reason_kind(&rejected.reason),
+        reject_owner(rejected)
+    )
+}
+
 fn apply_update_rejected(rejected: &UpdateRejected, region: &str, metrics: &mut WorkerMetrics) {
     metrics.rejects += 1;
+    *metrics
+        .reject_classes
+        .entry(reject_class_key(rejected))
+        .or_insert(0) += 1;
     eprintln!("{}", update_rejected_log_line(region, rejected));
 }
 
@@ -860,6 +921,48 @@ mod tests {
         let mut metrics = WorkerMetrics::default();
         apply_update_rejected(&rejected, "W", &mut metrics);
         assert_eq!(metrics.rejects, 1);
+        assert_eq!(
+            metrics
+                .reject_classes
+                .get("comp=typed-comp|reason=other|owner=unknown"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn update_rejected_metrics_classify_component_reason_and_owner() {
+        let rejected = UpdateRejected {
+            entity: Some("ship".into()),
+            component: Some("vel".into()),
+            reason: "not authoritative; owner=zw-E-lifecycle".to_string(),
+            fields: JsonFields { fields: Map::new() },
+        };
+
+        let mut metrics = WorkerMetrics::default();
+        apply_update_rejected(&rejected, "W", &mut metrics);
+        assert_eq!(metrics.rejects, 1);
+        assert_eq!(
+            metrics
+                .reject_classes
+                .get("comp=vel|reason=not_authoritative|owner=zw-E-lifecycle"),
+            Some(&1)
+        );
+
+        let mut fields = Map::new();
+        fields.insert("owner_region".to_string(), json!("E"));
+        let ghost_reject = UpdateRejected {
+            entity: Some("ship".into()),
+            component: Some("pos".into()),
+            reason: "ghost is read-only".to_string(),
+            fields: JsonFields { fields },
+        };
+        apply_update_rejected(&ghost_reject, "W", &mut metrics);
+        assert_eq!(
+            metrics
+                .reject_classes
+                .get("comp=pos|reason=ghost_read_only|owner=E"),
+            Some(&1)
+        );
     }
 
     #[test]

@@ -33,9 +33,15 @@ guarded target state: a convenient API that keeps correctness bugs visible
 
 ## Minimal flow
 
+This is the product-facing worker shape the SDK is meant to make boring:
+connect, declare interest, create an entity, write epoch-fenced component
+batches, react to authority/rejection metadata, then disconnect.
+
 ```rust
 use godworks_core::Position2;
-use godworks_worker_sdk::{WorkerConfig, WorkerSession};
+use godworks_worker_sdk::{
+    batch_entry, create_entity_op, disconnect_op, WorkerConfig, WorkerFrameKind, WorkerSession,
+};
 use serde_json::json;
 
 # async fn example<S>(stream: S) -> godworks_worker_sdk::Result<()>
@@ -50,25 +56,65 @@ worker
     .await?;
 
 worker
-    .update_component("ship-1", "pos", json!([10.0, 20.0]), Some(7))
+    .send_op(&create_entity_op(
+        "ship-1",
+        "W",
+        json!({
+            "pos": [10.0, 20.0],
+            "vel": [1.0, 0.0],
+            "mass": 12.5
+        }),
+    ))
+    .await?;
+
+worker
+    .batch_update("pos", vec![batch_entry("ship-1", json!([11.0, 20.5]), Some(8))])
+    .await?;
+
+worker
+    .batch_update("vel", vec![batch_entry("ship-1", json!([1.0, 0.25]), Some(8))])
     .await?;
 
 while let Some(frame) = worker.recv_frame().await? {
+    let raw_runtime_frame = frame.op();
+
     if let Some(authority) = frame.authority_change() {
         if !authority.authoritative {
+            let target_region = authority.fields.fields.get("handoff_target_region");
+            let epoch = authority.authority_epoch;
+
             // Stop writing that component and prepare handoff/flush behavior.
+            let _ = (target_region, epoch, raw_runtime_frame);
             continue;
         }
     }
 
-    if let Some(event) = frame.entity_event() {
-        // event.fields keeps the current broad JSON payload intact.
-        let _ = event.fields.fields.get("payload");
+    if let Some(rejected) = frame.update_rejected() {
+        let owner_region = rejected.fields.fields.get("owner_region");
+        let reason = rejected.reason.as_str();
+
+        // Retry/rebase policy belongs in the worker. The SDK preserves the
+        // rejection metadata that policy needs.
+        let _ = (owner_region, reason, raw_runtime_frame);
+    }
+
+    if frame.kind() == WorkerFrameKind::Other {
+        // Keep the full typed Op available for runtime frames the SDK has not
+        // promoted into a convenience accessor yet.
+        let _ = raw_runtime_frame;
     }
 }
+
+worker.send_op(&disconnect_op()).await?;
 # Ok(())
 # }
 ```
+
+The convenience helpers do not narrow the wire contract. Every received frame
+still carries its full typed `Op` through `WorkerFrame::op()` / `into_op()`, and
+the current broad runtime metadata remains available through each frame's
+`fields` bag. In particular, workers should read `AuthorityChange.fields` and
+`UpdateRejected.fields` when making handoff, retry, or stale-epoch decisions.
 
 ## Next after merge
 
