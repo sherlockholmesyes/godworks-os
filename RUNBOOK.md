@@ -145,6 +145,34 @@ This runner is a fixture consumer, not the production bridge. Its job is to
 prove Godot-side adapter code follows the SDK snapshot/resync contract before
 the real TCP scene probe or a future binding grows more behavior.
 
+The real broker reconnect/resync probe uses the same Godot-side adapter, but
+drives an actual TCP socket and `EntityQueryResponse` from the broker. Start one
+release broker:
+
+```powershell
+$env:GW_BIND="127.0.0.1"; $env:GW_PORT="7811"
+$env:GW_WAL=".local/godot-bridge-resync.wal"
+$env:GW_DURABLE_FLUSH_MS="5"
+.\target\release\godworks_broker.exe
+```
+
+Run the probe:
+
+```powershell
+$env:GW_HOST="127.0.0.1"; $env:GW_PORT="7811"
+godot --headless --path client_probes/godot --script res://client_bridge_tcp_resync_probe.gd
+```
+
+Expected result:
+
+```text
+GODOT CLIENT-BRIDGE TCP: PASS -- real broker reconnect checkout rebuilt Godot bridge snapshot and removed stale entity
+```
+
+This gate catches the next failure class after the fixture: a Godot adapter that
+can replay canned JSON but cannot rebuild from a real broker checkout after a
+socket reconnect.
+
 The Godot cross-broker probe drives the same TCP protocol from a real Godot
 runtime and checks that a scene entity crosses W -> E, the E-side write becomes
 public, and a stale W-side write is rejected.
