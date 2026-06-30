@@ -12,6 +12,8 @@ The alpha cache handles:
 - `UpdateRejected`
 - `CriticalSection` depth tracking
 - `MeshGhost` / `MeshGhostRemove` read-only projection markers
+- reconnect/resync cache lifecycle, including full rebuild from
+  `EntityQueryResponse`
 
 The crate does not open sockets, run interpolation, predict movement, or expose an engine-specific API. Godot/Unity bridges should wrap this cache instead of duplicating protocol state handling in engine scripts.
 
@@ -23,5 +25,27 @@ The cache preserves the server stream as the source of truth:
 - Ghost entities remain tagged with `ghost=true` and `owner_region`.
 - Authority changes are stored per component with epoch and mode.
 - Critical sections are surfaced as stream structure, not hidden.
+- `reset_for_reconnect()` clears entities, authority grants, ghost mirrors,
+  rejections, and critical-section depth; old stream state must not survive a
+  new broker connection.
+- `begin_resync()` starts a fresh checkout pass and clears the old view.
+- `finish_resync_from_query_response()` treats a full `EntityQueryResponse` as
+  a canonical checkout cut: absent old entities are removed, returned entities
+  are rebuilt, and the cache becomes `Live`.
 
 This is the product-facing starting point for issue #5: headless cache first, engine bridge second.
+
+## Reconnect flow
+
+Transport and engine bridges should keep the sequence explicit:
+
+1. On socket drop or broker kick, call `reset_for_reconnect()`.
+2. When opening a new connection, call `mark_connecting()`.
+3. Before requesting a full checkout, call `begin_resync()`.
+4. Apply the full checkout through `finish_resync_from_query_response()`.
+5. Resume normal stream updates with `apply_op()`.
+
+Do not merge old rows into a new checkout. Authority epochs from the old
+connection are advisory history only; they must not drive writes after a
+reconnect. The Godot cross-broker probe is a runtime ruler for the wire path,
+not yet a reusable engine bridge.
