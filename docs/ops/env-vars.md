@@ -10,6 +10,8 @@ This document records the current environment-variable surface. It is intentiona
 | `GW_WAL_COMPACT_BYTES` | Compact WAL after the configured byte threshold; `0` disables compaction. |
 | `GW_WAL_FAIL` | Test hook: inject WAL failure. Must not be enabled in production. |
 | `GW_RESTORE_OFFSET` | Restore only up to a consistent-cut WAL byte offset. |
+| `GW_REPLAY_TAPE` | Optional redacted JSONL broker decision tape for offline replay/eval. Disabled when unset. |
+| `GW_REPLAY_TAPE_CAPACITY` | Optional bounded in-memory replay-tape line buffer. Default `8192`; overflow drops tape lines, not runtime traffic. |
 | `GW_BOUNDARY` | Single W/E strip boundary. |
 | `GW_BOUNDARIES` | Comma-separated 1D strip boundaries for N-zone partitioning. |
 | `GW_GRID2D` | Enable 2D grid partitioning, for example `4x4`. |
