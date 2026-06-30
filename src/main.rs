@@ -4806,6 +4806,13 @@ fn prepare_update(
                 "reason":format!("ghost is read-only (non-authoritative; owned by zone '{}'); cannot claim authority over a cross-seam mirror", owner),
                 "ghost":true,"owner_region":owner}),
             );
+        } else {
+            emit(
+                state,
+                wid,
+                json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                "reason":"entity not found"}),
+            );
         }
         return None;
     }
@@ -8613,6 +8620,33 @@ mod tests {
                 .and_then(Value::as_u64)
                 .is_some_and(|age| age <= 1_000),
             "recent monitor tick should expose a fresh age: {fresh}"
+        );
+    }
+
+    #[test]
+    fn batch_update_missing_entity_emits_update_rejected() {
+        let mut state = ServerState::new(30.0);
+        let mut rx = add_test_worker_with_rx(&mut state, "owner-W", "W");
+
+        dispatch_inner(
+            &mut state,
+            "owner-W",
+            &json!({"op":"BatchUpdate","comp":"pos","updates":[["missing-body",[1.0,0.0]]]}),
+        );
+
+        let rejected = decode_test_frame(&rx.try_recv().expect("missing entity rejection"));
+        assert_eq!(
+            rejected.get("op").and_then(Value::as_str),
+            Some("UpdateRejected")
+        );
+        assert_eq!(
+            rejected.get("entity").and_then(Value::as_str),
+            Some("missing-body")
+        );
+        assert_eq!(rejected.get("comp").and_then(Value::as_str), Some("pos"));
+        assert_eq!(
+            rejected.get("reason").and_then(Value::as_str),
+            Some("entity not found")
         );
     }
 
