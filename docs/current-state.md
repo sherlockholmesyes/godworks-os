@@ -52,6 +52,8 @@ full SpatialOS replacement
   handling for authority/rejection/lifecycle-critical frames.
 - Shared WAL decoder and `wal_inspect` CLI.
 - Health/inspector-oriented runtime state.
+- Optional redacted replay tape for broker connect, ingress decision, selected
+  outbound decision frames, and handoff breadcrumbs.
 - Rapier2D physics worker demo.
 - Reality/load harness.
 - Agent reality-gate scaffold for trace/eval/promotion of agent-produced changes.

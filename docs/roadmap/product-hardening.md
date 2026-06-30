@@ -56,6 +56,7 @@ with compatibility tests rather than rebuilding a second protocol path.
 - Mesh auth beyond the current token-claim baseline.
 - Broader per-principal rate-limit policy for public hosted deployments.
 - Metrics exporter.
+- Redacted replay tape for offline eval and policy experiments.
 - Agent contribution trace/eval gate.
 - Docker Compose.
 - WAL inspect/recovery CLI.

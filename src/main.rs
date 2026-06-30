@@ -35,6 +35,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, Sender, UnboundedSender};
 use tokio::sync::Mutex;
 
+mod replay_tape;
+use replay_tape::ReplayTape;
+
 const BOUNDARY: f64 = 0.0;
 const H: f64 = 0.5;
 const INTEREST_MARGIN: f64 = 1.0;
@@ -1577,6 +1580,7 @@ struct ServerState {
     orphaned_regions: Vec<String>,
     metrics: Metrics,
     rejected: Vec<Value>,
+    replay_tape: Option<ReplayTape>, // Model Plane v0: optional bounded/redacted JSONL observer, never runtime authority.
     // ── documented SpatialOS contract ops ──
     pending_commands: HashMap<String, String>, // request_id -> caller wid (route the response back)
     entity_id_reservations: u64,               // monotonic ReserveEntityIds counter
@@ -1678,6 +1682,7 @@ impl ServerState {
             orphaned_regions: Vec::new(),
             metrics: Metrics::default(),
             rejected: Vec::new(),
+            replay_tape: ReplayTape::from_env(),
             pending_commands: HashMap::new(),
             entity_id_reservations: 0,
             flags: Map::new(),
@@ -2570,6 +2575,229 @@ fn worker_connect_frame(worker_id: &str, region: &str, auth_token: Option<&str>)
     frame(&v)
 }
 
+fn replay_tape_value_bytes(f: &Value, key: &str) -> Option<usize> {
+    f.get(key)
+        .and_then(|value| serde_json::to_vec(value).ok())
+        .map(|body| body.len())
+}
+
+fn replay_tape_op_summary(f: &Value, byte_len: usize) -> Value {
+    let mut summary = Map::new();
+    let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    summary.insert("op".to_string(), json!(op));
+    summary.insert("wire_bytes".to_string(), json!(byte_len));
+    for key in [
+        "request_id",
+        "entity",
+        "comp",
+        "region",
+        "target",
+        "src_region",
+    ] {
+        if let Some(value) = f.get(key).and_then(|v| v.as_str()) {
+            summary.insert(key.to_string(), json!(value));
+        }
+    }
+    if let Some(epoch) = f.get("authority_epoch").and_then(|v| v.as_u64()) {
+        summary.insert("authority_epoch".to_string(), json!(epoch));
+    }
+    if f.get("auth_token").is_some() {
+        summary.insert("credential_present".to_string(), json!(true));
+    }
+    if let Some(bytes) = replay_tape_value_bytes(f, "value") {
+        summary.insert("value_bytes".to_string(), json!(bytes));
+    }
+    if let Some(bytes) = replay_tape_value_bytes(f, "payload") {
+        summary.insert("payload_bytes".to_string(), json!(bytes));
+    }
+    if let Some(bytes) = replay_tape_value_bytes(f, "components") {
+        summary.insert("components_bytes".to_string(), json!(bytes));
+    }
+    if let Some(bytes) = replay_tape_value_bytes(f, "updates") {
+        summary.insert("updates_bytes".to_string(), json!(bytes));
+    }
+    if let Some(count) = f.get("updates").and_then(|v| v.as_array()).map(Vec::len) {
+        summary.insert("update_count".to_string(), json!(count));
+    }
+    if let Some(count) = f
+        .get("components")
+        .and_then(|v| v.as_object())
+        .map(Map::len)
+    {
+        summary.insert("component_count".to_string(), json!(count));
+    }
+    Value::Object(summary)
+}
+
+fn record_replay_tape_ingress(
+    state: &ServerState,
+    wid: &str,
+    f: &Value,
+    byte_len: usize,
+    outcome: &str,
+    reason: Option<&str>,
+) {
+    let Some(tape) = state.replay_tape.as_ref() else {
+        return;
+    };
+    let (role, region) = state
+        .workers
+        .get(wid)
+        .map(|w| (w.role.as_str(), w.region.as_str()))
+        .unwrap_or(("unknown", ""));
+    let mut event = Map::new();
+    event.insert("kind".to_string(), json!("broker_ingress"));
+    event.insert("t_ms".to_string(), json!(now_millis()));
+    event.insert("peer".to_string(), json!(wid));
+    event.insert("role".to_string(), json!(role));
+    event.insert("region".to_string(), json!(region));
+    event.insert("outcome".to_string(), json!(outcome));
+    event.insert("durable_gen".to_string(), json!(state.durable_gen));
+    event.insert("pending_gen".to_string(), json!(state.pending_gen));
+    event.insert(
+        "op_summary".to_string(),
+        replay_tape_op_summary(f, byte_len),
+    );
+    if let Some(reason) = reason {
+        event.insert("reason".to_string(), json!(reason));
+    }
+    tape.record(Value::Object(event));
+}
+
+struct ReplayConnectRecord<'a> {
+    wid: &'a str,
+    frame: &'a Value,
+    byte_len: usize,
+    region: &'a str,
+    attributes: &'a HashSet<String>,
+    outcome: &'a str,
+    reason: Option<&'a str>,
+}
+
+fn record_replay_tape_connect(state: &ServerState, rec: ReplayConnectRecord<'_>) {
+    let Some(tape) = state.replay_tape.as_ref() else {
+        return;
+    };
+    let role = peer_role_for(rec.region, rec.attributes);
+    let mut event = Map::new();
+    event.insert("kind".to_string(), json!("broker_connect"));
+    event.insert("t_ms".to_string(), json!(now_millis()));
+    event.insert("peer".to_string(), json!(rec.wid));
+    event.insert("role".to_string(), json!(role.as_str()));
+    event.insert("region".to_string(), json!(rec.region));
+    event.insert("outcome".to_string(), json!(rec.outcome));
+    event.insert("wire_bytes".to_string(), json!(rec.byte_len));
+    event.insert(
+        "requested_region".to_string(),
+        rec.frame.get("region").cloned().unwrap_or(Value::Null),
+    );
+    event.insert(
+        "proto".to_string(),
+        rec.frame.get("proto").cloned().unwrap_or(Value::Null),
+    );
+    event.insert(
+        "credential_present".to_string(),
+        json!(rec.frame.get("auth_token").is_some()),
+    );
+    event.insert("attribute_count".to_string(), json!(rec.attributes.len()));
+    if let Some(reason) = rec.reason {
+        event.insert("reason".to_string(), json!(reason));
+    }
+    tape.record(Value::Object(event));
+}
+
+struct ReplayHandoffRecord<'a> {
+    path: &'a str,
+    eid: &'a str,
+    from: Option<&'a str>,
+    to: Option<&'a str>,
+    authority_epoch: Option<u64>,
+    source_durable_gen: Option<u64>,
+    lease_epoch: Option<u64>,
+}
+
+fn record_replay_tape_handoff(state: &ServerState, rec: ReplayHandoffRecord<'_>) {
+    let Some(tape) = state.replay_tape.as_ref() else {
+        return;
+    };
+    let mut event = Map::new();
+    event.insert("kind".to_string(), json!("broker_handoff"));
+    event.insert("t_ms".to_string(), json!(now_millis()));
+    event.insert("path".to_string(), json!(rec.path));
+    event.insert("entity".to_string(), json!(rec.eid));
+    event.insert("durable_gen".to_string(), json!(state.durable_gen));
+    if let Some(from) = rec.from {
+        event.insert("from".to_string(), json!(from));
+    }
+    if let Some(to) = rec.to {
+        event.insert("to".to_string(), json!(to));
+    }
+    if let Some(authority_epoch) = rec.authority_epoch {
+        event.insert("authority_epoch".to_string(), json!(authority_epoch));
+    }
+    if let Some(source_durable_gen) = rec.source_durable_gen {
+        event.insert("source_durable_gen".to_string(), json!(source_durable_gen));
+    }
+    if let Some(lease_epoch) = rec.lease_epoch {
+        event.insert("lease_epoch".to_string(), json!(lease_epoch));
+    }
+    tape.record(Value::Object(event));
+}
+
+fn record_replay_tape_emit(state: &ServerState, wid: &str, v: &Value) {
+    let Some(tape) = state.replay_tape.as_ref() else {
+        return;
+    };
+    let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
+    if op != "UpdateRejected" && op != "AuthorityChange" {
+        return;
+    }
+    let (role, region) = state
+        .workers
+        .get(wid)
+        .map(|w| (w.role.as_str(), w.region.as_str()))
+        .unwrap_or(("unknown", ""));
+    let mut event = Map::new();
+    event.insert("kind".to_string(), json!("broker_outbound"));
+    event.insert("t_ms".to_string(), json!(now_millis()));
+    event.insert("peer".to_string(), json!(wid));
+    event.insert("role".to_string(), json!(role));
+    event.insert("region".to_string(), json!(region));
+    event.insert("op".to_string(), json!(op));
+    event.insert("durable_gen".to_string(), json!(state.durable_gen));
+    if let Some(value) = v.get("request_id").and_then(|value| value.as_str()) {
+        event.insert("request_id".to_string(), json!(value));
+    }
+    if let Some(value) = v.get("entity").and_then(|value| value.as_str()) {
+        event.insert("entity".to_string(), json!(value));
+    }
+    if let Some(value) = v.get("comp").and_then(|value| value.as_str()) {
+        event.insert("comp".to_string(), json!(value));
+    }
+    if let Some(value) = v.get("reason").and_then(|value| value.as_str()) {
+        event.insert("reason".to_string(), json!(value));
+    }
+    if let Some(value) = v.get("error").and_then(|value| value.as_str()) {
+        event.insert("error".to_string(), json!(value));
+    }
+    if let Some(value) = v.get("rejected_op").and_then(|value| value.as_str()) {
+        event.insert("rejected_op".to_string(), json!(value));
+    }
+    if let Some(value) = v.get("peer_role").and_then(|value| value.as_str()) {
+        event.insert("peer_role".to_string(), json!(value));
+    }
+    if let Some(value) = v.get("authoritative").and_then(|value| value.as_bool()) {
+        event.insert("authoritative".to_string(), json!(value));
+    }
+    if let Some(value) = v.get("authority_epoch").and_then(|value| value.as_u64()) {
+        event.insert("authority_epoch".to_string(), json!(value));
+    }
+    if let Some(value) = v.get("mode").and_then(|value| value.as_str()) {
+        event.insert("mode".to_string(), json!(value));
+    }
+    tape.record(Value::Object(event));
+}
+
 fn emit(state: &ServerState, wid: &str, v: Value) {
     if let Some(w) = state.workers.get(wid) {
         // G4 bounding (graceful first line): over the soft cap, a slow consumer's DEGRADABLE flood is
@@ -2578,6 +2806,7 @@ fn emit(state: &ServerState, wid: &str, v: Value) {
         // (4096 -> 2048 -> 1024) so a stressed broker sheds degradable floods sooner. CRITICAL goes on to
         // the bounded channel below.
         let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
+        record_replay_tape_emit(state, wid, &v);
         let degradable = op == "ComponentUpdate" || op == "InspectorFrame";
         let cap = EGRESS_SOFT_CAP >> state.load_level;
         if degradable && w.out_queue.load(Ordering::Relaxed) > cap {
@@ -3213,6 +3442,18 @@ fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
         return;
     }
     state.durable_gen = state.durable_gen.max(source_gen);
+    record_replay_tape_handoff(
+        state,
+        ReplayHandoffRecord {
+            path: "mesh_out",
+            eid,
+            from: Some(src_region.as_str()),
+            to: Some(target),
+            authority_epoch: Some(authority_epoch),
+            source_durable_gen: Some(source_gen),
+            lease_epoch: src_lease_epoch,
+        },
+    );
     // Park it pending the neighbour's MeshAck BEFORE attempting the send; if this process crashes after the WAL
     // but before/while sending, recovery reconstructs the same pending handoff from mesh_out.
     state.pending_mesh.insert(
@@ -3668,6 +3909,18 @@ fn apply_prepared_handoff(state: &mut ServerState, h: &PreparedHandoff) {
         return;
     }
     state.metrics.handoffs += 1;
+    record_replay_tape_handoff(
+        state,
+        ReplayHandoffRecord {
+            path: "local",
+            eid: &h.eid,
+            from: Some(h.from.as_str()),
+            to: Some(h.to.as_str()),
+            authority_epoch: Some(h.authority_epoch),
+            source_durable_gen: Some(h.gen),
+            lease_epoch: h.lease_epoch,
+        },
+    );
 
     if let Some(ow) = h.old_wid.clone() {
         if state.workers.contains_key(&ow) {
@@ -4959,14 +5212,31 @@ fn apply_one_update(
 
 fn dispatch_frame(state: &mut ServerState, wid: &str, f: &Value, byte_len: usize) {
     if reject_ingress_rate_limit(state, wid, f, byte_len) {
+        record_replay_tape_ingress(
+            state,
+            wid,
+            f,
+            byte_len,
+            "rejected",
+            Some("rate_limit_error"),
+        );
         reap_disconnecting(state);
         return;
     }
     if reject_role_policy(state, wid, f) {
+        record_replay_tape_ingress(
+            state,
+            wid,
+            f,
+            byte_len,
+            "rejected",
+            Some("role_policy_error"),
+        );
         reap_disconnecting(state);
         return;
     }
     dispatch_inner(state, wid, f);
+    record_replay_tape_ingress(state, wid, f, byte_len, "dispatched", None);
     // T1: a single frame's fan-out (e.g. a critical EntityEvent to N observers) may have driven a stuck
     // consumer past the hard egress cap; reap it NOW (within this frame) so its bounded channel can hold at
     // most CHANNEL_CAP frames before the socket is torn down -- the structural RAM bound. Runs on EVERY
@@ -6615,6 +6885,18 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 }
                 return;
             }
+            record_replay_tape_handoff(
+                state,
+                ReplayHandoffRecord {
+                    path: "mesh_in",
+                    eid: &eid,
+                    from: f.get("src_region").and_then(|v| v.as_str()),
+                    to: Some(adopt_region.as_str()),
+                    authority_epoch,
+                    source_durable_gen: f.get("source_durable_gen").and_then(|v| v.as_u64()),
+                    lease_epoch: f.get("lease_epoch").and_then(|v| v.as_u64()),
+                },
+            );
             // confirm receipt to the sender (the mesh-link worker that delivered this) so it releases the
             // parked entity from pending_mesh. Idempotent: re-sends are re-ACK'd, never double-adopted.
             // G2.1c: GW_MESH_ACK_DROP holds the ack so the entity stays in-flight (A.pending + B.adopted).
@@ -6794,11 +7076,12 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
     sock.set_nodelay(true).ok();
     let (mut rd, mut wr) = sock.into_split();
 
-    let first = match read_frame(&mut rd).await {
+    let first_frame = match read_frame(&mut rd).await {
         Some(f) => f,
         None => return,
     };
-    let first = first.value;
+    let first_byte_len = first_frame.byte_len;
+    let first = first_frame.value;
     if first.get("op").and_then(|v| v.as_str()) != Some("WorkerConnect") {
         return;
     }
@@ -6824,6 +7107,21 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
     // so a rolling broker upgrade can't let an incompatible peer corrupt the mesh.
     if let Some(proto) = first.get("proto").and_then(|v| v.as_u64()) {
         if proto < MIN_PROTO || proto > PROTOCOL_VERSION {
+            {
+                let s = state.lock().await;
+                record_replay_tape_connect(
+                    &s,
+                    ReplayConnectRecord {
+                        wid: &wid,
+                        frame: &first,
+                        byte_len: first_byte_len,
+                        region: &region,
+                        attributes: &attributes,
+                        outcome: "rejected",
+                        reason: Some("version_reject"),
+                    },
+                );
+            }
             let rej = frame(&json!({
                 "op": "VersionReject",
                 "reason": "incompatible protocol version",
@@ -6860,6 +7158,21 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
         }
         Ok(None) => {}
         Err(reason) => {
+            {
+                let s = state.lock().await;
+                record_replay_tape_connect(
+                    &s,
+                    ReplayConnectRecord {
+                        wid: &wid,
+                        frame: &first,
+                        byte_len: first_byte_len,
+                        region: &region,
+                        attributes: &attributes,
+                        outcome: "rejected",
+                        reason: Some(reason),
+                    },
+                );
+            }
             let rej = frame(&json!({
                 "op": "AuthReject",
                 "worker_id": wid,
@@ -6896,6 +7209,7 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
     {
         let mut s = state.lock().await;
         let ingress_tokens = s.ingress_burst_frames.max(1.0);
+        let connect_attributes_for_tape = attributes.clone();
         s.workers.insert(
             wid.clone(),
             WorkerHandle {
@@ -6924,6 +7238,18 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
         println!(
             "[broker] worker '{wid}' connected as region '{region}' role '{}'",
             role.as_str()
+        );
+        record_replay_tape_connect(
+            &s,
+            ReplayConnectRecord {
+                wid: &wid,
+                frame: &first,
+                byte_len: first_byte_len,
+                region: &region,
+                attributes: &connect_attributes_for_tape,
+                outcome: "accepted",
+                reason: None,
+            },
         );
         if role == PeerRole::Worker && region == "STANDBY" {
             s.standbys.push(wid.clone()); // a hot spare for failover
@@ -7773,6 +8099,33 @@ mod tests {
         rx
     }
 
+    fn replay_tape_path(name: &str) -> String {
+        let unique = format!("{}_{}_{}.jsonl", name, std::process::id(), now_millis());
+        std::env::temp_dir()
+            .join(unique)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn install_replay_tape(state: &mut ServerState, path: &str) {
+        state.replay_tape = Some(ReplayTape::open_path(path, 128).unwrap());
+    }
+
+    fn wait_for_tape(path: &str, min_lines: usize) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let lines: Vec<Value> = content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect();
+            if lines.len() >= min_lines || Instant::now() >= deadline {
+                return lines;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn seed_2d_rebalance_state(state: &mut ServerState) -> Vec<String> {
         state.grid2d = Some((2, 2, 10.0, 10.0));
         add_test_worker(state, "hot", "Z0_0");
@@ -7821,6 +8174,150 @@ mod tests {
             parse_grid2d_values("2x2", Some("200,100")),
             Some((2, 2, 100.0, 50.0))
         );
+    }
+
+    #[test]
+    fn replay_tape_disabled_by_default() {
+        let old = std::env::var_os("GW_REPLAY_TAPE");
+        std::env::remove_var("GW_REPLAY_TAPE");
+        let state = ServerState::new(30.0);
+        assert!(state.replay_tape.is_none());
+        if let Some(old) = old {
+            std::env::set_var("GW_REPLAY_TAPE", old);
+        }
+    }
+
+    #[test]
+    fn replay_tape_never_records_auth_token_or_component_body() {
+        let mut state = ServerState::new(30.0);
+        let path = replay_tape_path("gw_replay_redaction");
+        install_replay_tape(&mut state, &path);
+        let _rx = add_test_peer_with_rx(
+            &mut state,
+            "client-1",
+            "CLIENT",
+            HashSet::from(["role.client".to_string(), "player.alice".to_string()]),
+        );
+        let sentinel = "SECRET_COMPONENT_BODY_SHOULD_NOT_APPEAR";
+        let frame = json!({
+            "op":"CreateEntity",
+            "request_id":"create-secret",
+            "entity":"client-forged",
+            "auth_token":"super-secret-token",
+            "components":{"profile": sentinel, "pos":[1.0,2.0]}
+        });
+
+        dispatch_test_frame(&mut state, "client-1", &frame);
+
+        let _lines = wait_for_tape(&path, 2);
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!content.contains("super-secret-token"));
+        assert!(!content.contains("auth_token"));
+        assert!(!content.contains(sentinel));
+        assert!(content.contains("credential_present"));
+        assert!(content.contains("components_bytes"));
+    }
+
+    #[test]
+    fn replay_tape_large_payload_records_size_not_payload() {
+        let mut state = ServerState::new(30.0);
+        let path = replay_tape_path("gw_replay_large_payload");
+        install_replay_tape(&mut state, &path);
+        let _rx = add_test_peer_with_rx(
+            &mut state,
+            "client-1",
+            "CLIENT",
+            HashSet::from(["role.client".to_string(), "player.alice".to_string()]),
+        );
+        let sentinel = format!("LARGE_PAYLOAD_SENTINEL_{}", "x".repeat(2048));
+        let frame = json!({
+            "op":"UpdateComponent",
+            "entity":"missing-entity",
+            "comp":"bio",
+            "value": sentinel
+        });
+
+        dispatch_test_frame(&mut state, "client-1", &frame);
+
+        let _lines = wait_for_tape(&path, 2);
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(!content.contains("LARGE_PAYLOAD_SENTINEL"));
+        assert!(content.contains("value_bytes"));
+        assert!(content.contains("\"outcome\":\"dispatched\""));
+    }
+
+    #[test]
+    fn replay_tape_role_policy_reject_matches_frame_reason() {
+        let mut state = ServerState::new(30.0);
+        let path = replay_tape_path("gw_replay_role_policy");
+        install_replay_tape(&mut state, &path);
+        let _rx = add_test_peer_with_rx(
+            &mut state,
+            "client-1",
+            "CLIENT",
+            HashSet::from(["role.client".to_string(), "player.alice".to_string()]),
+        );
+
+        dispatch_test_frame(
+            &mut state,
+            "client-1",
+            &json!({"op":"CreateEntity","request_id":"c1","entity":"bad"}),
+        );
+
+        let lines = wait_for_tape(&path, 2);
+        assert!(lines.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("broker_ingress")
+                && event.get("outcome").and_then(Value::as_str) == Some("rejected")
+                && event.get("reason").and_then(Value::as_str) == Some("role_policy_error")
+                && event
+                    .get("op_summary")
+                    .and_then(|summary| summary.get("op"))
+                    .and_then(Value::as_str)
+                    == Some("CreateEntity")
+        }));
+        assert!(lines.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("broker_outbound")
+                && event.get("op").and_then(Value::as_str) == Some("UpdateRejected")
+                && event.get("error").and_then(Value::as_str) == Some("role_policy_error")
+                && event.get("rejected_op").and_then(Value::as_str) == Some("CreateEntity")
+                && event.get("peer_role").and_then(Value::as_str) == Some("client")
+        }));
+    }
+
+    #[test]
+    fn replay_tape_handoff_authority_change_records_epoch() {
+        let mut state = ServerState::new(30.0);
+        let _old_rx = add_test_worker_with_rx(&mut state, "zw-W", "W");
+        let _new_rx = add_test_worker_with_rx(&mut state, "zw-E", "E");
+        state.entities.insert(
+            "ship".to_string(),
+            test_physics_island_entity([-1.0, 0.0], "W"),
+        );
+        grant_region_physics_island_authority(&mut state, "zw-W", "ship");
+        let path = replay_tape_path("gw_replay_handoff_epoch");
+        install_replay_tape(&mut state, &path);
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([1.0, 0.0])
+        ));
+        flush_pending_handoffs(&mut state);
+
+        let lines = wait_for_tape(&path, 2);
+        assert!(lines.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("broker_handoff")
+                && event.get("path").and_then(Value::as_str) == Some("local")
+                && event.get("entity").and_then(Value::as_str) == Some("ship")
+                && event.get("from").and_then(Value::as_str) == Some("W")
+                && event.get("to").and_then(Value::as_str) == Some("E")
+                && event
+                    .get("authority_epoch")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|epoch| epoch > 1)
+        }));
     }
 
     #[test]
@@ -8080,6 +8577,60 @@ mod tests {
             !matches!(s.region_worker.get("E"), Some(w) if w == "region-thief"),
             "wrong-region claim token must not claim region ownership"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_tape_worker_connect_redacts_auth_token_on_reject() {
+        let path = replay_tape_path("gw_replay_connect_redaction");
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            install_replay_tape(&mut s, &path);
+            s.connect_auth_claims.insert(
+                "w-secret".to_string(),
+                PeerClaims {
+                    region: "W".to_string(),
+                    attributes: HashSet::from(["physics".to_string()]),
+                },
+            );
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"region-thief",
+                "region":"E",
+                "attributes":["physics"],
+                "auth_token":"w-secret"
+            })))
+            .await
+            .unwrap();
+
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await.unwrap();
+        let n = u32::from_be_bytes(hdr) as usize;
+        let mut body = vec![0u8; n];
+        client.read_exact(&mut body).await.unwrap();
+        let reject: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reject["op"], "AuthReject");
+        server.await.unwrap();
+
+        let _lines = wait_for_tape(&path, 1);
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(content.contains("\"kind\":\"broker_connect\""));
+        assert!(content.contains("\"credential_present\":true"));
+        assert!(content.contains("\"outcome\":\"rejected\""));
+        assert!(!content.contains("w-secret"));
+        assert!(!content.contains("auth_token"));
     }
 
     #[tokio::test]
