@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::atomic::AtomicBool;
 
+use godworks_protocol::DEFAULT_MAX_FRAME_BYTES;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -6549,7 +6550,8 @@ fn matches_query(e: &Entity, q: &Value) -> bool {
 
 // A2 thin-fill (2026-06-20): the frame length `n` is peer-controlled; `vec![0u8; n]` would alloc up
 // to 4 GiB on a single crafted frame = a one-packet remote OOM-DoS. Clamp before allocating.
-const MAX_FRAME: usize = 8 * 1024 * 1024; // 8 MiB -- generous vs any real op, rejects the DoS
+// Keep the broker bound to the protocol crate's public v1 contract so SDKs, docs, and runtime agree.
+const MAX_FRAME: usize = DEFAULT_MAX_FRAME_BYTES;
 
 async fn read_frame<R: AsyncReadExt + Unpin>(rd: &mut R) -> Option<Value> {
     let mut hdr = [0u8; 4];
@@ -7025,6 +7027,19 @@ mod tests {
     fn decode_test_frame(buf: &[u8]) -> Value {
         let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         serde_json::from_slice(&buf[4..4 + n]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_header_before_body() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let oversized = (DEFAULT_MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
+        client.write_all(&oversized).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(50), read_frame(&mut server))
+            .await
+            .expect("oversized header should return before reading a body");
+
+        assert!(result.is_none());
     }
 
     #[test]
