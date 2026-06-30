@@ -117,6 +117,10 @@ the current broad runtime metadata remains available through each frame's
 `fields` bag. In particular, workers should read `AuthorityChange.fields` and
 `UpdateRejected.fields` when making handoff, retry, or stale-epoch decisions.
 
-## Next after merge
+## Current integration status
 
-After this MVP lands, the next slice should migrate `zone_worker` onto the SDK behind behavior-preserving tests. Do not start Godot or client SDK work before that migration proves the SDK can drive the current worker path.
+The real `zone_worker` now uses the SDK frame boundary and helper surface for
+its worker protocol path. See `docs/sdk/issue-16-pr-readiness.md` for the
+current migrated-site report and gate. Do not start Godot or client SDK work
+from this document alone; first check the current hardening roadmap and the
+latest worker/runtime gate.
