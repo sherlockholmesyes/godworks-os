@@ -9231,6 +9231,185 @@ mod tests {
     }
 
     #[test]
+    fn physics_handoff_preserves_gameplay_authority() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        add_test_worker(&mut state, "gameplay", "GAME");
+        let mut ship = test_physics_island_entity([-1.0, 0.0], "W");
+        ship.components.insert(
+            "inventory".to_string(),
+            json!({"iron": 3, "atlas_shards": 1}),
+        );
+        ship.components
+            .insert("health".to_string(), json!({"hp": 100}));
+        ensure_component_authority(&mut ship, "inventory");
+        ensure_component_authority(&mut ship, "health");
+        set_component_authority_epoch(&mut ship, "inventory", 29);
+        set_component_authority_epoch(&mut ship, "health", 31);
+        state.entities.insert("ship".to_string(), ship);
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+        grant_authority(&mut state, "gameplay", "ship", "inventory");
+        grant_authority(&mut state, "gameplay", "ship", "health");
+        let inventory_epoch = component_authority_epoch(&state.entities["ship"], "inventory");
+        let health_epoch = component_authority_epoch(&state.entities["ship"], "health");
+        let old_physics_epochs = stamp_expanded_physics_island_epochs(
+            state.entities.get_mut("ship").expect("seeded ship"),
+        );
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        assert_eq!(inventory_epoch, 29);
+        assert_eq!(health_epoch, 31);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "inventory"),
+            Some("gameplay".to_string())
+        );
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "health"),
+            Some("gameplay".to_string())
+        );
+        assert_eq!(
+            state.workers["gameplay"]
+                .authority_epochs
+                .get(&authority_key("ship", "inventory"))
+                .copied(),
+            Some(inventory_epoch)
+        );
+        assert_eq!(
+            state.workers["gameplay"]
+                .authority_epochs
+                .get(&authority_key("ship", "health"))
+                .copied(),
+            Some(health_epoch)
+        );
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+
+        assert_eq!(state.pending_handoffs.len(), 1);
+        assert!(!state.pending_handoffs[0]
+            .moved_comps
+            .contains(&"inventory".to_string()));
+        assert!(!state.pending_handoffs[0]
+            .moved_comps
+            .contains(&"health".to_string()));
+        let pending_authority = state.pending_handoffs[0]
+            .authority
+            .as_object()
+            .expect("pending handoff must carry an authority snapshot");
+        assert_eq!(pending_authority["inventory"]["owner"], "gameplay");
+        assert_eq!(
+            pending_authority["inventory"]["authority_epoch"],
+            inventory_epoch
+        );
+        assert_eq!(pending_authority["inventory"]["mode"], "server_arbitrated");
+        assert_eq!(pending_authority["health"]["owner"], "gameplay");
+        assert_eq!(pending_authority["health"]["authority_epoch"], health_epoch);
+        assert_eq!(pending_authority["health"]["mode"], "server_arbitrated");
+
+        flush_pending_handoffs(&mut state);
+
+        for comp in expanded_physics_island_components() {
+            assert_eq!(
+                component_authority_owner(&state.entities["ship"], comp),
+                Some("w2".to_string()),
+                "{comp}"
+            );
+            assert!(
+                !state.workers["w1"]
+                    .authority_epochs
+                    .contains_key(&authority_key("ship", comp)),
+                "old physics owner still has cached authority for {comp}"
+            );
+            assert!(state.workers["w2"]
+                .authority_epochs
+                .contains_key(&authority_key("ship", comp)));
+        }
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "inventory"),
+            Some("gameplay".to_string())
+        );
+        assert_eq!(
+            component_authority_epoch(&state.entities["ship"], "inventory"),
+            inventory_epoch
+        );
+        assert_eq!(
+            component_authority_mode(&state.entities["ship"], "inventory"),
+            AuthorityMode::ServerArbitrated
+        );
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "health"),
+            Some("gameplay".to_string())
+        );
+        assert_eq!(
+            component_authority_epoch(&state.entities["ship"], "health"),
+            health_epoch
+        );
+        assert_eq!(
+            component_authority_mode(&state.entities["ship"], "health"),
+            AuthorityMode::ServerArbitrated
+        );
+        assert!(state.workers["gameplay"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "inventory")));
+        assert!(state.workers["gameplay"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "health")));
+        assert!(!state.workers["w2"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "inventory")));
+        assert!(!state.workers["w2"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "health")));
+        assert!(!apply_one_update(
+            &mut state,
+            "w1",
+            "ship",
+            "pos",
+            json!([4.0, 0.0]),
+            Some(old_physics_epochs["pos"]),
+        ));
+        assert!(!apply_one_update(
+            &mut state,
+            "w2",
+            "ship",
+            "health",
+            json!({"hp": 1}),
+            Some(health_epoch),
+        ));
+        assert!(apply_one_update(
+            &mut state,
+            "gameplay",
+            "ship",
+            "inventory",
+            json!({"iron": 4, "atlas_shards": 1}),
+            Some(inventory_epoch),
+        ));
+        assert!(apply_one_update(
+            &mut state,
+            "gameplay",
+            "ship",
+            "health",
+            json!({"hp": 90}),
+            Some(health_epoch),
+        ));
+        flush_pending_updates(&mut state);
+        assert_eq!(
+            state.entities["ship"].components["inventory"],
+            json!({"iron": 4, "atlas_shards": 1})
+        );
+        assert_eq!(
+            state.entities["ship"].components["health"],
+            json!({"hp": 90})
+        );
+    }
+
+    #[test]
     fn handoff_sync_fail_keeps_old_owner() {
         let mut state = ServerState::new(30.0);
         add_test_worker(&mut state, "w1", "W");
