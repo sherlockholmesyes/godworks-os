@@ -1,0 +1,131 @@
+{
+  "name": "godot_bridge_resync_contract_v1",
+  "description": "Shared engine-bridge transcript: stale stream state is cleared, full checkout becomes the canonical live view, ghosts remain read-only projections.",
+  "steps": [
+    {
+      "kind": "stream",
+      "op": {
+        "op": "AddEntity",
+        "entity": "stale",
+        "components": {
+          "pos": [99.0, 99.0],
+          "kind": "old"
+        }
+      }
+    },
+    {
+      "kind": "stream",
+      "op": {
+        "op": "AuthorityChange",
+        "entity": "stale",
+        "comp": "pos",
+        "authoritative": true,
+        "authority_epoch": 3,
+        "mode": "server_physics_island"
+      }
+    },
+    {
+      "kind": "stream",
+      "op": {
+        "op": "MeshGhost",
+        "entity": "old-ghost",
+        "pos": [4.0, 4.0],
+        "owner_region": "E"
+      }
+    },
+    {
+      "kind": "stream",
+      "op": {
+        "op": "UpdateRejected",
+        "entity": "stale",
+        "comp": "pos",
+        "reason": "stale authority_epoch"
+      }
+    },
+    {
+      "kind": "stream",
+      "op": {
+        "op": "CriticalSection",
+        "phase": "begin",
+        "entity": "stale"
+      }
+    },
+    {
+      "kind": "mark_live"
+    },
+    {
+      "kind": "transport_closed"
+    },
+    {
+      "kind": "transport_connecting"
+    },
+    {
+      "kind": "begin_full_resync"
+    },
+    {
+      "kind": "finish_full_resync",
+      "op": {
+        "op": "EntityQueryResponse",
+        "request_id": "godot-bridge-resync",
+        "count": 2,
+        "entities": [
+          {
+            "entity": "fresh",
+            "pos": [2.0, 3.0],
+            "region": "E",
+            "components": {
+              "kind": "new"
+            },
+            "authority": {
+              "pos": {
+                "owner": "zw-E",
+                "authority_epoch": 8,
+                "mode": "server_physics_island"
+              }
+            }
+          },
+          {
+            "entity": "remote",
+            "pos": [9.0, 1.0],
+            "components": {
+              "kind": "remote_ghost"
+            },
+            "ghost": true,
+            "owner_region": "W",
+            "authority": {}
+          }
+        ]
+      }
+    }
+  ],
+  "expected_snapshot": {
+    "phase": "Live",
+    "critical_depth": 0,
+    "entity_count": 2,
+    "rejection_count": 0,
+    "entities": [
+      {
+        "entity": "fresh",
+        "ghost": false,
+        "owner_region": null,
+        "position2": [2.0, 3.0],
+        "component_keys": ["kind", "pos", "region"],
+        "authority": {
+          "pos": {
+            "authoritative": true,
+            "authority_epoch": 8,
+            "mode": "server_physics_island"
+          }
+        }
+      },
+      {
+        "entity": "remote",
+        "ghost": true,
+        "owner_region": "W",
+        "position2": [9.0, 1.0],
+        "component_keys": ["ghost", "kind", "owner_region", "pos"],
+        "authority": {}
+      }
+    ]
+  }
+}

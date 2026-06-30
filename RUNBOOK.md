@@ -116,6 +116,18 @@ cargo test dense_seam_with_matching_e_worker_conserves_authority -- --nocapture
 
 ## Godot Headless Client Probe
 
+Before adding or changing Godot bridge behavior, run the SDK bridge contract
+fixture:
+
+```powershell
+cargo test -p godworks-client-sdk bridge_replays_godot_resync_contract_fixture -- --nocapture
+```
+
+That fixture lives at `tests/fixtures/client_bridge/godot-resync-contract.json`
+and is the shared reconnect/resync contract for engine bindings. It keeps the
+Rust `ClientBridge` as the source of truth instead of letting the Godot probe
+grow a second cache with different semantics.
+
 The Godot cross-broker probe drives the same TCP protocol from a real Godot
 runtime and checks that a scene entity crosses W -> E, the E-side write becomes
 public, and a stale W-side write is rejected.
