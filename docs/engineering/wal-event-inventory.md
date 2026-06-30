@@ -29,12 +29,16 @@ Current replay path:
 
 - write barrier helpers: `ServerState::wal_append`,
   `ServerState::wal_append_nosync`, `ServerState::wal_sync`
-- encoding/version helpers: `wal_v1_envelope_line`, `wal_v1_header_line`
-- integrity gate: `decode_wal_line`
+- encoding/version helpers: `godworks_broker::wal::wal_v1_envelope_line`,
+  `godworks_broker::wal::wal_v1_header_line`
+- integrity gate: `godworks_broker::wal::decode_wal_line`
 - report + restore: `recover_from_wal_report`
 - pure replay reducer: `apply_wal_events`
 - startup hydration: `main` loads `GW_WAL`, optional `GW_RESTORE_OFFSET`,
   recovered topology, pending mesh handoffs, and entity id high-water mark
+- operator inspection: `wal_inspect <path> [--up-to-offset <bytes>]` uses the
+  same shared WAL reader as broker recovery and reports kind counts, unknown
+  kinds, corruption/refusal status, and corrupt-tail truncation.
 
 ## Durability forms
 
@@ -83,7 +87,9 @@ goes fail-closed for persistent ops and does not publish success.
 - latest partition topology
 - unacked `mesh_out` payloads for resend
 - reserved entity id high-water mark
-- integrity report with WAL version, truncated tail bytes, and refuse error
+- integrity report with WAL version, selected/decoded event counts,
+  corrupt-tail counts, unknown-kind inventory, truncated tail bytes, and refuse
+  error
 
 That shape is the extraction target for issue #3: the future WAL module should
 return the same facts with named types, not leak `serde_json::Value` through the
@@ -106,26 +112,23 @@ and runtime tests:
 
 ## Next extraction seams
 
-1. Move envelope/header/CRC/decode/report code into a WAL module without
+1. Move the remaining broker-local WAL replay layer into named types without
    changing the on-disk format.
 2. Replace the tuple return from `recover_from_wal_report` with a typed
    recovery report.
-3. Add an operator CLI or tool command that can inspect a WAL without serving.
-4. Add explicit corrupt-tail, mid-corruption, future-version, and
-   `GW_RESTORE_OFFSET` tests for the extracted module.
-5. Keep snapshots as a separate layer; issue #3 should not become a full
+3. Keep snapshots as a separate layer; issue #3 should not become a full
    snapshot implementation.
 
 ## Gaps to close while extracting
 
-- Recovery currently ignores unknown WAL event kinds. The inspector should
-  count and flag unknown kinds so operator review can catch drift before a
-  replay silently drops a new transition.
+- Recovery still ignores unknown WAL event kinds during broker replay for
+  backward-compatible serving, but the shared reader and `wal_inspect` now count
+  and flag unknown kinds so operator review can catch drift before a new
+  transition stays invisible.
 - Keep the runtime fail-closed persistent-op gate aligned with the public
   protocol's persistent operations; `ReserveEntityIds` and `MeshAck` are now
   covered by a regression test.
 - The broker-contact `component_authority` path should not mutate canonical RAM
   before its authority WAL record is known durable.
-- Add direct tests for v1 corrupt-tail truncation, mid-stream corruption
-  refusal, dry-run report output, recovered `partition_config`, and recovered
-  pending `mesh_out` handoffs.
+- Add direct tests for dry-run report output, recovered `partition_config`, and
+  recovered pending `mesh_out` handoffs.

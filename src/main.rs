@@ -16,15 +16,18 @@
 //!                  as the honest no-spare dead-end; metrics{handoffs,applies,failovers}.
 //! the reference is the conformance oracle; this is the runtime (no GC, real threads, ARM).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::sync::atomic::AtomicBool;
 
+use godworks_broker::wal::{
+    crc32_ieee, read_wal_events, wal_v1_envelope_line, wal_v1_header_line, WalReadReport,
+};
 use godworks_protocol::DEFAULT_MAX_FRAME_BYTES;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2026,93 +2029,34 @@ fn threshold_tx_value(tx_id: &str, phase: &str, from: Value, to: Value, ts_ms: u
 // is computed over a reproducible canonical string (no key-order / re-serialization ambiguity). A fresh WAL
 // also gets a header line {"kind":"wal_header","wal_version":1}. v0 WALs (no header, bare event lines) stay
 // readable via the lenient legacy path so existing logs + the L5 drill never regress.
-const WAL_VERSION: u64 = 1;
-
-// CRC32 (IEEE 802.3, the zlib/PNG polynomial) — self-contained so the broker adds NO new crate dependency
-// (offline build, fast link). Table built once on first use.
-fn crc32_ieee(bytes: &[u8]) -> u32 {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
-        let mut i = 0usize;
-        while i < 256 {
-            let mut c = i as u32;
-            let mut k = 0;
-            while k < 8 {
-                c = if c & 1 != 0 {
-                    0xEDB88320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-                k += 1;
-            }
-            t[i] = c;
-            i += 1;
-        }
-        t
-    });
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in bytes {
-        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc ^ 0xFFFF_FFFF
-}
-
-// Encode one event as a v1 integrity-envelope LINE (no trailing newline). The payload is serialized once,
-// the CRC is taken over that exact string, and the string is embedded (serde-escaped) as `_d`.
-fn wal_v1_envelope_line(ev: &Value) -> String {
-    let payload = serde_json::to_string(ev).unwrap();
-    let crc = crc32_ieee(payload.as_bytes());
-    // build {"_c":<crc>,"_d":<escaped payload>} — Value::String does the escaping; preserve_order keeps _c,_d.
-    serde_json::to_string(&json!({ "_c": crc, "_d": payload })).unwrap()
-}
-
-fn wal_v1_header_line() -> String {
-    serde_json::to_string(&json!({ "kind": "wal_header", "wal_version": WAL_VERSION })).unwrap()
-}
-
-// Per-line decode result: a v1 envelope that PASSED its CRC, a legacy v0 bare event, or CORRUPT (failed CRC
-// or a v1-mode line that isn't a valid envelope). The header line is reported separately by the caller.
-enum WalLine {
-    Ok(Value), // a usable event (v1 verified, or v0 bare)
-    Corrupt,   // integrity failure: failed CRC, or non-envelope line while in v1 mode
-}
-
-// Decode a single raw line. `v1_mode` = the header declared v1 (so bare/garbled lines are corruption, not v0).
-fn decode_wal_line(line: &str, v1_mode: bool) -> WalLine {
-    // try the v1 envelope shape first
-    if let Ok(v) = serde_json::from_str::<Value>(line) {
-        if let (Some(c), Some(d)) = (
-            v.get("_c").and_then(|x| x.as_u64()),
-            v.get("_d").and_then(|x| x.as_str()),
-        ) {
-            // an integrity envelope -> verify the CRC over the inner payload string
-            if crc32_ieee(d.as_bytes()) != c as u32 {
-                return WalLine::Corrupt; // CRC mismatch (bit-rot / half-write)
-            }
-            return match serde_json::from_str::<Value>(d) {
-                Ok(ev) => WalLine::Ok(ev),
-                Err(_) => WalLine::Corrupt, // CRC ok but inner not valid JSON (shouldn't happen) -> corrupt
-            };
-        }
-        // parsed JSON but NOT an envelope:
-        if v1_mode {
-            // in v1 mode every record must be an envelope; a bare object = a torn/foreign line = corruption.
-            return WalLine::Corrupt;
-        }
-        return WalLine::Ok(v); // v0 legacy: a bare event line is normal
-    }
-    // not parseable JSON at all
-    WalLine::Corrupt
-}
-
 // What recovery learned about the WAL's integrity (for the dry-run report + the startup fail-closed gate).
 struct RecoverReport {
     wal_version: u64,
+    selected_event_count: u64,
+    decoded_record_count: u64,
+    corrupt_tail_record_count: u64,
     truncated_tail_bytes: u64,
+    unknown_kind_count: u64,
+    kind_counts: BTreeMap<String, u64>,
+    unknown_kinds: BTreeMap<String, u64>,
     // Some(msg) => REFUSE: mid-stream corruption or an unknown version. Startup must NOT serve; print the msg.
     error: Option<String>,
+}
+
+impl From<WalReadReport> for RecoverReport {
+    fn from(report: WalReadReport) -> Self {
+        Self {
+            wal_version: report.wal_version,
+            selected_event_count: report.selected_event_count,
+            decoded_record_count: report.decoded_record_count,
+            corrupt_tail_record_count: report.corrupt_tail_record_count,
+            truncated_tail_bytes: report.truncated_tail_bytes,
+            unknown_kind_count: report.unknown_kind_count,
+            kind_counts: report.kind_counts,
+            unknown_kinds: report.unknown_kinds,
+            error: report.error,
+        }
+    }
 }
 
 // A stable content hash of the recovered store (order-independent: per-entity hashes XOR-folded) so the
@@ -2151,52 +2095,11 @@ fn recover_from_wal_report(
     u64,
     RecoverReport,
 ) {
-    // First pass: read raw lines + classify, so we can distinguish a TAIL corrupt-run (truncate) from a
-    // MID-stream corruption (refuse). The WAL is bounded by compaction, so reading it whole is fine.
-    let raw_lines: Vec<String> = match File::open(path) {
-        Ok(f) => BufReader::new(f).lines().map_while(Result::ok).collect(),
-        Err(_) => {
-            // no file yet -> a fresh v1 WAL will be created by the caller; nothing to recover.
-            return (
-                HashMap::new(),
-                HashSet::new(),
-                None,
-                HashMap::new(),
-                0,
-                RecoverReport {
-                    wal_version: WAL_VERSION,
-                    truncated_tail_bytes: 0,
-                    error: None,
-                },
-            );
-        }
-    };
-
-    // Detect the header / version from the FIRST non-empty line.
-    let mut wal_version: u64 = 0; // 0 == legacy (no header)
-    let mut first_idx: Option<usize> = None;
-    for (i, raw) in raw_lines.iter().enumerate() {
-        if raw.trim().is_empty() {
-            continue;
-        }
-        first_idx = Some(i);
-        if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
-            if v.get("kind").and_then(|k| k.as_str()) == Some("wal_header") {
-                wal_version = v.get("wal_version").and_then(|x| x.as_u64()).unwrap_or(0);
-            }
-        }
-        break;
-    }
-    // UNKNOWN version -> VersionReject (do not guess how to parse a future format).
-    if wal_version > WAL_VERSION {
-        let report = RecoverReport {
-            wal_version,
-            truncated_tail_bytes: 0,
-            error: Some(format!(
-                "VersionReject: WAL wal_version={} is newer than this broker supports (max {}); refusing to recover",
-                wal_version, WAL_VERSION
-            )),
-        };
+    // First pass: shared WAL scanner/decoder. This is the same integrity truth the wal_inspect CLI uses; the
+    // broker-specific reducer below intentionally stays here until the Entity/authority model is extracted.
+    let read = read_wal_events(path, up_to_offset);
+    let report = RecoverReport::from(read.report);
+    if report.error.is_some() {
         return (
             HashMap::new(),
             HashSet::new(),
@@ -2206,105 +2109,16 @@ fn recover_from_wal_report(
             report,
         );
     }
-    let v1_mode = wal_version >= 1;
-    let header_idx = if v1_mode { first_idx } else { None };
 
-    // Classify every non-empty, non-header line as Ok(ev) or Corrupt, tracking on-disk byte spans so a tail
-    // truncation can report exact bytes and stay consistent with wal_bytes / GW_RESTORE_OFFSET accounting.
-    struct Rec {
-        ev: Option<Value>, // None == corrupt
-        bytes: u64,        // raw.len() + 1 (the '\n') — the physical span of this line
-        cum_end: u64,      // cumulative on-disk offset at the END of this line
-    }
-    let mut recs: Vec<Rec> = Vec::with_capacity(raw_lines.len());
-    let mut cumulative: u64 = 0;
-    for (i, raw) in raw_lines.iter().enumerate() {
-        let span = raw.len() as u64 + 1; // +1 for the newline BufReader stripped
-        cumulative += span;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || Some(i) == header_idx {
-            continue; // blank padding / the header line are not events
-        }
-        let ev = match decode_wal_line(trimmed, v1_mode) {
-            WalLine::Ok(v) => {
-                // skip a header that appears mid-file (defensive) — it's not an event
-                if v.get("kind").and_then(|k| k.as_str()) == Some("wal_header") {
-                    continue;
-                }
-                Some(v)
-            }
-            WalLine::Corrupt => None,
-        };
-        recs.push(Rec {
-            ev,
-            bytes: span,
-            cum_end: cumulative,
-        });
-    }
-
-    // TAIL vs MID corruption (v1 only). Find the longest run of corrupt records at the very END: those = the
-    // crash's in-progress / torn trailing write(s) -> truncate them. Any corrupt record BEFORE the last good
-    // record is mid-stream corruption -> REFUSE. In v0 (legacy, no CRC) we cannot tell torn-tail from bit-rot,
-    // so we keep the original lenient behavior (corrupt lines were already being dropped) to avoid regressing
-    // existing v0 WALs / the L5 drill's prior format.
-    let mut truncated_tail_bytes: u64 = 0;
-    let mut tail_corrupt = 0usize;
-    let mut good_prefix_len = recs.len();
-    if v1_mode {
-        for r in recs.iter().rev() {
-            if r.ev.is_none() {
-                tail_corrupt += 1;
-                truncated_tail_bytes += r.bytes;
-            } else {
-                break;
-            }
-        }
-        good_prefix_len = recs.len() - tail_corrupt;
-        // corruption inside the good prefix (a valid record FOLLOWS a corrupt one) -> mid-stream violation.
-        let mid_corrupt = recs[..good_prefix_len].iter().any(|r| r.ev.is_none());
-        if mid_corrupt {
-            let report = RecoverReport {
-                wal_version,
-                truncated_tail_bytes: 0,
-                error: Some(
-                    "RestoreIntegrityError: corrupt WAL record(s) in the MIDDLE of the log (a valid record follows a \
-                     CRC failure) — refusing to serve partial/forked state. Repair or restore from a snapshot."
-                        .to_string(),
-                ),
-            };
-            return (
-                HashMap::new(),
-                HashSet::new(),
-                None,
-                HashMap::new(),
-                0,
-                report,
-            );
-        }
-    }
-
-    // Replay the good prefix (== the original recover_from_wal apply loop), honoring up_to_offset.
-    let good_events: Vec<&Value> = recs[..good_prefix_len]
-        .iter()
-        .filter(|r| match up_to_offset {
-            Some(off) => r.cum_end <= off,
-            None => true,
-        })
-        .filter_map(|r| r.ev.as_ref())
-        .collect();
+    let good_events: Vec<&Value> = read.events.iter().collect();
     let (store, tombstones, last_partition, recovered_pending, recovered_id_hwm) =
         apply_wal_events(&good_events);
-    if truncated_tail_bytes > 0 {
+    if report.truncated_tail_bytes > 0 {
         println!(
             "[rust-broker] #2 WAL: truncated {} corrupt trailing byte(s) ({} record(s)) — the in-progress write from the crash",
-            truncated_tail_bytes, tail_corrupt
+            report.truncated_tail_bytes, report.corrupt_tail_record_count
         );
     }
-    let report = RecoverReport {
-        wal_version,
-        truncated_tail_bytes,
-        error: None,
-    };
     (
         store,
         tombstones,
@@ -8820,7 +8634,13 @@ async fn main() {
                 "entity_count": store.len(),
                 "store_hash": format!("{:016x}", store_content_hash(&store)),
                 "wal_version": report.wal_version,
+                "selected_event_count": report.selected_event_count,
+                "decoded_record_count": report.decoded_record_count,
+                "corrupt_tail_record_count": report.corrupt_tail_record_count,
                 "truncated_tail_bytes": report.truncated_tail_bytes,
+                "unknown_kind_count": report.unknown_kind_count,
+                "kind_counts": report.kind_counts,
+                "unknown_kinds": report.unknown_kinds,
                 "error": report.error,
             });
             println!("{}", serde_json::to_string(&dry).unwrap());
