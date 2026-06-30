@@ -12,7 +12,10 @@ The SDK does not change broker runtime behavior. It wraps the existing length-pr
 - Send `Interest` / AOI updates.
 - Create entities with typed SDK helpers while preserving component payloads such as `pos`, `vel`, and `mass`.
 - Receive and classify checkout, entity, component, event, authority, rejection, command, and mesh handoff frames.
-- Send `UpdateComponent` and `BatchUpdate` frames.
+- Send lifecycle/component ops: `CreateEntity`, `DeleteEntity`, `ReserveEntityIds`,
+  `AddComponent`, `RemoveComponent`, `UpdateComponent`, and `BatchUpdate`.
+- Send query/command/event ops without hand-writing the operation wrapper:
+  `EntityQuery`, `CommandResponse`, and `EntityEvent`.
 - Preserve raw/lossless fields through the underlying typed protocol model for broad or evolving frame shapes.
 
 ## Minimal worker shape
