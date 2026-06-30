@@ -10,9 +10,10 @@ use std::io;
 use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId};
 use godworks_protocol::json::{decode_json_value, encode_json_value};
 use godworks_protocol::{
-    AddEntity, AuthReject, AuthorityChange, BatchUpdate, BatchUpdateEntry, CommandRequest,
-    ComponentUpdate, CreateEntity, CriticalSection, EntityEvent, Fold, Heartbeat, Interest,
-    JsonFields, MeshHandoff, Op, UpdateComponent, UpdateRejected, WorkerConnect,
+    AddComponent, AddEntity, AuthReject, AuthorityChange, BatchUpdate, BatchUpdateEntry,
+    CommandRequest, CommandResponse, ComponentUpdate, CreateEntity, CriticalSection, DeleteEntity,
+    EntityEvent, EntityQuery, Fold, Heartbeat, Interest, JsonFields, MeshHandoff, Op,
+    RemoveComponent, ReserveEntityIds, UpdateComponent, UpdateRejected, WorkerConnect,
     DEFAULT_MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::{json, Map, Value};
@@ -175,6 +176,58 @@ where
             updates,
         });
         self.send_op(&op).await
+    }
+
+    pub async fn delete_entity(
+        &mut self,
+        entity: impl Into<EntityId>,
+        request_id: Option<impl Into<String>>,
+        authority_epoch: Option<u64>,
+    ) -> Result<()> {
+        self.send_op(&delete_entity_op(entity, request_id, authority_epoch))
+            .await
+    }
+
+    pub async fn reserve_entity_ids(
+        &mut self,
+        request_id: Option<impl Into<String>>,
+        count: u64,
+    ) -> Result<()> {
+        self.send_op(&reserve_entity_ids_op(request_id, count))
+            .await
+    }
+
+    pub async fn add_component(
+        &mut self,
+        entity: impl Into<EntityId>,
+        component: impl Into<ComponentName>,
+        value: Value,
+        authority_epoch: Option<u64>,
+    ) -> Result<()> {
+        self.send_op(&add_component_op(entity, component, value, authority_epoch))
+            .await
+    }
+
+    pub async fn remove_component(
+        &mut self,
+        entity: impl Into<EntityId>,
+        component: impl Into<ComponentName>,
+        authority_epoch: Option<u64>,
+    ) -> Result<()> {
+        self.send_op(&remove_component_op(entity, component, authority_epoch))
+            .await
+    }
+
+    pub async fn query_entities(&mut self, fields: Map<String, Value>) -> Result<()> {
+        self.send_op(&entity_query_op(fields)).await
+    }
+
+    pub async fn respond_to_command(&mut self, fields: Map<String, Value>) -> Result<()> {
+        self.send_op(&command_response_op(fields)).await
+    }
+
+    pub async fn emit_event(&mut self, fields: Map<String, Value>) -> Result<()> {
+        self.send_op(&entity_event_op(fields)).await
     }
 }
 
@@ -353,6 +406,69 @@ pub fn create_entity_op(
     })
 }
 
+pub fn delete_entity_op(
+    entity: impl Into<EntityId>,
+    request_id: Option<impl Into<String>>,
+    authority_epoch: Option<u64>,
+) -> Op {
+    Op::DeleteEntity(DeleteEntity {
+        entity: entity.into(),
+        request_id: request_id.map(Into::into),
+        authority_epoch,
+    })
+}
+
+pub fn reserve_entity_ids_op(request_id: Option<impl Into<String>>, count: u64) -> Op {
+    Op::ReserveEntityIds(ReserveEntityIds {
+        request_id: request_id.map(Into::into),
+        count,
+    })
+}
+
+pub fn add_component_op(
+    entity: impl Into<EntityId>,
+    component: impl Into<ComponentName>,
+    value: Value,
+    authority_epoch: Option<u64>,
+) -> Op {
+    Op::AddComponent(AddComponent {
+        entity: entity.into(),
+        component: component.into(),
+        value,
+        authority_epoch,
+    })
+}
+
+pub fn remove_component_op(
+    entity: impl Into<EntityId>,
+    component: impl Into<ComponentName>,
+    authority_epoch: Option<u64>,
+) -> Op {
+    Op::RemoveComponent(RemoveComponent {
+        entity: entity.into(),
+        component: component.into(),
+        authority_epoch,
+    })
+}
+
+pub fn entity_query_op(fields: Map<String, Value>) -> Op {
+    Op::EntityQuery(EntityQuery {
+        fields: JsonFields { fields },
+    })
+}
+
+pub fn command_response_op(fields: Map<String, Value>) -> Op {
+    Op::CommandResponse(CommandResponse {
+        fields: JsonFields { fields },
+    })
+}
+
+pub fn entity_event_op(fields: Map<String, Value>) -> Op {
+    Op::EntityEvent(EntityEvent {
+        fields: JsonFields { fields },
+    })
+}
+
 pub fn fold_op(entity: impl Into<EntityId>, region: impl Into<RegionId>, pos: [f32; 2]) -> Op {
     let entity = entity.into();
     let region = region.into();
@@ -434,6 +550,13 @@ mod tests {
         let op = decode_frame_payload(value.to_string().as_bytes()).unwrap();
         assert_eq!(encode_json_value(&op), value);
         op
+    }
+
+    fn fields(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect()
     }
 
     #[test]
@@ -547,6 +670,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sdk_lifecycle_query_command_event_helpers_match_current_wire_shapes() {
+        assert_eq!(
+            encode_json_value(&delete_entity_op("W-b0", Some("del-1"), Some(9))),
+            json!({"op":"DeleteEntity","entity":"W-b0","request_id":"del-1","authority_epoch":9})
+        );
+        assert_eq!(
+            encode_json_value(&reserve_entity_ids_op(Some("reserve-1"), 32)),
+            json!({"op":"ReserveEntityIds","request_id":"reserve-1","count":32})
+        );
+        assert_eq!(
+            encode_json_value(&add_component_op(
+                "W-b0",
+                "health",
+                json!({"hp":100}),
+                Some(5)
+            )),
+            json!({"op":"AddComponent","entity":"W-b0","comp":"health","value":{"hp":100},"authority_epoch":5})
+        );
+        assert_eq!(
+            encode_json_value(&remove_component_op("W-b0", "health", Some(6))),
+            json!({"op":"RemoveComponent","entity":"W-b0","comp":"health","authority_epoch":6})
+        );
+        assert_eq!(
+            encode_json_value(&entity_query_op(fields(&[
+                ("request_id", json!("q-1")),
+                ("include_handoff_intent", json!(true)),
+                (
+                    "query",
+                    json!({"type":"sphere","center":[0.0,0.0],"radius":50.0}),
+                ),
+            ]))),
+            json!({"op":"EntityQuery","request_id":"q-1","include_handoff_intent":true,"query":{"type":"sphere","center":[0.0,0.0],"radius":50.0}})
+        );
+        assert_eq!(
+            encode_json_value(&command_response_op(fields(&[
+                ("request_id", json!("cmd-1")),
+                ("success", json!(true)),
+                ("payload", json!({"accepted":true})),
+            ]))),
+            json!({"op":"CommandResponse","request_id":"cmd-1","success":true,"payload":{"accepted":true}})
+        );
+        assert_eq!(
+            encode_json_value(&entity_event_op(fields(&[
+                ("entity", json!("W-b0")),
+                ("event", json!("StatusChanged")),
+                ("payload", json!({"amount":12})),
+                ("sim_time", json!(123.5)),
+                ("gen", json!(77)),
+                ("class", json!("critical")),
+            ]))),
+            json!({"op":"EntityEvent","entity":"W-b0","event":"StatusChanged","payload":{"amount":12},"sim_time":123.5,"gen":77,"class":"critical"})
+        );
+    }
+
     #[tokio::test]
     async fn connect_interest_and_update_helpers_emit_typed_ops() {
         let (client_stream, mut broker_stream) = duplex(8192);
@@ -584,6 +762,81 @@ mod tests {
         assert!(matches!(
             read_op(&mut broker_stream).await.unwrap(),
             Some(Op::BatchUpdate(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_query_command_event_session_methods_emit_typed_ops() {
+        let (client_stream, mut broker_stream) = duplex(8192);
+        let config = WorkerConfig::new("worker-1", "W").with_attribute("physics");
+        let mut worker = WorkerSession::connect(client_stream, config).await.unwrap();
+
+        worker
+            .delete_entity("ship-1", Some("del-1"), Some(8))
+            .await
+            .unwrap();
+        worker
+            .reserve_entity_ids(Some("reserve-1"), 4)
+            .await
+            .unwrap();
+        worker
+            .add_component("ship-1", "loot", json!(3), Some(9))
+            .await
+            .unwrap();
+        worker
+            .remove_component("ship-1", "loot", Some(10))
+            .await
+            .unwrap();
+        worker
+            .query_entities(fields(&[("request_id", json!("q-1"))]))
+            .await
+            .unwrap();
+        worker
+            .respond_to_command(fields(&[
+                ("request_id", json!("cmd-1")),
+                ("success", json!(true)),
+            ]))
+            .await
+            .unwrap();
+        worker
+            .emit_event(fields(&[
+                ("entity", json!("ship-1")),
+                ("event", json!("StatusChanged")),
+            ]))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::WorkerConnect(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::DeleteEntity(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::ReserveEntityIds(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::AddComponent(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::RemoveComponent(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::EntityQuery(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::CommandResponse(_))
+        ));
+        assert!(matches!(
+            read_op(&mut broker_stream).await.unwrap(),
+            Some(Op::EntityEvent(_))
         ));
     }
 
