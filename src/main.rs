@@ -431,33 +431,47 @@ fn spawn_region(
 // entity handed across the process seam, the entity now belongs to one of THIS broker's OWNED zones -- its
 // `region` must name that zone, NOT be re-derived from position against this broker's local W|E boundary
 // (the old `spawn_in_region(..., None, ...)` path did the latter -> a unit Folded into ZB at x<0 got
-// mislabeled "W" instead of "ZB"). The receiving region, by most-authoritative source available:
-//   1. `my_region` (this broker's GW_ADVERTISE'd owned region) -- set in the registry/advertise topology
+// mislabeled "W" instead of "ZB"). The receiving region, by most-authoritative owned source available:
+//   1. in 2D-grid mode, the addressed grid cell if THIS broker owns it; otherwise reject without ACK
+//      (a parseable cell name is not enough -- the receiver must actually own that cell).
+//   2. else `my_region` (this broker's GW_ADVERTISE'd owned region) -- set in the registry/advertise topology
 //      (the advertise-topology tests): the broker IS that zone, so adopt -> it.
-//   2. else the `target` the sender addressed, IF this broker actually owns it (a local worker leases it:
+//   3. else the `target` the sender addressed, IF this broker actually owns it (a local worker leases it:
 //      region_worker has it) -- the static-GW_MESH topology (mesh_soak owns "E", routed target "E") where
 //      my_region is empty but the broker still owns the target zone.
-//   3. else fall back to the position-derived region (preserves the prior behavior for a topology that
+//   4. else fall back to the position-derived region (preserves the prior behavior for a topology that
 //      advertises nothing AND doesn't own the target as a named zone -- e.g. nzone's "EARTH" target landing
 //      on a broker whose only owned zone is "E": there is no better label than the geometric one).
-fn receiving_region_for_adopt(state: &ServerState, pos: [f64; 2], target: Option<&str>) -> String {
+fn receiving_region_for_adopt(
+    state: &ServerState,
+    pos: [f64; 2],
+    target: Option<&str>,
+) -> Option<String> {
     if let Some((c, r, cw, ch)) = state.grid2d {
         if let Some(t) = target.map(str::trim).filter(|t| !t.is_empty()) {
-            if parse_grid_cell(t).is_some() {
-                return t.to_string();
+            if let Some((col, row)) = parse_grid_cell(t) {
+                let in_bounds = col >= 0 && row >= 0 && col < c as i64 && row < r as i64;
+                if state.region_worker.contains_key(t) || state.my_region == t {
+                    return in_bounds.then(|| t.to_string());
+                }
+                return None;
             }
         }
-        return region_2d(pos, c, r, cw, ch);
+        let geometric = region_2d(pos, c, r, cw, ch);
+        if state.region_worker.contains_key(&geometric) || state.my_region == geometric {
+            return Some(geometric);
+        }
+        return None;
     }
     if !state.my_region.is_empty() {
-        return state.my_region.clone();
+        return Some(state.my_region.clone());
     }
     if let Some(t) = target.map(str::trim).filter(|t| !t.is_empty()) {
         if state.region_worker.contains_key(t) {
-            return refine_region(coarse_region(t), pos[0], &state.splits);
+            return Some(refine_region(coarse_region(t), pos[0], &state.splits));
         }
     }
-    spawn_region(pos, None, &state.boundaries, &state.splits)
+    Some(spawn_region(pos, None, &state.boundaries, &state.splits))
 }
 
 fn existing_mesh_adopt_matches(
@@ -3961,6 +3975,12 @@ fn apply_prepared_handoff(state: &mut ServerState, h: &PreparedHandoff) {
         apply_authority_snapshot(e, &h.authority);
         e.last_broadcast_cell = Some(interest_cell_of(h.pos));
     } else {
+        state.rejected.push(json!({
+            "entity": h.eid,
+            "from": h.from,
+            "to": h.to,
+            "reason": "prepared handoff target entity missing or deleted before durable apply"
+        }));
         return;
     }
     state.metrics.handoffs += 1;
@@ -4963,6 +4983,7 @@ fn flush_pending_handoffs(state: &mut ServerState) {
                 "reason":"wal_sync_failed: staged handoff did not cross durable watermark; authority not transferred"
             }));
         }
+        state.pending_handoffs = pending;
         return;
     }
     state.durable_gen = state.durable_gen.max(max_gen);
@@ -5827,6 +5848,8 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 return;
             }
             state.deleted_entities.insert(eid.clone());
+            state.pending_handoffs.retain(|h| h.eid != eid);
+            state.pending_handoff_intent.remove(&eid);
             let removed = state.entities.remove(&eid).is_some();
             if removed {
                 let wids: Vec<String> = state.workers.keys().cloned().collect();
@@ -6905,7 +6928,19 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             let pos = arr2(f.get("pos"));
             let authority_epoch = f.get("authority_epoch").and_then(|v| v.as_u64());
             let target = f.get("target").and_then(|v| v.as_str());
-            let adopt_region = receiving_region_for_adopt(state, pos, target);
+            let Some(adopt_region) = receiving_region_for_adopt(state, pos, target) else {
+                state.rejected.push(json!({
+                    "reason":"mesh handoff target region not owned",
+                    "entity":eid,
+                    "target":target,
+                    "pos":[pos[0],pos[1]]
+                }));
+                if state.rejected.len() > 256 {
+                    let drop = state.rejected.len() - 256;
+                    state.rejected.drain(0..drop);
+                }
+                return;
+            };
             if !state.entities.contains_key(&eid) {
                 let vel = arr2(f.get("vel")); // adopt the inbound velocity (hardcoded [0,0] -> C1 seam break)
                 let authority_snapshot = f.get("authority").cloned();
@@ -9471,6 +9506,44 @@ mod tests {
     }
 
     #[test]
+    fn mesh_adopt_grid_target_must_be_receiver_owned() {
+        let mut state = ServerState::new(30.0);
+        state.grid2d = Some((4, 4, 30.0, 30.0));
+        add_test_worker(&mut state, "cell-worker", "Z2_3");
+        let mut rx = add_test_worker_with_rx(&mut state, "mesh-link", "MESH");
+
+        dispatch_inner(
+            &mut state,
+            "mesh-link",
+            &json!({
+                "op":"MeshHandoff",
+                "entity":"ship",
+                "source_region":"Z2_2",
+                "target":"Z3_3",
+                "source_durable_gen":7,
+                "lease_epoch":1,
+                "authority_epoch":9,
+                "pos":[75.0,105.0],
+                "vel":[0.0,0.0],
+                "components":{"pos":[75.0,105.0],"vel":[0.0,0.0]}
+            }),
+        );
+
+        assert!(
+            !state.entities.contains_key("ship"),
+            "receiver must not adopt a MeshHandoff into an unowned grid cell"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "unowned target must not be ACKed as adopted"
+        );
+        assert!(state.rejected.iter().any(|r| {
+            r.get("reason").and_then(|v| v.as_str()) == Some("mesh handoff target region not owned")
+                && r.get("target").and_then(|v| v.as_str()) == Some("Z3_3")
+        }));
+    }
+
+    #[test]
     fn mesh_handoff_existing_entity_exact_duplicate_is_reacked() {
         let mut state = ServerState::new(30.0);
         add_test_worker(&mut state, "east-worker", "E");
@@ -10049,7 +10122,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_sync_fail_keeps_old_owner() {
+    fn handoff_sync_fail_keeps_old_owner_and_pending_retry() {
         let mut state = ServerState::new(30.0);
         add_test_worker(&mut state, "w1", "W");
         add_test_worker(&mut state, "w2", "E");
@@ -10068,7 +10141,7 @@ mod tests {
         state.wal_fail_inject = true;
         flush_pending_handoffs(&mut state);
 
-        assert!(state.pending_handoffs.is_empty());
+        assert_eq!(state.pending_handoffs.len(), 1);
         assert_eq!(state.durable_gen, 0);
         assert_eq!(state.entities["ship"].region, "W");
         assert_eq!(state.entities["ship"].pos, [-1.0, 0.0]);
@@ -10077,6 +10150,87 @@ mod tests {
             Some("w1".to_string())
         );
         assert!(state.wal_degraded);
+
+        state.wal_fail_inject = false;
+        state.wal_degraded = false;
+        flush_pending_handoffs(&mut state);
+
+        assert!(state.pending_handoffs.is_empty());
+        assert_eq!(state.entities["ship"].region, "E");
+        assert_eq!(state.entities["ship"].pos, [2.0, 0.0]);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w2".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_tombstone_cancels_pending_local_handoff() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        let mut new_owner_rx = add_test_worker_with_rx(&mut state, "w2", "E");
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+        assert_eq!(state.pending_handoffs.len(), 1);
+
+        dispatch_inner(
+            &mut state,
+            "w1",
+            &json!({"op":"DeleteEntity","entity":"ship"}),
+        );
+
+        assert!(state.deleted_entities.contains("ship"));
+        assert!(!state.entities.contains_key("ship"));
+        assert!(state.pending_handoffs.is_empty());
+
+        flush_pending_handoffs(&mut state);
+
+        assert_eq!(state.metrics.handoffs, 0);
+        assert!(
+            new_owner_rx.try_recv().is_err(),
+            "cancelled pending handoff must not grant authority to the new owner after delete"
+        );
+    }
+
+    #[test]
+    fn prepared_handoff_missing_entity_records_rejection() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+        state.entities.remove("ship");
+        state.deleted_entities.insert("ship".to_string());
+
+        flush_pending_handoffs(&mut state);
+
+        assert!(state.pending_handoffs.is_empty());
+        assert_eq!(state.metrics.handoffs, 0);
+        assert!(state.rejected.iter().any(|r| {
+            r.get("reason").and_then(|v| v.as_str())
+                == Some("prepared handoff target entity missing or deleted before durable apply")
+                && r.get("entity").and_then(|v| v.as_str()) == Some("ship")
+        }));
     }
 
     #[test]
