@@ -41,6 +41,10 @@ path = "src/bin/zone_worker.rs"
 name = "reality_loadgen"
 path = "src/bin/reality_loadgen.rs"
 
+[[bin]]
+name = "replay_eval"
+path = "src/bin/replay_eval.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

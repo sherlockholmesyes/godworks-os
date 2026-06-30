@@ -2629,6 +2629,24 @@ fn replay_tape_op_summary(f: &Value, byte_len: usize) -> Value {
     Value::Object(summary)
 }
 
+fn record_replay_tape_spatial_contract(state: &ServerState, event: &mut Map<String, Value>) {
+    event.insert("spatial_dim".to_string(), json!("D2"));
+    event.insert("coordinate_codec".to_string(), json!("debug_f64_2"));
+    let partition_schema = if let Some((cols, rows, _cell_w, _cell_h)) = state.grid2d {
+        json!({
+            "kind": "grid2d",
+            "cols": cols,
+            "rows": rows
+        })
+    } else {
+        json!({
+            "kind": "strip1d",
+            "boundary_count": state.boundaries.len()
+        })
+    };
+    event.insert("partition_schema".to_string(), partition_schema);
+}
+
 fn record_replay_tape_ingress(
     state: &ServerState,
     wid: &str,
@@ -2654,6 +2672,7 @@ fn record_replay_tape_ingress(
     event.insert("outcome".to_string(), json!(outcome));
     event.insert("durable_gen".to_string(), json!(state.durable_gen));
     event.insert("pending_gen".to_string(), json!(state.pending_gen));
+    record_replay_tape_spatial_contract(state, &mut event);
     event.insert(
         "op_summary".to_string(),
         replay_tape_op_summary(f, byte_len),
@@ -2700,6 +2719,7 @@ fn record_replay_tape_connect(state: &ServerState, rec: ReplayConnectRecord<'_>)
         json!(rec.frame.get("auth_token").is_some()),
     );
     event.insert("attribute_count".to_string(), json!(rec.attributes.len()));
+    record_replay_tape_spatial_contract(state, &mut event);
     if let Some(reason) = rec.reason {
         event.insert("reason".to_string(), json!(reason));
     }
@@ -2726,6 +2746,7 @@ fn record_replay_tape_handoff(state: &ServerState, rec: ReplayHandoffRecord<'_>)
     event.insert("path".to_string(), json!(rec.path));
     event.insert("entity".to_string(), json!(rec.eid));
     event.insert("durable_gen".to_string(), json!(state.durable_gen));
+    record_replay_tape_spatial_contract(state, &mut event);
     if let Some(from) = rec.from {
         event.insert("from".to_string(), json!(from));
     }
@@ -2765,6 +2786,7 @@ fn record_replay_tape_emit(state: &ServerState, wid: &str, v: &Value) {
     event.insert("region".to_string(), json!(region));
     event.insert("op".to_string(), json!(op));
     event.insert("durable_gen".to_string(), json!(state.durable_gen));
+    record_replay_tape_spatial_contract(state, &mut event);
     if let Some(value) = v.get("request_id").and_then(|value| value.as_str()) {
         event.insert("request_id".to_string(), json!(value));
     }
@@ -8313,6 +8335,13 @@ mod tests {
                 && event.get("entity").and_then(Value::as_str) == Some("ship")
                 && event.get("from").and_then(Value::as_str) == Some("W")
                 && event.get("to").and_then(Value::as_str) == Some("E")
+                && event.get("spatial_dim").and_then(Value::as_str) == Some("D2")
+                && event.get("coordinate_codec").and_then(Value::as_str) == Some("debug_f64_2")
+                && event
+                    .get("partition_schema")
+                    .and_then(|schema| schema.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("strip1d")
                 && event
                     .get("authority_epoch")
                     .and_then(Value::as_u64)
