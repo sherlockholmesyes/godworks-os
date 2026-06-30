@@ -111,6 +111,14 @@ struct Bot {
     epoch: u64,
 }
 
+#[derive(Default)]
+struct WorkerMetrics {
+    auth_gain: u64,
+    auth_loss: u64,
+    loss_imminent: u64,
+    rejects: u64,
+}
+
 // agar.io cell sizing: a cell's AREA scales with mass, so radius = base * sqrt(mass). Used by the body
 // collider on adopt and by the eat-check. Bigger cells also move slower (applied in the input handler).
 fn radius_for(mass: f32, base: f32) -> f32 {
@@ -264,7 +272,7 @@ async fn main() {
     let mut view_vel: HashMap<String, [f32; 2]> = HashMap::new();
     let mut view_mass: HashMap<String, f32> = HashMap::new();
     let mut bots: HashMap<String, Bot> = HashMap::new();
-    let mut rejects: u64 = 0;
+    let mut metrics = WorkerMetrics::default();
 
     // ── spawn our own bots (we declared Interest -> the broker grants us authority on create; the body
     //    is created when the AuthorityChange{true} echo arrives, from the pos/vel we stash here) ──
@@ -328,9 +336,10 @@ async fn main() {
                     &mut mjoints,
                     radius,
                     rest,
+                    &mut metrics,
                 ),
                 Op::UpdateRejected(rejected) => {
-                    apply_update_rejected(rejected, &region, &mut rejects);
+                    apply_update_rejected(rejected, &region, &mut metrics);
                 }
                 Op::RemoveEntity(remove) => apply_remove_entity(
                     remove,
@@ -445,9 +454,10 @@ async fn main() {
         if last_report.elapsed().as_secs_f64() >= 1.0 {
             let ach = acc_ticks as f64 / last_report.elapsed().as_secs_f64();
             eprintln!(
-                "[zw {region}] tick={tick} owned={} view={} rejects={rejects} hz={ach:.1}",
+                "[zw {region}] tick={tick} owned={} view={} rejects={} hz={ach:.1}",
                 bots.len(),
-                view_pos.len()
+                view_pos.len(),
+                metrics.rejects
             );
             last_report = Instant::now();
             acc_ticks = 0;
@@ -462,8 +472,23 @@ async fn main() {
 
     write_op(&mut wr, &disconnect_op()).await.ok();
     eprintln!(
-        "[zw {region}] done tick={tick} owned={} rejects={rejects}",
-        bots.len()
+        "[zw {region}] done tick={tick} owned={} rejects={}",
+        bots.len(),
+        metrics.rejects
+    );
+    eprintln!(
+        "zone_worker_summary {}",
+        json!({
+            "region": region,
+            "worker_id": wid,
+            "tick": tick,
+            "owned": bots.len(),
+            "view": view_pos.len(),
+            "rejects": metrics.rejects,
+            "auth_gain": metrics.auth_gain,
+            "auth_loss": metrics.auth_loss,
+            "loss_imminent": metrics.loss_imminent,
+        })
     );
 }
 
@@ -537,8 +562,8 @@ fn update_rejected_log_line(region: &str, rejected: &UpdateRejected) -> String {
     )
 }
 
-fn apply_update_rejected(rejected: &UpdateRejected, region: &str, rejects: &mut u64) {
-    *rejects += 1;
+fn apply_update_rejected(rejected: &UpdateRejected, region: &str, metrics: &mut WorkerMetrics) {
+    metrics.rejects += 1;
     eprintln!("{}", update_rejected_log_line(region, rejected));
 }
 
@@ -623,6 +648,7 @@ fn apply_authority_change(
     mjoints: &mut MultibodyJointSet,
     radius: f32,
     rest: f32,
+    metrics: &mut WorkerMetrics,
 ) {
     let eid = change.entity.as_ref().to_string();
     let comp = change.component.as_ref();
@@ -633,11 +659,13 @@ fn apply_authority_change(
     let epoch = change.authority_epoch;
     // C2 pre-handoff intent: NOT a real authority change; log + ignore for the body lifecycle.
     if authority_extra(change, "state") == Some("AUTHORITY_LOSS_IMMINENT") {
+        metrics.loss_imminent += 1;
         let tgt = authority_extra(change, "handoff_target_region").unwrap_or("?");
         eprintln!("[zw {region}] LOSS-IMMINENT e={eid} target={tgt}");
         return;
     }
     if change.authoritative {
+        metrics.auth_gain += 1;
         // ADOPT: create a rapier body from the carried pos+vel (exactly-one-zone simulates it now).
         if let Some(bot) = bots.get_mut(&eid) {
             bot.epoch = epoch; // re-grant: refresh the epoch we fence writes with
@@ -665,12 +693,15 @@ fn apply_authority_change(
                 p[0], p[1], v[0], v[1]
             );
         }
-    } else if let Some(bot) = bots.remove(&eid) {
-        // LOSE: destroy the local body (the other zone owns it now).
-        destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
-        eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} destroy");
     } else {
-        eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} (no local body)");
+        metrics.auth_loss += 1;
+        if let Some(bot) = bots.remove(&eid) {
+            // LOSE: destroy the local body (the other zone owns it now).
+            destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
+            eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} destroy");
+        } else {
+            eprintln!("[zw {region}] AUTH-LOSS e={eid} epoch={epoch} (no local body)");
+        }
     }
 }
 
@@ -747,6 +778,7 @@ mod tests {
             mode: "server_physics_island".to_string(),
             fields: JsonFields { fields: Map::new() },
         };
+        let mut metrics = WorkerMetrics::default();
 
         apply_authority_change(
             &change,
@@ -761,11 +793,13 @@ mod tests {
             &mut mjoints,
             0.5,
             0.9,
+            &mut metrics,
         );
 
         let bot = bots.get("ship").expect("ship adopted");
         assert_eq!(bot.epoch, 11);
         assert_eq!(body_state(&bodies, bot.handle), (5.0, 6.0, 7.0, 8.0));
+        assert_eq!(metrics.auth_gain, 1);
     }
 
     #[test]
@@ -823,9 +857,9 @@ mod tests {
             "[zw W] REJECTED e=typed-entity comp=typed-comp reason='typed reason'"
         );
 
-        let mut rejects = 0;
-        apply_update_rejected(&rejected, "W", &mut rejects);
-        assert_eq!(rejects, 1);
+        let mut metrics = WorkerMetrics::default();
+        apply_update_rejected(&rejected, "W", &mut metrics);
+        assert_eq!(metrics.rejects, 1);
     }
 
     #[test]
@@ -854,6 +888,7 @@ mod tests {
         let mut ijoints = ImpulseJointSet::new();
         let mut mjoints = MultibodyJointSet::new();
         let handle = add_test_bot("typed-entity", 1, &mut bots, &mut bodies);
+        let mut metrics = WorkerMetrics::default();
 
         apply_authority_change(
             &change,
@@ -868,10 +903,12 @@ mod tests {
             &mut mjoints,
             0.5,
             0.9,
+            &mut metrics,
         );
 
         assert!(!bots.contains_key("typed-entity"));
         assert!(bodies.get(handle).is_none());
+        assert_eq!(metrics.auth_loss, 1);
     }
 
     #[test]
@@ -898,6 +935,7 @@ mod tests {
         let mut ijoints = ImpulseJointSet::new();
         let mut mjoints = MultibodyJointSet::new();
         let handle = add_test_bot("ship", 8, &mut bots, &mut bodies);
+        let mut metrics = WorkerMetrics::default();
 
         apply_authority_change(
             &change,
@@ -912,9 +950,12 @@ mod tests {
             &mut mjoints,
             0.5,
             0.9,
+            &mut metrics,
         );
 
         assert!(bots.contains_key("ship"));
         assert!(bodies.get(handle).is_some());
+        assert_eq!(metrics.loss_imminent, 1);
+        assert_eq!(metrics.auth_loss, 0);
     }
 }

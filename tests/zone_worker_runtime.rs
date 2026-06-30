@@ -86,6 +86,41 @@ fn start_worker(
     cmd.spawn().expect("spawn zone_worker")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn start_worker_with_motion(
+    port: u16,
+    region: &str,
+    worker_id: &str,
+    spawn_n: usize,
+    spawn_box: Option<&str>,
+    spawn_vel: &str,
+    spawn_speed: &str,
+    duration: &str,
+) -> Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zone_worker"));
+    cmd.env("GW_ZW_HOST", "127.0.0.1")
+        .env("GW_ZW_PORT", port.to_string())
+        .env("GW_ZW_REGION", region)
+        .env("GW_ZW_ID", worker_id)
+        .env("GW_ZW_SPAWN", spawn_n.to_string())
+        .env("GW_ZW_DURATION", duration)
+        .env("GW_ZW_HZ", "30")
+        .env("GW_ZW_SPAWN_VEL", spawn_vel)
+        .env("GW_ZW_SPAWN_SPEED", spawn_speed)
+        // This runtime gate is about seam authority handoff, not dense collision throughput.
+        // Keep real Rapier bodies in the loop, but avoid a random contact jam masking the handoff contract.
+        .env("GW_ZW_RADIUS", "0.05")
+        .env("GW_ZW_SEED", "4242")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(b) = spawn_box {
+        cmd.env("GW_ZW_SPAWN_BOX", b);
+    } else {
+        cmd.env_remove("GW_ZW_SPAWN_BOX");
+    }
+    cmd.spawn().expect("spawn zone_worker")
+}
+
 fn stop(child: &mut Child) {
     if child.try_wait().expect("try_wait").is_none() {
         let _ = child.kill();
@@ -101,21 +136,42 @@ fn stderr_text(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-fn count(haystack: &str, needle: &str) -> usize {
-    haystack.matches(needle).count()
-}
-
-fn parse_done_value(stderr: &str, key: &str) -> Option<usize> {
-    let done = stderr
+fn parse_summary(stderr: &str) -> Value {
+    const PREFIX: &str = "zone_worker_summary ";
+    let line = stderr
         .lines()
         .rev()
-        .find(|line| line.contains("done tick="))?;
-    for part in done.split_whitespace() {
-        if let Some(v) = part.strip_prefix(&format!("{key}=")) {
-            return v.parse().ok();
-        }
+        .find(|line| line.starts_with(PREFIX))
+        .unwrap_or_else(|| panic!("missing zone_worker_summary line\n{stderr}"));
+    serde_json::from_str(line.trim_start_matches(PREFIX))
+        .unwrap_or_else(|err| panic!("invalid zone_worker_summary json: {err}\nline={line}"))
+}
+
+fn summary_usize(summary: &Value, key: &str) -> usize {
+    summary
+        .get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("summary missing numeric key {key}: {summary}")) as usize
+}
+
+fn assert_expected_stale_owner_rejects(stderr: &str, expected_owner: &str, max: usize) {
+    let rejects: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("REJECTED"))
+        .collect();
+    assert!(
+        rejects.len() <= max,
+        "too many stale-owner rejects: max={max}, got={}\n{stderr}",
+        rejects.len()
+    );
+    for line in rejects {
+        assert!(
+            line.contains("comp=vel")
+                && line.contains("not authoritative")
+                && line.contains(expected_owner),
+            "unexpected reject line: {line}\n{stderr}"
+        );
     }
-    None
 }
 
 fn extract_eid(line: &str) -> Option<String> {
@@ -188,11 +244,12 @@ fn create_storm_named_region_every_created_entity_ends_owned() {
     stop(&mut broker);
     assert!(out.status.success(), "zone_worker failed: {:?}", out.status);
     let stderr = stderr_text(&out);
-    assert_eq!(count(&stderr, "AUTH-GAIN"), 100, "{stderr}");
-    assert_eq!(count(&stderr, "AUTH-LOSS"), 0, "{stderr}");
-    assert_eq!(count(&stderr, "REJECTED"), 0, "{stderr}");
-    assert_eq!(parse_done_value(&stderr, "owned"), Some(100), "{stderr}");
-    assert_eq!(parse_done_value(&stderr, "rejects"), Some(0), "{stderr}");
+    let summary = parse_summary(&stderr);
+    assert_eq!(summary.get("region").and_then(Value::as_str), Some("EARTH"));
+    assert_eq!(summary_usize(&summary, "auth_gain"), 100, "{stderr}");
+    assert_eq!(summary_usize(&summary, "auth_loss"), 0, "{stderr}");
+    assert_eq!(summary_usize(&summary, "rejects"), 0, "{stderr}");
+    assert_eq!(summary_usize(&summary, "owned"), 100, "{stderr}");
 }
 
 #[test]
@@ -287,4 +344,92 @@ fn dense_seam_with_matching_e_worker_conserves_authority() {
         100,
         "authority was not conserved across seam: W={w_owned}, E={e_owned}, frame={frame}"
     );
+}
+
+#[test]
+fn moving_w_bodies_handoff_to_e_with_epoch_fencing_and_no_stale_ownership() {
+    let port = free_port();
+    let mut broker = start_broker("moving_w_to_e_lifecycle", port);
+    let east = start_worker_with_motion(port, "E", "zw-E-lifecycle", 0, None, "0,0", "0", "5.0");
+    sleep(Duration::from_millis(250));
+    let west = start_worker_with_motion(
+        port,
+        "W",
+        "zw-W-lifecycle",
+        24,
+        Some("-4,-2,-12,12"),
+        "10,0",
+        "0",
+        "5.0",
+    );
+
+    let west_out = wait_output(west);
+    let east_out = wait_output(east);
+    let frame = inspector_frame(port, "moving-w-to-e");
+    stop(&mut broker);
+
+    assert!(
+        west_out.status.success(),
+        "west zone_worker failed: {:?}",
+        west_out.status
+    );
+    assert!(
+        east_out.status.success(),
+        "east zone_worker failed: {:?}",
+        east_out.status
+    );
+    let west_stderr = stderr_text(&west_out);
+    let east_stderr = stderr_text(&east_out);
+    let west_summary = parse_summary(&west_stderr);
+    let east_summary = parse_summary(&east_stderr);
+
+    assert_eq!(
+        summary_usize(&west_summary, "auth_gain"),
+        24,
+        "west did not gain all spawned bodies\n{west_stderr}"
+    );
+    assert_eq!(
+        summary_usize(&west_summary, "auth_loss"),
+        24,
+        "west did not release every crossing body\nwest={west_stderr}\neast={east_stderr}"
+    );
+    assert!(
+        summary_usize(&east_summary, "auth_gain") >= 24,
+        "east did not adopt the crossing bodies\nwest={west_stderr}\neast={east_stderr}"
+    );
+    let west_rejects = summary_usize(&west_summary, "rejects");
+    assert!(
+        west_rejects <= 24,
+        "west should only see bounded old-owner fences, not a reject storm\n{west_stderr}"
+    );
+    assert_expected_stale_owner_rejects(&west_stderr, "owner=zw-E-lifecycle", 24);
+    assert_eq!(summary_usize(&east_summary, "rejects"), 0, "{east_stderr}");
+    assert_eq!(summary_usize(&west_summary, "owned"), 0, "{west_stderr}");
+
+    let entities = frame
+        .get("entities")
+        .and_then(Value::as_array)
+        .expect("entities array");
+    let real_entities: Vec<&Value> = entities
+        .iter()
+        .filter(|e| e.get("ghost").and_then(Value::as_bool) != Some(true))
+        .collect();
+    assert_eq!(
+        real_entities.len(),
+        24,
+        "entity lifecycle lost bodies: {frame}"
+    );
+
+    for entity in real_entities {
+        let owner = entity
+            .get("authority")
+            .and_then(|a| a.get("pos"))
+            .and_then(|p| p.get("owner"))
+            .and_then(Value::as_str);
+        assert_eq!(
+            owner,
+            Some("zw-E-lifecycle"),
+            "crossed entity retained stale/non-east authority: {entity}"
+        );
+    }
 }
