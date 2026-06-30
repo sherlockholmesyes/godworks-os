@@ -51,5 +51,17 @@ jobs:
       - name: Unit and integration tests
         run: cargo test --workspace --all-targets
 
+      - name: Replay eval fixture gate
+        run: |
+          cargo run --quiet --bin replay_eval -- tests/fixtures/replay_eval/valid-minimal.jsonl
+          if cargo run --quiet --bin replay_eval -- tests/fixtures/replay_eval/invalid-grid2d-missing-dimensions.jsonl; then
+            echo "malformed grid2d replay tape unexpectedly passed"
+            exit 1
+          fi
+          if cargo run --quiet --bin replay_eval -- tests/fixtures/replay_eval/invalid-string-partition-schema.jsonl; then
+            echo "legacy string partition_schema replay tape unexpectedly passed"
+            exit 1
+          fi
+
       - name: Release build
         run: cargo build --workspace --release

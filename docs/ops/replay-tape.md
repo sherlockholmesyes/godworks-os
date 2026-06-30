@@ -72,8 +72,14 @@ The evaluator fails if:
 
 - a redacted key appears anywhere in the tape;
 - a broker event lacks spatial contract metadata;
+- a spatial contract has a malformed `partition_schema`;
 - a handoff event lacks authority epoch or durable-generation context;
 - a role-policy `UpdateRejected` breadcrumb omits the rejected op or peer role.
+
+CI runs `replay_eval` against positive and negative fixtures in
+`tests/fixtures/replay_eval/`. The negative fixtures are part of the contract:
+they must keep failing, or the gate has become descriptive instead of
+falsifying.
 
 ## Current Limits
 
