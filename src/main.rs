@@ -1,7 +1,7 @@
 //! Godworks OS data-plane (Rust) — the authoritative store + op-broker + zone handoff
 //! + WAL durability + lease/heartbeat failover. A drop-in, FULL-PARITY equivalent of
-//! the reference server (same ~17-op contract, same length-prefixed-JSON wire in
-//! phase 1, so the Godot bridge and reference wire-tests run against it UNCHANGED).
+//!   the reference server (same ~17-op contract, same length-prefixed-JSON wire in
+//!   phase 1, so the Godot bridge and reference wire-tests run against it UNCHANGED).
 //!
 //! design-parity vs the reference (no function lost, none downgraded):
 //!   hot path     : WorkerConnect, Interest/QBI, CreateEntity, DeleteEntity,
@@ -1439,6 +1439,8 @@ struct BufferedEvent {
     gen: Value,
 }
 
+type CoalescedEventsByWorker = HashMap<String, (Vec<Value>, HashMap<String, (Value, u64)>)>;
+
 struct ServerState {
     entities: HashMap<String, Entity>,
     workers: HashMap<String, WorkerHandle>,
@@ -2043,6 +2045,23 @@ struct RecoverReport {
     error: Option<String>,
 }
 
+type RecoveredStore = (
+    HashMap<String, Entity>,
+    HashSet<String>,
+    Option<Value>,
+    HashMap<String, Value>,
+    u64,
+    RecoverReport,
+);
+
+type ReplayStore = (
+    HashMap<String, Entity>,
+    HashSet<String>,
+    Option<Value>,
+    HashMap<String, Value>,
+    u64,
+);
+
 impl From<WalReadReport> for RecoverReport {
     fn from(report: WalReadReport) -> Self {
         Self {
@@ -2084,17 +2103,7 @@ fn store_content_hash(store: &HashMap<String, Entity>) -> u64 {
 // corrupt TRAILING run truncates it cleanly; a corrupt record with a VALID record AFTER it (mid-stream) or an
 // unknown wal_version REFUSES (report.error set, empty store) so the caller fails closed instead of serving
 // partial state. v0 files keep the lenient legacy behavior (skip unparseable lines) — no regression.
-fn recover_from_wal_report(
-    path: &str,
-    up_to_offset: Option<u64>,
-) -> (
-    HashMap<String, Entity>,
-    HashSet<String>,
-    Option<Value>,
-    HashMap<String, Value>,
-    u64,
-    RecoverReport,
-) {
+fn recover_from_wal_report(path: &str, up_to_offset: Option<u64>) -> RecoveredStore {
     // First pass: shared WAL scanner/decoder. This is the same integrity truth the wal_inspect CLI uses; the
     // broker-specific reducer below intentionally stays here until the Entity/authority model is extracted.
     let read = read_wal_events(path, up_to_offset);
@@ -2131,23 +2140,15 @@ fn recover_from_wal_report(
 
 // Apply already-decoded (CRC-verified) WAL events to a fresh store. Split out of recover_from_wal_report so
 // the integrity/version gate runs FIRST, then this pure replay runs on the good (CRC-passing) prefix only.
-fn apply_wal_events(
-    events: &[&Value],
-) -> (
-    HashMap<String, Entity>,
-    HashSet<String>,
-    Option<Value>,
-    HashMap<String, Value>,
-    u64,
-) {
+fn apply_wal_events(events: &[&Value]) -> ReplayStore {
     let mut store: HashMap<String, Entity> = HashMap::new();
     let mut tombstones: HashSet<String> = HashSet::new();
     let mut last_partition: Option<Value> = None; // R0.2: the latest partition_config (boundary/splits/mesh) to restore
     let mut recovered_pending: HashMap<String, Value> = HashMap::new(); // G2.1d: mesh_out not acked by the cut -> resend on restore
     let mut recovered_id_hwm: u64 = 0; // ReserveEntityIds high-water mark: never reissue a block after restart
     let g2d_off = std::env::var("GW_G2D_OFF").is_ok(); // G2.1d test toggle: OFF reverts to pre-resolver (proves the wire-transit LOSS)
-    for ev in events.iter().copied() {
-        let ev = ev.clone();
+    for ev in events {
+        let ev = (*ev).clone();
         match ev.get("kind").and_then(|v| v.as_str()).unwrap_or("") {
             "register" => {
                 let eid = ev["entity"].as_str().unwrap_or("").to_string();
@@ -2580,8 +2581,7 @@ fn flush_events(state: &mut ServerState) {
     let max_visual: usize = 64usize >> state.load_level;
     let buffered = std::mem::take(&mut state.event_outbox);
     // per worker -> (critical events [all], visual coalesce_key -> (representative, count))
-    let mut per_worker: HashMap<String, (Vec<Value>, HashMap<String, (Value, u64)>)> =
-        HashMap::new();
+    let mut per_worker: CoalescedEventsByWorker = HashMap::new();
     for ev in buffered {
         let base = json!({"op":"EntityEvent","entity":ev.eid,"event":ev.event,"payload":ev.payload,
             "sim_time":ev.sim_time,"gen":ev.gen,"class":ev.class});
@@ -2788,6 +2788,12 @@ fn renew(state: &mut ServerState, wid: &str) {
     }
 }
 
+#[derive(Default)]
+struct SpawnAuthoritySeed {
+    epoch: Option<u64>,
+    snapshot: Option<Value>,
+}
+
 fn spawn_in_region(
     state: &mut ServerState,
     eid: &str,
@@ -2795,8 +2801,7 @@ fn spawn_in_region(
     vel: [f64; 2],
     comps: Map<String, Value>,
     requested_region: Option<&str>,
-    authority_epoch: Option<u64>,
-    authority_snapshot: Option<Value>,
+    authority: SpawnAuthoritySeed,
 ) -> bool {
     if state.deleted_entities.contains(eid) {
         return false;
@@ -2806,16 +2811,7 @@ fn spawn_in_region(
         Some((c, r, cw, ch)) => region_2d(pos, c, r, cw, ch),
         None => spawn_region(pos, requested_region, &state.boundaries, &state.splits),
     };
-    spawn_committed_region(
-        state,
-        eid,
-        pos,
-        vel,
-        comps,
-        region,
-        authority_epoch,
-        authority_snapshot,
-    )
+    spawn_committed_region(state, eid, pos, vel, comps, region, authority)
 }
 
 fn spawn_committed_region(
@@ -2825,13 +2821,12 @@ fn spawn_committed_region(
     vel: [f64; 2],
     comps: Map<String, Value>,
     region: String,
-    authority_epoch: Option<u64>,
-    authority_snapshot: Option<Value>,
+    authority: SpawnAuthoritySeed,
 ) -> bool {
     if state.deleted_entities.contains(eid) {
         return false;
     }
-    let epoch = authority_epoch.unwrap_or(1);
+    let epoch = authority.epoch.unwrap_or(1);
     state.entities.insert(
         eid.to_string(),
         Entity {
@@ -2844,7 +2839,7 @@ fn spawn_committed_region(
             last_broadcast_cell: Some(interest_cell_of(pos)),
         },
     );
-    if let (Some(e), Some(snapshot)) = (state.entities.get_mut(eid), authority_snapshot.as_ref()) {
+    if let (Some(e), Some(snapshot)) = (state.entities.get_mut(eid), authority.snapshot.as_ref()) {
         apply_authority_snapshot(e, snapshot);
     }
     let authority = state
@@ -4825,7 +4820,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 }
             }
             if accepted == 0 {
-                return; // nothing applied (all rejected / unknown) -> no fsync, no publish
+                // nothing applied (all rejected / unknown) -> no fsync, no publish
             }
         }
         "Fold" => {
@@ -5142,7 +5137,15 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             let created = !state.entities.contains_key(&eid);
             if created {
                 let requested_region = f.get("region").and_then(|v| v.as_str());
-                if !spawn_in_region(state, &eid, pos2, vel2, comps, requested_region, None, None) {
+                if !spawn_in_region(
+                    state,
+                    &eid,
+                    pos2,
+                    vel2,
+                    comps,
+                    requested_region,
+                    SpawnAuthoritySeed::default(),
+                ) {
                     if let Some(req) = f.get("request_id") {
                         emit(
                             state,
@@ -6326,8 +6329,10 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     vel,
                     comps,
                     adopt_region.clone(),
-                    authority_epoch,
-                    authority_snapshot,
+                    SpawnAuthoritySeed {
+                        epoch: authority_epoch,
+                        snapshot: authority_snapshot,
+                    },
                 ) {
                     // (broker owned it, no worker simulated it) -> frozen at the seam.
                     return;
@@ -6789,6 +6794,482 @@ fn spawn_mesh_link_dynamic(st: Arc<Mutex<ServerState>>, region: String, reg_dir:
     });
 }
 
+#[tokio::main]
+async fn main() {
+    let port: u16 = std::env::var("GW_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7777);
+    let lease_ttl: f64 = std::env::var("GW_LEASE_TTL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30.0);
+    let threshold_ttl_ms: u64 = std::env::var("GW_THRESHOLD_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30_000);
+
+    let mut state = ServerState::new(lease_ttl);
+    state.threshold_ttl = Duration::from_millis(threshold_ttl_ms);
+
+    // durability: recover the EXACT pre-crash store from the WAL alone, then continue logging
+    if let Ok(path) = std::env::var("GW_WAL") {
+        // G2: GW_RESTORE_OFFSET=<bytes> rolls the world back to a snapshot cut (else full recovery)
+        let restore_offset = std::env::var("GW_RESTORE_OFFSET")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        let (store, tombstones, topology, recovered_pending, recovered_id_hwm, report) =
+            recover_from_wal_report(&path, restore_offset);
+
+        // #2 RESTORE DRY-RUN: GW_RESTORE_DRYRUN=1 validates a WAL (version / corrupt-tail / content hash /
+        // entity_count) and EXITS WITHOUT serving, so automation can vet a WAL before booting the broker on it.
+        if std::env::var("GW_RESTORE_DRYRUN").is_ok() {
+            let dry = json!({
+                "dry_run": true,
+                "wal": path,
+                "entity_count": store.len(),
+                "store_hash": format!("{:016x}", store_content_hash(&store)),
+                "wal_version": report.wal_version,
+                "selected_event_count": report.selected_event_count,
+                "decoded_record_count": report.decoded_record_count,
+                "corrupt_tail_record_count": report.corrupt_tail_record_count,
+                "truncated_tail_bytes": report.truncated_tail_bytes,
+                "unknown_kind_count": report.unknown_kind_count,
+                "kind_counts": report.kind_counts,
+                "unknown_kinds": report.unknown_kinds,
+                "error": report.error,
+            });
+            println!("{}", serde_json::to_string(&dry).unwrap());
+            // refuse => non-zero exit so a script can gate on it; clean => 0.
+            std::process::exit(if report.error.is_some() { 2 } else { 0 });
+        }
+
+        // not a dry-run: a refuse (mid-corruption / unknown version) must NOT serve partial state -> fail closed.
+        if let Some(err) = report.error {
+            eprintln!("[rust-broker] WAL recovery REFUSED — not serving: {}", err);
+            std::process::exit(2);
+        }
+        let n = store.len();
+        state.entities = store;
+        state.deleted_entities = tombstones;
+        state.entity_id_reservations = recovered_id_hwm;
+        // R0.2: restore the partition topology (boundary/splits/mesh) so the router matches recovered placement.
+        if let Some(pc) = topology {
+            if let Some(b) = pc.get("boundary").and_then(|v| v.as_f64()) {
+                state.boundary = b;
+            }
+            // N-ZONE: restore the full strip cut list so the router rebuilds the SAME N-way assignment. A WAL
+            // predating N-zone has no `boundaries` field -> fall back to the single restored `boundary` (the
+            // 1-element W|E list), so old WALs recover byte-for-byte.
+            if let Some(bs) = pc.get("boundaries").and_then(|v| v.as_array()) {
+                let v: Vec<f64> = bs.iter().filter_map(|x| x.as_f64()).collect();
+                if !v.is_empty() {
+                    state.boundaries = v;
+                }
+            } else {
+                state.boundaries = vec![state.boundary];
+            }
+            if let Some(splits) = pc.get("splits").and_then(|v| v.as_object()) {
+                state.splits = splits
+                    .iter()
+                    .filter_map(|(r, v)| {
+                        v.as_array()
+                            .map(|a| (r.clone(), a.iter().filter_map(|x| x.as_f64()).collect()))
+                    })
+                    .collect();
+            }
+            if let Some(mesh) = pc.get("mesh_regions").and_then(|v| v.as_array()) {
+                state.mesh_regions = mesh
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+            state.zone_topology_rev = pc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("[rust-broker] R0.2: restored partition_config boundary={} boundaries={:?} splits={} mesh={}",
+                state.boundary, state.boundaries, state.splits.len(), state.mesh_regions.len());
+        }
+        // G2.1d: an in-flight handoff (mesh_out without mesh_acked by the cut) is "in the channel" -> rebuild
+        // pending_mesh from the full mesh_out payload so startup/link-ready resends it and the target adopts
+        // it exactly once (the receiver adopt is idempotent). Closes the wire-transit snapshot-loss window.
+        for (eid, payload) in recovered_pending {
+            let target = payload
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let handoff = json!({"op":"MeshHandoff","entity":eid.clone(),"target":target.clone(),
+                "pos":payload.get("pos").cloned().unwrap_or(Value::Null),
+                "vel":payload.get("vel").cloned().unwrap_or(Value::Null),
+                "authority_epoch":payload.get("authority_epoch").cloned().unwrap_or(Value::Null),
+                "authority":payload.get("authority").cloned().unwrap_or(Value::Null),
+                "src_region":payload.get("src_region").cloned().unwrap_or(Value::Null),
+                "lease_epoch":payload.get("lease_epoch").cloned().unwrap_or(Value::Null),
+                "components":payload.get("components").cloned().unwrap_or(Value::Null)});
+            state
+                .pending_mesh
+                .insert(eid, (handoff, Instant::now(), target));
+        }
+        if !state.pending_mesh.is_empty() {
+            println!("[rust-broker] G2.1d: restored {} in-flight handoff(s) to pending_mesh -> will resend",
+                state.pending_mesh.len());
+        }
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("WAL open failed");
+        // #2: seed wal_bytes from the ACTUAL on-disk size so the compaction threshold + GW_RESTORE_OFFSET stay
+        // consistent AND ensure_wal_header correctly no-ops on a populated WAL (only a truly-empty file is
+        // header-stamped). Previously wal_bytes started at 0 even on a recovered (non-empty) WAL.
+        state.wal_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        state.wal = Some(f);
+        state.wal_path = path.clone(); // R0.3: the tick uses this to rewrite/rename the WAL on compaction
+        state.ensure_wal_header(); // stamp the v1 version header iff this is a brand-new (empty) WAL
+        println!(
+            "[rust-broker] WAL {path}: recovered {n} entities from the log (durable-recovery fix); wal_version={}, on-disk={} bytes; compaction threshold={} bytes (0=off)",
+            report.wal_version, state.wal_bytes, state.wal_compact_bytes
+        );
+    }
+
+    // #2 CROSS-MACHINE: the bind ADDRESS is config-driven (GW_BIND), default "127.0.0.1" so every existing
+    // localhost gate is byte-for-byte unchanged. The DIAL side was ALREADY host-agnostic -- GW_MESH="E=host:port"
+    // and the registry `addr` both feed TcpStream::connect(&addr), which takes any host:port (incl. a remote IP /
+    // DNS name). The one thing pinned to loopback was the LISTENER: bind(("127.0.0.1", port)) means a broker on
+    // machine A literally cannot accept a connection from machine B, so a cross-host mesh dial would refuse. Set
+    // GW_BIND=0.0.0.0 (all interfaces) -- or a specific NIC IP -- to let real remote peers reach this listener.
+    // Note: this is a config VALUE consumed exactly once at bind (no flag in any hot path, no second code branch);
+    // GW_MESH stays THE neighbour-address config (region=host:port), so there is no duplicate "GW_NEIGHBORS" knob
+    // -- the cross-host mesh is "dial GW_MESH host:port (already works) + listen on GW_BIND so the peer can dial back".
+    let bind_host = std::env::var("GW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let listener = TcpListener::bind((bind_host.as_str(), port))
+        .await
+        .unwrap_or_else(|e| panic!("bind {bind_host}:{port} failed: {e}"));
+    println!(
+        "[rust-broker] Godworks OS data-plane live @ {bind_host}:{port} (Rust/tokio; full reference-parity; lease_ttl={lease_ttl})"
+    );
+
+    let state = Arc::new(Mutex::new(state));
+
+    // DurableTransition watermark tick: all single/batch component writes append WAL lines without fsync,
+    // then this one barrier advances durable_gen and publishes the group. This is the general law behind
+    // BatchUpdate's old special-case group commit, without per-op disk stalls under game-rate writes.
+    {
+        let st = state.clone();
+        let flush_ms = std::env::var("GW_DURABLE_FLUSH_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(16);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(flush_ms));
+            loop {
+                tick.tick().await;
+                let mut s = st.lock().await;
+                let _t = Instant::now();
+                flush_pending_updates(&mut s);
+                record_lock_hold(&mut s, "durable_flush", _t.elapsed());
+                reap_disconnecting(&mut s);
+            }
+        });
+    }
+
+    // liveness monitor (failover) + dynamic load-balancing monitor on the broker's clock
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let nominal = Duration::from_millis(300);
+            let mut tick = tokio::time::interval(nominal);
+            let mut last_wake = Instant::now();
+            loop {
+                tick.tick().await;
+                // #3 metrics: tick-lag = how much LATER this tick fired than the 300ms schedule (the broker's
+                // saturation signal -- a starved/locked-up broker can't keep its monitor cadence). >= 0; ~0 healthy.
+                let elapsed = last_wake.elapsed();
+                last_wake = Instant::now();
+                let lag = elapsed.as_secs_f64() * 1000.0 - nominal.as_secs_f64() * 1000.0;
+                let mut s = st.lock().await;
+                s.tick_lag_ms = if lag > 0.0 { lag } else { 0.0 };
+                let _t = Instant::now();
+                check_leases(&mut s);
+                record_lock_hold(&mut s, "check_leases", _t.elapsed());
+                let _t = Instant::now();
+                rebalance(&mut s);
+                record_lock_hold(&mut s, "rebalance", _t.elapsed());
+                let _t = Instant::now();
+                rebalance_2d(&mut s);
+                record_lock_hold(&mut s, "rebalance_2d", _t.elapsed());
+                let _t = Instant::now();
+                maybe_split(&mut s);
+                record_lock_hold(&mut s, "maybe_split", _t.elapsed());
+                let _t = Instant::now();
+                process_rebalance_jobs(&mut s);
+                record_lock_hold(&mut s, "rebalance_jobs", _t.elapsed());
+                resend_pending_mesh(&mut s); // re-deliver any cross-broker handoff the neighbour hasn't ACK'd
+                push_border_ghosts(&mut s); // CROSS-BROKER SEAM-INTEREST: project this broker's near-seam entities to the meshed neighbour(s) as read-only ghosts
+                reap_stale_ghosts(&mut s); // drop ghosts whose source stopped refreshing (left the band / link dropped)
+                gc_threshold_timeouts(&mut s);
+                update_load_governor(&mut s); // L3: derive load_level from the egress backlog -> degradation keys off it
+                                              // #3 GRACEFUL-DRAIN progress: while draining, keep handing owned entities to neighbours (a body that
+                                              // arrived/was-created-pre-drain or whose first hand-off raced a momentarily-down link gets swept up
+                                              // here). When BOTH entities and pending_mesh are empty, every owned entity has been ACK'd onto a
+                                              // neighbour (conservation-exact via the mesh path) -> the drain is COMPLETE; exit 0 if drain_exit so a
+                                              // rolling deploy proceeds. drain_exit=false (a test) leaves it alive to be asserted against.
+                if s.draining {
+                    if !s.entities.is_empty() {
+                        let _ = drain_handoff_owned(&mut s);
+                    }
+                    if s.entities.is_empty()
+                        && s.pending_mesh.is_empty()
+                        && !s.mesh.is_empty()
+                        && s.drain_exit
+                    {
+                        println!("[drain] COMPLETE -- all entities handed off + ACK'd by neighbour(s); exiting 0 (clean rolling-deploy shutdown)");
+                        std::process::exit(0);
+                    }
+                }
+                // R0.3: bound the WAL on disk. Runs under THIS lock (no concurrent writer -> no torn-write race);
+                // a no-op until wal_bytes exceeds the threshold, so the per-tick cost is one comparison.
+                let _t = Instant::now();
+                s.maybe_compact_wal();
+                record_lock_hold(&mut s, "wal_compact", _t.elapsed());
+            }
+        });
+    }
+
+    // L1 event-storm: a fast event-flush tick (20Hz) coalesces the buffered EntityEvents (critical=all,
+    // visual=one-per-coalesce_key with a count, debug=dropped) so a 1000-event burst delivers bounded output.
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                tick.tick().await;
+                let mut s = st.lock().await;
+                flush_events(&mut s);
+            }
+        });
+    }
+
+    // OWNED-REGION IDENTITY from GW_ADVERTISE="REGION=host:port[@epoch]", parsed UNCONDITIONALLY at startup
+    // (NOT only inside the GW_REGISTRY discovery block below). A broker's advertised region IS the zone it
+    // owns, registry or no registry -- the static-GW_MESH topology (the advertise-topology's static
+    // peer) advertises a region but configures no registry, so my_region stayed EMPTY there and an inbound
+    // mesh adopt fell back to a POSITION-derive against the local W|E boundary -> the fold-into-ZB
+    // region mislabel ("W"/"E" instead of the owned zone). Setting my_region here makes receiving_region_for_adopt
+    // label an adopted entity with this broker's OWN zone. If GW_REGISTRY is also set, the block below re-sets
+    // my_region (identical value) + seeds the lease_epoch; ADDITIVE: no GW_ADVERTISE => my_region stays empty
+    // (mesh_soak / nzone) => adopt falls to the target-owned / position path exactly as before.
+    if state.lock().await.my_region.is_empty() {
+        if let Ok(advertise) = std::env::var("GW_ADVERTISE") {
+            if let Some((region, _rest)) = advertise.split_once('=') {
+                let region = region.trim().to_string();
+                if !region.is_empty() {
+                    state.lock().await.my_region = region;
+                }
+            }
+        }
+    }
+
+    // CROSS-BROKER MESH: connect (with retry) to each configured NEIGHBOUR broker, so entities crossing
+    // into a remote zone are handed across the PROCESS boundary to the broker owning it. Config:
+    // GW_MESH="E=host:port,MARS=host:port,..." (region=addr pairs); GW_MESH_EAST=addr is the legacy
+    // shorthand for "E=addr". N-neighbour = the open-universe-of-planets backbone (planet = zone-broker).
+    let mut mesh_cfg: Vec<(String, String)> = Vec::new();
+    if let Ok(addr) = std::env::var("GW_MESH_EAST") {
+        mesh_cfg.push(("E".to_string(), addr));
+    }
+    if let Ok(spec) = std::env::var("GW_MESH") {
+        for pair in spec.split(',') {
+            if let Some((r, a)) = pair.split_once('=') {
+                let (r, a) = (r.trim().to_string(), a.trim().to_string());
+                if !r.is_empty() && !a.is_empty() {
+                    mesh_cfg.push((r, a));
+                }
+            }
+        }
+    }
+    for (region, addr) in mesh_cfg {
+        state.lock().await.mesh_regions.insert(region.clone()); // route region-bound entities to the mesh even while the link reconnects
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
+                    stream.set_nodelay(true).ok();
+                    let (mut rd, mut wr) = stream.into_split();
+                    let token = {
+                        let s = st.lock().await;
+                        s.connect_auth_token.clone()
+                    };
+                    let hs = worker_connect_frame(
+                        &format!("mesh-link-{region}"),
+                        "MESH",
+                        token.as_deref(),
+                    );
+                    if wr.write_all(&hs).await.is_ok() {
+                        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                        {
+                            st.lock().await.mesh.insert(region.clone(), tx);
+                        }
+                        println!("[mesh] linked to neighbour broker for region {region} @ {addr}");
+                        let st_ack = st.clone();
+                        tokio::spawn(async move {
+                            // the only inbound on our OUTBOUND mesh link is the neighbour's MeshAck ->
+                            // release the parked entity from pending_mesh (the 2-phase handoff confirmed).
+                            while let Some(f) = read_frame(&mut rd).await {
+                                if f.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
+                                    if let Some(eid) = f.get("entity").and_then(|v| v.as_str()) {
+                                        let mut s = st_ack.lock().await;
+                                        // B2 recovery: record the confirmed departure so a crash-restart
+                                        // does not resurrect an entity that already landed on the neighbour.
+                                        record_mesh_ack(&mut s, eid);
+                                    }
+                                }
+                            }
+                        });
+                        while let Some(buf) = rx.recv().await {
+                            if wr.write_all(&buf).await.is_err() {
+                                break;
+                            }
+                        }
+                        st.lock().await.mesh.remove(&region);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
+
+    // L2 service-discovery: if GW_REGISTRY (a dir) is set, self-register + heartbeat this broker's advertised
+    // region (GW_ADVERTISE="E=host:port") on a 1s tick, and DISCOVER neighbour brokers from the registry --
+    // spawning a dynamic-addr mesh link for each FRESH region != self. Replaces the static GW_MESH at scale;
+    // a replaced node is followed automatically. The static GW_MESH path above still works (back-compat).
+    if let Ok(reg_dir) = std::env::var("GW_REGISTRY") {
+        let advertise = std::env::var("GW_ADVERTISE").unwrap_or_default();
+        // L6 partition proxy (test hook): while GW_REG_FREEZE_FILE exists, this broker performs NO registry I/O
+        // (no read, no write) -- a faithful "partitioned from the shared registry store" model: it keeps
+        // SERVING with its last-known lease_epoch, cannot see it has been superseded, and stops advertising.
+        // Removing the file = the partition HEALS -> it resumes registry I/O and self-fences on seeing a higher
+        // epoch. Unset in production (no freeze) -> a plain no-op.
+        let freeze_file = std::env::var("GW_REG_FREEZE_FILE").unwrap_or_default();
+        let _ = std::fs::create_dir_all(&reg_dir);
+        // Parse "REGION=host:port[@epoch]". The optional @epoch lets a test pin the spec's 10 / 11; absent,
+        // the own epoch is the registry's CURRENT epoch for this region + 1 (so a takeover incarnation
+        // strictly out-epochs the last one) or 1 if the region is unclaimed.
+        let (my_region, my_addr, explicit_epoch) = {
+            if let Some((region, rest)) = advertise.split_once('=') {
+                let region = region.trim().to_string();
+                let (addr, epoch) = match rest.rsplit_once('@') {
+                    Some((a, ep)) => (a.trim().to_string(), ep.trim().parse::<u64>().ok()),
+                    None => (rest.trim().to_string(), None),
+                };
+                (region, addr, epoch)
+            } else {
+                (String::new(), String::new(), None)
+            }
+        };
+        // Establish THIS incarnation's lease_epoch for its own region, monotonically above whatever the
+        // registry currently shows, then publish it into state (mesh_forward stamps outbound handoffs with it).
+        let my_epoch = if my_region.is_empty() {
+            0
+        } else {
+            explicit_epoch.unwrap_or_else(|| {
+                registry_lease_epoch(&reg_dir, &my_region)
+                    .map(|e| e + 1)
+                    .unwrap_or(1)
+            })
+        };
+        if !my_region.is_empty() {
+            let mut s = state.lock().await;
+            s.my_region = my_region.clone();
+            s.region_lease_epoch.insert(my_region.clone(), my_epoch);
+        }
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(1000));
+            loop {
+                tick.tick().await;
+                // partition proxy: while frozen, do NO registry I/O at all (isolated from the store)
+                if !freeze_file.is_empty() && std::path::Path::new(&freeze_file).exists() {
+                    continue;
+                }
+                let now = now_millis();
+                if !my_region.is_empty() && !my_addr.is_empty() {
+                    registry_heartbeat(&reg_dir, &my_region, &my_addr, now, my_epoch);
+                    // heartbeat self + own epoch
+                }
+                for (region, entry) in registry_read(&reg_dir) {
+                    let hb = entry.get("hb_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let entry_epoch = entry.get("lease_epoch").and_then(|v| v.as_u64());
+                    let entry_addr = entry
+                        .get("addr")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if region == my_region {
+                        // L6 SELF-FENCE: a STRICTLY HIGHER epoch for MY region held by a DIFFERENT addr means a
+                        // newer incarnation took over -> I am the stale owner. Mark superseded so mesh_forward
+                        // stops emitting ownership traffic for it. (Same addr at a higher epoch = me restarted,
+                        // not a supersession.)
+                        if let Some(ep) = entry_epoch {
+                            let other_addr =
+                                entry_addr.as_deref().map(|a| a != my_addr).unwrap_or(false);
+                            if ep > my_epoch && other_addr {
+                                let mut s = st.lock().await;
+                                if s.superseded_regions.insert(my_region.clone()) {
+                                    eprintln!(
+                                        "[fence] region '{my_region}' SUPERSEDED: registry shows lease_epoch={ep} (> mine {my_epoch}) at a different addr -- self-fencing this incarnation"
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if now.saturating_sub(hb) < 5000 {
+                        // L6: learn the peer region's CURRENT lease_epoch (monotonic max) so an inbound stale
+                        // handoff from a fenced incarnation of THAT region can be rejected on receipt here.
+                        if let Some(ep) = entry_epoch {
+                            let mut s = st.lock().await;
+                            let cur = s.region_lease_epoch.get(&region).copied().unwrap_or(0);
+                            if ep > cur {
+                                s.region_lease_epoch.insert(region.clone(), ep);
+                            }
+                        }
+                        // Spawn the dynamic mesh-link iff no link TASK is already running for this region THIS
+                        // lifetime (mesh_link_spawned), NOT iff mesh_regions lacks it. A WAL recovery restores
+                        // mesh_regions (so routing knows W is remote) but the OLD link task died in the crash --
+                        // gating on mesh_regions made a recovered broker believe it was linked while it had no
+                        // live link, so its recovered in-flight handoffs never resent (the churn pending-leak).
+                        // mesh_link_spawned starts empty every boot -> a recovered broker re-spawns the link once;
+                        // the task itself loops forever (reconnect-on-drop), so one spawn per region is enough.
+                        let need_spawn = {
+                            let mut s = st.lock().await;
+                            s.mesh_regions.insert(region.clone()); // routing: W is a remote meshed region
+                            if s.mesh_link_spawned.contains(&region) {
+                                false
+                            } else {
+                                s.mesh_link_spawned.insert(region.clone());
+                                true
+                            }
+                        };
+                        if need_spawn {
+                            spawn_mesh_link_dynamic(st.clone(), region.clone(), reg_dir.clone());
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    loop {
+        match listener.accept().await {
+            Ok((sock, _)) => {
+                let st = state.clone();
+                tokio::spawn(handle_conn(sock, st));
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6941,8 +7422,7 @@ mod tests {
                 [0.0, 0.0],
                 Map::new(),
                 None,
-                None,
-                None,
+                SpawnAuthoritySeed::default(),
             ));
             grant_region_physics_island_authority(state, "hot", &eid);
             eids.push(eid);
@@ -6956,8 +7436,7 @@ mod tests {
                 [0.0, 0.0],
                 Map::new(),
                 None,
-                None,
-                None,
+                SpawnAuthoritySeed::default(),
             ));
             grant_region_physics_island_authority(state, "hot", &eid);
             eids.push(eid);
@@ -6998,8 +7477,7 @@ mod tests {
             [0.0, 0.0],
             Map::new(),
             None,
-            None,
-            None,
+            SpawnAuthoritySeed::default(),
         );
 
         assert!(!ok);
@@ -7921,8 +8399,7 @@ mod tests {
             [1.0, 0.0],
             Map::new(),
             Some("W"),
-            None,
-            None,
+            SpawnAuthoritySeed::default(),
         ));
         grant_region_physics_island_authority(&mut state, "w1", "ship");
         let old_epoch = component_authority_epoch(&state.entities["ship"], "pos");
@@ -8001,8 +8478,7 @@ mod tests {
             [1.0, 0.0],
             Map::new(),
             Some("W"),
-            None,
-            None,
+            SpawnAuthoritySeed::default(),
         ));
         grant_region_physics_island_authority(&mut state, "w1", "ship");
         let old_epoch = component_authority_epoch(&state.entities["ship"], "pos");
@@ -8516,8 +8992,7 @@ mod tests {
             [0.5, 0.0],
             Map::new(),
             Some("W"),
-            None,
-            None,
+            SpawnAuthoritySeed::default(),
         ));
 
         assert!(handoff_with_position(
@@ -8595,479 +9070,5 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    let port: u16 = std::env::var("GW_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(7777);
-    let lease_ttl: f64 = std::env::var("GW_LEASE_TTL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30.0);
-    let threshold_ttl_ms: u64 = std::env::var("GW_THRESHOLD_TTL_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000);
-
-    let mut state = ServerState::new(lease_ttl);
-    state.threshold_ttl = Duration::from_millis(threshold_ttl_ms);
-
-    // durability: recover the EXACT pre-crash store from the WAL alone, then continue logging
-    if let Ok(path) = std::env::var("GW_WAL") {
-        // G2: GW_RESTORE_OFFSET=<bytes> rolls the world back to a snapshot cut (else full recovery)
-        let restore_offset = std::env::var("GW_RESTORE_OFFSET")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok());
-        let (store, tombstones, topology, recovered_pending, recovered_id_hwm, report) =
-            recover_from_wal_report(&path, restore_offset);
-
-        // #2 RESTORE DRY-RUN: GW_RESTORE_DRYRUN=1 validates a WAL (version / corrupt-tail / content hash /
-        // entity_count) and EXITS WITHOUT serving, so automation can vet a WAL before booting the broker on it.
-        if std::env::var("GW_RESTORE_DRYRUN").is_ok() {
-            let dry = json!({
-                "dry_run": true,
-                "wal": path,
-                "entity_count": store.len(),
-                "store_hash": format!("{:016x}", store_content_hash(&store)),
-                "wal_version": report.wal_version,
-                "selected_event_count": report.selected_event_count,
-                "decoded_record_count": report.decoded_record_count,
-                "corrupt_tail_record_count": report.corrupt_tail_record_count,
-                "truncated_tail_bytes": report.truncated_tail_bytes,
-                "unknown_kind_count": report.unknown_kind_count,
-                "kind_counts": report.kind_counts,
-                "unknown_kinds": report.unknown_kinds,
-                "error": report.error,
-            });
-            println!("{}", serde_json::to_string(&dry).unwrap());
-            // refuse => non-zero exit so a script can gate on it; clean => 0.
-            std::process::exit(if report.error.is_some() { 2 } else { 0 });
-        }
-
-        // not a dry-run: a refuse (mid-corruption / unknown version) must NOT serve partial state -> fail closed.
-        if let Some(err) = report.error {
-            eprintln!("[rust-broker] WAL recovery REFUSED — not serving: {}", err);
-            std::process::exit(2);
-        }
-        let n = store.len();
-        state.entities = store;
-        state.deleted_entities = tombstones;
-        state.entity_id_reservations = recovered_id_hwm;
-        // R0.2: restore the partition topology (boundary/splits/mesh) so the router matches recovered placement.
-        if let Some(pc) = topology {
-            if let Some(b) = pc.get("boundary").and_then(|v| v.as_f64()) {
-                state.boundary = b;
-            }
-            // N-ZONE: restore the full strip cut list so the router rebuilds the SAME N-way assignment. A WAL
-            // predating N-zone has no `boundaries` field -> fall back to the single restored `boundary` (the
-            // 1-element W|E list), so old WALs recover byte-for-byte.
-            if let Some(bs) = pc.get("boundaries").and_then(|v| v.as_array()) {
-                let v: Vec<f64> = bs.iter().filter_map(|x| x.as_f64()).collect();
-                if !v.is_empty() {
-                    state.boundaries = v;
-                }
-            } else {
-                state.boundaries = vec![state.boundary];
-            }
-            if let Some(splits) = pc.get("splits").and_then(|v| v.as_object()) {
-                state.splits = splits
-                    .iter()
-                    .filter_map(|(r, v)| {
-                        v.as_array()
-                            .map(|a| (r.clone(), a.iter().filter_map(|x| x.as_f64()).collect()))
-                    })
-                    .collect();
-            }
-            if let Some(mesh) = pc.get("mesh_regions").and_then(|v| v.as_array()) {
-                state.mesh_regions = mesh
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect();
-            }
-            state.zone_topology_rev = pc.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-            println!("[rust-broker] R0.2: restored partition_config boundary={} boundaries={:?} splits={} mesh={}",
-                state.boundary, state.boundaries, state.splits.len(), state.mesh_regions.len());
-        }
-        // G2.1d: an in-flight handoff (mesh_out without mesh_acked by the cut) is "in the channel" -> rebuild
-        // pending_mesh from the full mesh_out payload so startup/link-ready resends it and the target adopts
-        // it exactly once (the receiver adopt is idempotent). Closes the wire-transit snapshot-loss window.
-        for (eid, payload) in recovered_pending {
-            let target = payload
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let handoff = json!({"op":"MeshHandoff","entity":eid.clone(),"target":target.clone(),
-                "pos":payload.get("pos").cloned().unwrap_or(Value::Null),
-                "vel":payload.get("vel").cloned().unwrap_or(Value::Null),
-                "authority_epoch":payload.get("authority_epoch").cloned().unwrap_or(Value::Null),
-                "authority":payload.get("authority").cloned().unwrap_or(Value::Null),
-                "src_region":payload.get("src_region").cloned().unwrap_or(Value::Null),
-                "lease_epoch":payload.get("lease_epoch").cloned().unwrap_or(Value::Null),
-                "components":payload.get("components").cloned().unwrap_or(Value::Null)});
-            state
-                .pending_mesh
-                .insert(eid, (handoff, Instant::now(), target));
-        }
-        if !state.pending_mesh.is_empty() {
-            println!("[rust-broker] G2.1d: restored {} in-flight handoff(s) to pending_mesh -> will resend",
-                state.pending_mesh.len());
-        }
-        let f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .expect("WAL open failed");
-        // #2: seed wal_bytes from the ACTUAL on-disk size so the compaction threshold + GW_RESTORE_OFFSET stay
-        // consistent AND ensure_wal_header correctly no-ops on a populated WAL (only a truly-empty file is
-        // header-stamped). Previously wal_bytes started at 0 even on a recovered (non-empty) WAL.
-        state.wal_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        state.wal = Some(f);
-        state.wal_path = path.clone(); // R0.3: the tick uses this to rewrite/rename the WAL on compaction
-        state.ensure_wal_header(); // stamp the v1 version header iff this is a brand-new (empty) WAL
-        println!(
-            "[rust-broker] WAL {path}: recovered {n} entities from the log (durable-recovery fix); wal_version={}, on-disk={} bytes; compaction threshold={} bytes (0=off)",
-            report.wal_version, state.wal_bytes, state.wal_compact_bytes
-        );
-    }
-
-    // #2 CROSS-MACHINE: the bind ADDRESS is config-driven (GW_BIND), default "127.0.0.1" so every existing
-    // localhost gate is byte-for-byte unchanged. The DIAL side was ALREADY host-agnostic -- GW_MESH="E=host:port"
-    // and the registry `addr` both feed TcpStream::connect(&addr), which takes any host:port (incl. a remote IP /
-    // DNS name). The one thing pinned to loopback was the LISTENER: bind(("127.0.0.1", port)) means a broker on
-    // machine A literally cannot accept a connection from machine B, so a cross-host mesh dial would refuse. Set
-    // GW_BIND=0.0.0.0 (all interfaces) -- or a specific NIC IP -- to let real remote peers reach this listener.
-    // Note: this is a config VALUE consumed exactly once at bind (no flag in any hot path, no second code branch);
-    // GW_MESH stays THE neighbour-address config (region=host:port), so there is no duplicate "GW_NEIGHBORS" knob
-    // -- the cross-host mesh is "dial GW_MESH host:port (already works) + listen on GW_BIND so the peer can dial back".
-    let bind_host = std::env::var("GW_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let listener = TcpListener::bind((bind_host.as_str(), port))
-        .await
-        .unwrap_or_else(|e| panic!("bind {bind_host}:{port} failed: {e}"));
-    println!(
-        "[rust-broker] Godworks OS data-plane live @ {bind_host}:{port} (Rust/tokio; full reference-parity; lease_ttl={lease_ttl})"
-    );
-
-    let state = Arc::new(Mutex::new(state));
-
-    // DurableTransition watermark tick: all single/batch component writes append WAL lines without fsync,
-    // then this one barrier advances durable_gen and publishes the group. This is the general law behind
-    // BatchUpdate's old special-case group commit, without per-op disk stalls under game-rate writes.
-    {
-        let st = state.clone();
-        let flush_ms = std::env::var("GW_DURABLE_FLUSH_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|ms| *ms > 0)
-            .unwrap_or(16);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(flush_ms));
-            loop {
-                tick.tick().await;
-                let mut s = st.lock().await;
-                let _t = Instant::now();
-                flush_pending_updates(&mut s);
-                record_lock_hold(&mut s, "durable_flush", _t.elapsed());
-                reap_disconnecting(&mut s);
-            }
-        });
-    }
-
-    // liveness monitor (failover) + dynamic load-balancing monitor on the broker's clock
-    {
-        let st = state.clone();
-        tokio::spawn(async move {
-            let nominal = Duration::from_millis(300);
-            let mut tick = tokio::time::interval(nominal);
-            let mut last_wake = Instant::now();
-            loop {
-                tick.tick().await;
-                // #3 metrics: tick-lag = how much LATER this tick fired than the 300ms schedule (the broker's
-                // saturation signal -- a starved/locked-up broker can't keep its monitor cadence). >= 0; ~0 healthy.
-                let elapsed = last_wake.elapsed();
-                last_wake = Instant::now();
-                let lag = elapsed.as_secs_f64() * 1000.0 - nominal.as_secs_f64() * 1000.0;
-                let mut s = st.lock().await;
-                s.tick_lag_ms = if lag > 0.0 { lag } else { 0.0 };
-                let _t = Instant::now();
-                check_leases(&mut s);
-                record_lock_hold(&mut s, "check_leases", _t.elapsed());
-                let _t = Instant::now();
-                rebalance(&mut s);
-                record_lock_hold(&mut s, "rebalance", _t.elapsed());
-                let _t = Instant::now();
-                rebalance_2d(&mut s);
-                record_lock_hold(&mut s, "rebalance_2d", _t.elapsed());
-                let _t = Instant::now();
-                maybe_split(&mut s);
-                record_lock_hold(&mut s, "maybe_split", _t.elapsed());
-                let _t = Instant::now();
-                process_rebalance_jobs(&mut s);
-                record_lock_hold(&mut s, "rebalance_jobs", _t.elapsed());
-                resend_pending_mesh(&mut s); // re-deliver any cross-broker handoff the neighbour hasn't ACK'd
-                push_border_ghosts(&mut s); // CROSS-BROKER SEAM-INTEREST: project this broker's near-seam entities to the meshed neighbour(s) as read-only ghosts
-                reap_stale_ghosts(&mut s); // drop ghosts whose source stopped refreshing (left the band / link dropped)
-                gc_threshold_timeouts(&mut s);
-                update_load_governor(&mut s); // L3: derive load_level from the egress backlog -> degradation keys off it
-                                              // #3 GRACEFUL-DRAIN progress: while draining, keep handing owned entities to neighbours (a body that
-                                              // arrived/was-created-pre-drain or whose first hand-off raced a momentarily-down link gets swept up
-                                              // here). When BOTH entities and pending_mesh are empty, every owned entity has been ACK'd onto a
-                                              // neighbour (conservation-exact via the mesh path) -> the drain is COMPLETE; exit 0 if drain_exit so a
-                                              // rolling deploy proceeds. drain_exit=false (a test) leaves it alive to be asserted against.
-                if s.draining {
-                    if !s.entities.is_empty() {
-                        let _ = drain_handoff_owned(&mut s);
-                    }
-                    if s.entities.is_empty() && s.pending_mesh.is_empty() && !s.mesh.is_empty() {
-                        if s.drain_exit {
-                            println!("[drain] COMPLETE -- all entities handed off + ACK'd by neighbour(s); exiting 0 (clean rolling-deploy shutdown)");
-                            std::process::exit(0);
-                        }
-                    }
-                }
-                // R0.3: bound the WAL on disk. Runs under THIS lock (no concurrent writer -> no torn-write race);
-                // a no-op until wal_bytes exceeds the threshold, so the per-tick cost is one comparison.
-                let _t = Instant::now();
-                s.maybe_compact_wal();
-                record_lock_hold(&mut s, "wal_compact", _t.elapsed());
-            }
-        });
-    }
-
-    // L1 event-storm: a fast event-flush tick (20Hz) coalesces the buffered EntityEvents (critical=all,
-    // visual=one-per-coalesce_key with a count, debug=dropped) so a 1000-event burst delivers bounded output.
-    {
-        let st = state.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(50));
-            loop {
-                tick.tick().await;
-                let mut s = st.lock().await;
-                flush_events(&mut s);
-            }
-        });
-    }
-
-    // OWNED-REGION IDENTITY from GW_ADVERTISE="REGION=host:port[@epoch]", parsed UNCONDITIONALLY at startup
-    // (NOT only inside the GW_REGISTRY discovery block below). A broker's advertised region IS the zone it
-    // owns, registry or no registry -- the static-GW_MESH topology (the advertise-topology's static
-    // peer) advertises a region but configures no registry, so my_region stayed EMPTY there and an inbound
-    // mesh adopt fell back to a POSITION-derive against the local W|E boundary -> the fold-into-ZB
-    // region mislabel ("W"/"E" instead of the owned zone). Setting my_region here makes receiving_region_for_adopt
-    // label an adopted entity with this broker's OWN zone. If GW_REGISTRY is also set, the block below re-sets
-    // my_region (identical value) + seeds the lease_epoch; ADDITIVE: no GW_ADVERTISE => my_region stays empty
-    // (mesh_soak / nzone) => adopt falls to the target-owned / position path exactly as before.
-    if state.lock().await.my_region.is_empty() {
-        if let Ok(advertise) = std::env::var("GW_ADVERTISE") {
-            if let Some((region, _rest)) = advertise.split_once('=') {
-                let region = region.trim().to_string();
-                if !region.is_empty() {
-                    state.lock().await.my_region = region;
-                }
-            }
-        }
-    }
-
-    // CROSS-BROKER MESH: connect (with retry) to each configured NEIGHBOUR broker, so entities crossing
-    // into a remote zone are handed across the PROCESS boundary to the broker owning it. Config:
-    // GW_MESH="E=host:port,MARS=host:port,..." (region=addr pairs); GW_MESH_EAST=addr is the legacy
-    // shorthand for "E=addr". N-neighbour = the open-universe-of-planets backbone (planet = zone-broker).
-    let mut mesh_cfg: Vec<(String, String)> = Vec::new();
-    if let Ok(addr) = std::env::var("GW_MESH_EAST") {
-        mesh_cfg.push(("E".to_string(), addr));
-    }
-    if let Ok(spec) = std::env::var("GW_MESH") {
-        for pair in spec.split(',') {
-            if let Some((r, a)) = pair.split_once('=') {
-                let (r, a) = (r.trim().to_string(), a.trim().to_string());
-                if !r.is_empty() && !a.is_empty() {
-                    mesh_cfg.push((r, a));
-                }
-            }
-        }
-    }
-    for (region, addr) in mesh_cfg {
-        state.lock().await.mesh_regions.insert(region.clone()); // route region-bound entities to the mesh even while the link reconnects
-        let st = state.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Ok(stream) = tokio::net::TcpStream::connect(&addr).await {
-                    stream.set_nodelay(true).ok();
-                    let (mut rd, mut wr) = stream.into_split();
-                    let token = {
-                        let s = st.lock().await;
-                        s.connect_auth_token.clone()
-                    };
-                    let hs = worker_connect_frame(
-                        &format!("mesh-link-{region}"),
-                        "MESH",
-                        token.as_deref(),
-                    );
-                    if wr.write_all(&hs).await.is_ok() {
-                        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-                        {
-                            st.lock().await.mesh.insert(region.clone(), tx);
-                        }
-                        println!("[mesh] linked to neighbour broker for region {region} @ {addr}");
-                        let st_ack = st.clone();
-                        tokio::spawn(async move {
-                            // the only inbound on our OUTBOUND mesh link is the neighbour's MeshAck ->
-                            // release the parked entity from pending_mesh (the 2-phase handoff confirmed).
-                            while let Some(f) = read_frame(&mut rd).await {
-                                if f.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
-                                    if let Some(eid) = f.get("entity").and_then(|v| v.as_str()) {
-                                        let mut s = st_ack.lock().await;
-                                        // B2 recovery: record the confirmed departure so a crash-restart
-                                        // does not resurrect an entity that already landed on the neighbour.
-                                        record_mesh_ack(&mut s, eid);
-                                    }
-                                }
-                            }
-                        });
-                        while let Some(buf) = rx.recv().await {
-                            if wr.write_all(&buf).await.is_err() {
-                                break;
-                            }
-                        }
-                        st.lock().await.mesh.remove(&region);
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        });
-    }
-
-    // L2 service-discovery: if GW_REGISTRY (a dir) is set, self-register + heartbeat this broker's advertised
-    // region (GW_ADVERTISE="E=host:port") on a 1s tick, and DISCOVER neighbour brokers from the registry --
-    // spawning a dynamic-addr mesh link for each FRESH region != self. Replaces the static GW_MESH at scale;
-    // a replaced node is followed automatically. The static GW_MESH path above still works (back-compat).
-    if let Ok(reg_dir) = std::env::var("GW_REGISTRY") {
-        let advertise = std::env::var("GW_ADVERTISE").unwrap_or_default();
-        // L6 partition proxy (test hook): while GW_REG_FREEZE_FILE exists, this broker performs NO registry I/O
-        // (no read, no write) -- a faithful "partitioned from the shared registry store" model: it keeps
-        // SERVING with its last-known lease_epoch, cannot see it has been superseded, and stops advertising.
-        // Removing the file = the partition HEALS -> it resumes registry I/O and self-fences on seeing a higher
-        // epoch. Unset in production (no freeze) -> a plain no-op.
-        let freeze_file = std::env::var("GW_REG_FREEZE_FILE").unwrap_or_default();
-        let _ = std::fs::create_dir_all(&reg_dir);
-        // Parse "REGION=host:port[@epoch]". The optional @epoch lets a test pin the spec's 10 / 11; absent,
-        // the own epoch is the registry's CURRENT epoch for this region + 1 (so a takeover incarnation
-        // strictly out-epochs the last one) or 1 if the region is unclaimed.
-        let (my_region, my_addr, explicit_epoch) = {
-            if let Some((region, rest)) = advertise.split_once('=') {
-                let region = region.trim().to_string();
-                let (addr, epoch) = match rest.rsplit_once('@') {
-                    Some((a, ep)) => (a.trim().to_string(), ep.trim().parse::<u64>().ok()),
-                    None => (rest.trim().to_string(), None),
-                };
-                (region, addr, epoch)
-            } else {
-                (String::new(), String::new(), None)
-            }
-        };
-        // Establish THIS incarnation's lease_epoch for its own region, monotonically above whatever the
-        // registry currently shows, then publish it into state (mesh_forward stamps outbound handoffs with it).
-        let my_epoch = if my_region.is_empty() {
-            0
-        } else {
-            explicit_epoch.unwrap_or_else(|| {
-                registry_lease_epoch(&reg_dir, &my_region)
-                    .map(|e| e + 1)
-                    .unwrap_or(1)
-            })
-        };
-        if !my_region.is_empty() {
-            let mut s = state.lock().await;
-            s.my_region = my_region.clone();
-            s.region_lease_epoch.insert(my_region.clone(), my_epoch);
-        }
-        let st = state.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(1000));
-            loop {
-                tick.tick().await;
-                // partition proxy: while frozen, do NO registry I/O at all (isolated from the store)
-                if !freeze_file.is_empty() && std::path::Path::new(&freeze_file).exists() {
-                    continue;
-                }
-                let now = now_millis();
-                if !my_region.is_empty() && !my_addr.is_empty() {
-                    registry_heartbeat(&reg_dir, &my_region, &my_addr, now, my_epoch);
-                    // heartbeat self + own epoch
-                }
-                for (region, entry) in registry_read(&reg_dir) {
-                    let hb = entry.get("hb_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let entry_epoch = entry.get("lease_epoch").and_then(|v| v.as_u64());
-                    let entry_addr = entry
-                        .get("addr")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    if region == my_region {
-                        // L6 SELF-FENCE: a STRICTLY HIGHER epoch for MY region held by a DIFFERENT addr means a
-                        // newer incarnation took over -> I am the stale owner. Mark superseded so mesh_forward
-                        // stops emitting ownership traffic for it. (Same addr at a higher epoch = me restarted,
-                        // not a supersession.)
-                        if let Some(ep) = entry_epoch {
-                            let other_addr =
-                                entry_addr.as_deref().map(|a| a != my_addr).unwrap_or(false);
-                            if ep > my_epoch && other_addr {
-                                let mut s = st.lock().await;
-                                if s.superseded_regions.insert(my_region.clone()) {
-                                    eprintln!(
-                                        "[fence] region '{my_region}' SUPERSEDED: registry shows lease_epoch={ep} (> mine {my_epoch}) at a different addr -- self-fencing this incarnation"
-                                    );
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    if now.saturating_sub(hb) < 5000 {
-                        // L6: learn the peer region's CURRENT lease_epoch (monotonic max) so an inbound stale
-                        // handoff from a fenced incarnation of THAT region can be rejected on receipt here.
-                        if let Some(ep) = entry_epoch {
-                            let mut s = st.lock().await;
-                            let cur = s.region_lease_epoch.get(&region).copied().unwrap_or(0);
-                            if ep > cur {
-                                s.region_lease_epoch.insert(region.clone(), ep);
-                            }
-                        }
-                        // Spawn the dynamic mesh-link iff no link TASK is already running for this region THIS
-                        // lifetime (mesh_link_spawned), NOT iff mesh_regions lacks it. A WAL recovery restores
-                        // mesh_regions (so routing knows W is remote) but the OLD link task died in the crash --
-                        // gating on mesh_regions made a recovered broker believe it was linked while it had no
-                        // live link, so its recovered in-flight handoffs never resent (the churn pending-leak).
-                        // mesh_link_spawned starts empty every boot -> a recovered broker re-spawns the link once;
-                        // the task itself loops forever (reconnect-on-drop), so one spawn per region is enough.
-                        let need_spawn = {
-                            let mut s = st.lock().await;
-                            s.mesh_regions.insert(region.clone()); // routing: W is a remote meshed region
-                            if s.mesh_link_spawned.contains(&region) {
-                                false
-                            } else {
-                                s.mesh_link_spawned.insert(region.clone());
-                                true
-                            }
-                        };
-                        if need_spawn {
-                            spawn_mesh_link_dynamic(st.clone(), region.clone(), reg_dir.clone());
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    loop {
-        match listener.accept().await {
-            Ok((sock, _)) => {
-                let st = state.clone();
-                tokio::spawn(handle_conn(sock, st));
-            }
-            Err(_) => continue,
-        }
     }
 }

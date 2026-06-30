@@ -120,12 +120,6 @@ struct WorkerMetrics {
     reject_classes: BTreeMap<String, u64>,
 }
 
-// agar.io cell sizing: a cell's AREA scales with mass, so radius = base * sqrt(mass). Used by the body
-// collider on adopt and by the eat-check. Bigger cells also move slower (applied in the input handler).
-fn radius_for(mass: f32, base: f32) -> f32 {
-    base * mass.max(1.0).sqrt()
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let host = env_str("GW_ZW_HOST", "127.0.0.1");
@@ -234,8 +228,10 @@ async fn main() {
 
     // ── rapier world (one per process) ──
     let gravity = vector![0.0, 0.0];
-    let mut ip = IntegrationParameters::default();
-    ip.dt = dt;
+    let ip = IntegrationParameters {
+        dt,
+        ..Default::default()
+    };
     let mut pipeline = PhysicsPipeline::new();
     let mut islands = IslandManager::new();
     let mut bphase = DefaultBroadPhase::new();
@@ -450,7 +446,7 @@ async fn main() {
         }
 
         // (4) heartbeat ~4x/s (renew the region lease)
-        if tick % ((hz as u64 / 4).max(1)) == 0 {
+        if tick.is_multiple_of((hz as u64 / 4).max(1)) {
             write_op(&mut wr, &heartbeat_op(wid.clone())).await.ok();
         }
 
