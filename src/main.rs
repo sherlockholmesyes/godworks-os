@@ -1838,6 +1838,16 @@ impl ServerState {
         if self.snapshot_seen {
             return;
         }
+        // Compaction is a durable-cut operation: it rewrites RAM state into a new WAL. Staged transitions
+        // still live only in the current WAL + pending_* queues until their group fsync/apply pass, so
+        // compacting here would snapshot pre-transition RAM and delete the only file carrying the staged line.
+        if !self.pending_updates.is_empty()
+            || !self.pending_handoffs.is_empty()
+            || !self.pending_failovers.is_empty()
+            || !self.pending_block_migrations.is_empty()
+        {
+            return;
+        }
         let tmp = format!("{}.tmp", self.wal_path);
         // Build the snapshot as register lines (== spawn_in_region's WAL event, == recover_from_wal's reader)
         // + the latest partition_config (== wal_partition_config), into <wal>.tmp.
@@ -11442,6 +11452,71 @@ mod tests {
         assert!(
             entities.contains_key("alive-1"),
             "live entity must survive compaction"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_waits_for_pending_durable_transition_cut() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_compact_pending_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+        let original = "pending-update-still-in-current-wal\n";
+        std::fs::write(&wal_path, original).unwrap();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        state.wal_degraded = false;
+        state.snapshot_seen = false;
+        state.wal_compact_bytes = 1;
+        state.wal_bytes = 4096;
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([1.0, 0.0], "W"));
+        state.pending_updates.push(PreparedUpdate {
+            gen: 2,
+            eid: "ship".to_string(),
+            comp: "pos".to_string(),
+            value: json!([2.0, 0.0]),
+            version: 2,
+            writer: "w1".to_string(),
+        });
+
+        state.maybe_compact_wal();
+
+        assert!(
+            !state.wal_degraded,
+            "a pending transition should postpone compaction, not degrade WAL"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&wal_path).unwrap(),
+            original,
+            "compaction must not rewrite the current WAL while staged transitions still need it"
+        );
+        assert_eq!(
+            state.metrics.wal_compactions, 0,
+            "pending transitions mean there is not yet a compactable durable cut"
+        );
+        assert_eq!(state.pending_updates.len(), 1);
+        assert!(
+            !std::path::Path::new(&format!("{wal_path}.tmp")).exists(),
+            "postponed compaction should not leave a tmp snapshot"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
