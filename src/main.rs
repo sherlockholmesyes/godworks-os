@@ -89,6 +89,37 @@ struct PeerClaims {
     attributes: HashSet<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerRole {
+    Worker,
+    Client,
+    Observer,
+    Mesh,
+}
+
+impl PeerRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            PeerRole::Worker => "worker",
+            PeerRole::Client => "client",
+            PeerRole::Observer => "observer",
+            PeerRole::Mesh => "mesh",
+        }
+    }
+}
+
+fn peer_role_for(region: &str, attributes: &HashSet<String>) -> PeerRole {
+    if region == "MESH" || attributes.contains("role.mesh") {
+        PeerRole::Mesh
+    } else if region == "OBS" || attributes.contains("role.observer") {
+        PeerRole::Observer
+    } else if region == "CLIENT" || attributes.contains("role.client") {
+        PeerRole::Client
+    } else {
+        PeerRole::Worker
+    }
+}
+
 fn parse_connect_auth_claims(spec: &str) -> HashMap<String, PeerClaims> {
     let mut claims = HashMap::new();
     for entry in spec.split(',') {
@@ -534,6 +565,7 @@ struct GhostEntity {
 
 struct WorkerHandle {
     region: String,
+    role: PeerRole,
     attributes: HashSet<String>, // worker-type attributes (ACL / LB constraints)
     view: HashSet<String>,
     authority_epochs: HashMap<String, u64>,
@@ -555,17 +587,23 @@ struct WorkerHandle {
 
 impl WorkerHandle {
     fn has_global_observer_claim(&self) -> bool {
+        if self.role != PeerRole::Observer {
+            return false;
+        }
         self.attributes
             .iter()
             .any(|a| a == "observer" || a == "debug" || a == "inspector")
     }
 
     fn default_region_interest(&self, pos: [f64; 2]) -> bool {
-        match self.region.as_str() {
-            "OBS" => self.has_global_observer_claim(),
-            "MESH" => false, // a cross-broker mesh link is a conduit, not an interest-holder
-            "W" => pos[0] < H + INTEREST_MARGIN,
-            _ => pos[0] >= -H - INTEREST_MARGIN,
+        match self.role {
+            PeerRole::Observer => self.has_global_observer_claim(),
+            PeerRole::Mesh => false, // a cross-broker mesh link is a conduit, not an interest-holder
+            PeerRole::Client => false, // clients opt into AOI explicitly; they never own a default region view
+            PeerRole::Worker => match self.region.as_str() {
+                "W" => pos[0] < H + INTEREST_MARGIN,
+                _ => pos[0] >= -H - INTEREST_MARGIN,
+            },
         }
     }
 
@@ -2662,6 +2700,100 @@ fn reject_ingress_rate_limit(
             "rate_limit_cost": cost,
             "rate_limit_tokens": remaining_tokens,
             "reason": "rate_limit_error: ingress cost budget exceeded"
+        }),
+    );
+    true
+}
+
+fn role_policy_allows(role: PeerRole, attributes: &HashSet<String>, op: &str) -> bool {
+    if op == "Health" {
+        return true;
+    }
+    if op == "SetComponentAuthority" && attributes.contains("kernel_admin") {
+        return true;
+    }
+    if op == "SnapshotMarker"
+        && attributes
+            .iter()
+            .any(|a| a == "snapshot" || a == "inspector" || a == "kernel_admin")
+    {
+        return true;
+    }
+    if op == "Drain"
+        && attributes
+            .iter()
+            .any(|a| a == "kernel_admin" || a == "inspector" || a == "ops")
+    {
+        return true;
+    }
+    if op == "InspectorQuery"
+        && attributes
+            .iter()
+            .any(|a| a == "inspector" || a == "debug" || a == "kernel_admin")
+    {
+        return true;
+    }
+    match role {
+        PeerRole::Worker => !matches!(
+            op,
+            "MeshHandoff" | "MeshAck" | "MeshGhost" | "MeshGhostRemove"
+        ),
+        PeerRole::Client => matches!(
+            op,
+            "Heartbeat"
+                | "LogMessage"
+                | "Metrics"
+                | "Disconnect"
+                | "Interest"
+                | "EntityQuery"
+                | "CommandRequest"
+                | "UpdateComponent"
+        ),
+        PeerRole::Observer => {
+            matches!(
+                op,
+                "Heartbeat" | "LogMessage" | "Metrics" | "Disconnect" | "Interest" | "EntityQuery"
+            ) || (op == "InspectorQuery"
+                && attributes.iter().any(|a| a == "inspector" || a == "debug"))
+        }
+        PeerRole::Mesh => matches!(
+            op,
+            "Heartbeat"
+                | "LogMessage"
+                | "Metrics"
+                | "Disconnect"
+                | "MeshHandoff"
+                | "MeshAck"
+                | "MeshGhost"
+                | "MeshGhostRemove"
+        ),
+    }
+}
+
+fn reject_role_policy(state: &mut ServerState, wid: &str, f: &Value) -> bool {
+    let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let Some((role, attributes)) = state
+        .workers
+        .get(wid)
+        .map(|w| (w.role, w.attributes.clone()))
+    else {
+        return false;
+    };
+    if role_policy_allows(role, &attributes, op) {
+        return false;
+    }
+    emit(
+        state,
+        wid,
+        json!({
+            "op": "UpdateRejected",
+            "request_id": f.get("request_id").cloned().unwrap_or(Value::Null),
+            "entity": f.get("entity").cloned().unwrap_or(Value::Null),
+            "comp": "role_policy",
+            "error": "role_policy_error",
+            "rejected_op": op,
+            "peer_role": role.as_str(),
+            "reason": format!("role {} cannot send {}", role.as_str(), op)
         }),
     );
     true
@@ -4830,6 +4962,10 @@ fn dispatch_frame(state: &mut ServerState, wid: &str, f: &Value, byte_len: usize
         reap_disconnecting(state);
         return;
     }
+    if reject_role_policy(state, wid, f) {
+        reap_disconnecting(state);
+        return;
+    }
     dispatch_inner(state, wid, f);
     // T1: a single frame's fan-out (e.g. a critical EntityEvent to N observers) may have driven a stuck
     // consumer past the hard egress cap; reap it NOW (within this frame) so its bounded channel can hold at
@@ -6735,6 +6871,7 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
             return; // do NOT register; the connection drops as wr/rd go out of scope
         }
     }
+    let role = peer_role_for(&region, &attributes);
 
     // T1: BOUNDED egress channel (capacity CHANNEL_CAP). A stuck consumer can hold AT MOST CHANNEL_CAP unsent
     // frames; emit()'s try_send then fails Full and (for a critical frame) flags the worker for force-disconnect.
@@ -6763,6 +6900,7 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
             wid.clone(),
             WorkerHandle {
                 region: region.clone(),
+                role,
                 attributes,
                 view: HashSet::new(),
                 authority_epochs: HashMap::new(),
@@ -6783,10 +6921,13 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
             },
         );
         update_interest_grid(&mut s, &wid); // Interest: default a fresh worker to global (no AOI yet); an Interest op re-indexes it
-        println!("[broker] worker '{wid}' connected as region '{region}'");
-        if region == "STANDBY" {
+        println!(
+            "[broker] worker '{wid}' connected as region '{region}' role '{}'",
+            role.as_str()
+        );
+        if role == PeerRole::Worker && region == "STANDBY" {
             s.standbys.push(wid.clone()); // a hot spare for failover
-        } else if region != "OBS" && region != "MESH" {
+        } else if role == PeerRole::Worker {
             // ANY real zone-region leases authority: W/E for the position-sharded seam, AND arbitrary
             // open-world regions (planets / fold-targets like "MARS") so a PORTAL FOLD can hand authority
             // to a non-adjacent zone. OBS (observer) + MESH (cross-broker link) are control-regions.
@@ -7528,6 +7669,7 @@ mod tests {
             wid.to_string(),
             WorkerHandle {
                 region: region.to_string(),
+                role: peer_role_for(region, &HashSet::new()),
                 attributes: HashSet::new(),
                 view: HashSet::new(),
                 authority_epochs: HashMap::new(),
@@ -7563,6 +7705,7 @@ mod tests {
             wid.to_string(),
             WorkerHandle {
                 region: region.to_string(),
+                role: peer_role_for(region, &HashSet::new()),
                 attributes: HashSet::new(),
                 view: HashSet::new(),
                 authority_epochs: HashMap::new(),
@@ -7585,6 +7728,48 @@ mod tests {
         state
             .region_worker
             .insert(region.to_string(), wid.to_string());
+        rx
+    }
+
+    fn add_test_peer_with_rx(
+        state: &mut ServerState,
+        wid: &str,
+        region: &str,
+        attributes: HashSet<String>,
+    ) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
+        let ingress_tokens = state.ingress_burst_frames.max(1.0);
+        let role = peer_role_for(region, &attributes);
+        state.workers.insert(
+            wid.to_string(),
+            WorkerHandle {
+                region: region.to_string(),
+                role,
+                attributes,
+                view: HashSet::new(),
+                authority_epochs: HashMap::new(),
+                aoi_center: None,
+                aoi_radius: None,
+                fidelity_full_radius: None,
+                fidelity_coarse_rate: 1,
+                fidelity_coarse_grid: 0.0,
+                fidelity_seq: HashMap::new(),
+                tx,
+                out_queue: Arc::new(AtomicU64::new(0)),
+                dropped: Arc::new(AtomicU64::new(0)),
+                disconnect: Arc::new(AtomicBool::new(false)),
+                grid_cells: Vec::new(),
+                ingress_tokens,
+                ingress_last_refill: Instant::now(),
+                ingress_rejected: 0,
+            },
+        );
+        if role == PeerRole::Worker {
+            state
+                .region_worker
+                .insert(region.to_string(), wid.to_string());
+        }
+        update_interest_grid(state, wid);
         rx
     }
 
@@ -7958,6 +8143,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_role_claim_cannot_lease_worker_region() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            s.connect_auth_claims.insert(
+                "client-secret".to_string(),
+                PeerClaims {
+                    region: "W".to_string(),
+                    attributes: HashSet::from([
+                        "role.client".to_string(),
+                        "player.alice".to_string(),
+                    ]),
+                },
+            );
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"client-alice",
+                "region":"W",
+                "auth_token":"client-secret"
+            })))
+            .await
+            .unwrap();
+
+        let mut registered = false;
+        for _ in 0..20 {
+            {
+                let s = state.lock().await;
+                registered = s.workers.get("client-alice").is_some_and(|w| {
+                    w.role == PeerRole::Client
+                        && w.region == "W"
+                        && w.attributes.contains("player.alice")
+                }) && !matches!(s.region_worker.get("W"), Some(w) if w == "client-alice");
+            }
+            if registered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registered,
+            "a client claim may connect with region context but must not lease the worker region"
+        );
+
+        client
+            .write_all(&frame(&json!({"op":"Disconnect"})))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn worker_connect_auth_rejects_before_registration() {
         let state = Arc::new(Mutex::new(ServerState::new(30.0)));
         {
@@ -8052,6 +8300,167 @@ mod tests {
             .await
             .unwrap();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn client_role_rejects_create_entity_before_dispatch_or_wal() {
+        let mut state = ServerState::new(30.0);
+        let mut rx = add_test_peer_with_rx(
+            &mut state,
+            "client-alice",
+            "W",
+            HashSet::from(["role.client".to_string(), "player.alice".to_string()]),
+        );
+
+        dispatch_test_frame(
+            &mut state,
+            "client-alice",
+            &json!({
+                "op":"CreateEntity",
+                "request_id":"create-client",
+                "entity":"client-spawn",
+                "components":{"pos":[0.0,0.0],"vel":[0.0,0.0]}
+            }),
+        );
+
+        assert!(!state.entities.contains_key("client-spawn"));
+        assert_eq!(state.wal_bytes, 0);
+        let reject = decode_test_frame(&rx.try_recv().expect("client create must reject"));
+        assert_eq!(reject["op"], "UpdateRejected");
+        assert_eq!(reject["comp"], "role_policy");
+        assert_eq!(reject["rejected_op"], "CreateEntity");
+        assert_eq!(reject["peer_role"], "client");
+    }
+
+    #[test]
+    fn client_role_update_component_still_requires_component_authority() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "owner", "W");
+        assert!(spawn_in_region(
+            &mut state,
+            "ship",
+            [-1.0, 0.0],
+            [0.0, 0.0],
+            Map::new(),
+            Some("W"),
+            SpawnAuthoritySeed::default(),
+        ));
+        let mut rx = add_test_peer_with_rx(
+            &mut state,
+            "client-alice",
+            "W",
+            HashSet::from(["role.client".to_string(), "player.alice".to_string()]),
+        );
+
+        dispatch_test_frame(
+            &mut state,
+            "client-alice",
+            &json!({
+                "op":"UpdateComponent",
+                "entity":"ship",
+                "comp":"pos",
+                "value":[2.0,0.0],
+                "authority_epoch":0
+            }),
+        );
+
+        let reject = decode_test_frame(
+            &rx.try_recv()
+                .expect("client update without authority must reject"),
+        );
+        assert_eq!(reject["op"], "UpdateRejected");
+        assert_eq!(reject["comp"], "pos");
+        assert_ne!(reject["comp"], "role_policy");
+        assert_eq!(state.entities["ship"].pos, [-1.0, 0.0]);
+    }
+
+    #[test]
+    fn mesh_role_rejects_non_mesh_lifecycle_ops_but_allows_mesh_ack() {
+        let mut state = ServerState::new(30.0);
+        let mut rx = add_test_peer_with_rx(
+            &mut state,
+            "mesh-peer",
+            "MESH",
+            HashSet::from(["role.mesh".to_string()]),
+        );
+
+        dispatch_test_frame(
+            &mut state,
+            "mesh-peer",
+            &json!({
+                "op":"CreateEntity",
+                "request_id":"mesh-create",
+                "entity":"bad-mesh-spawn",
+                "components":{"pos":[0.0,0.0]}
+            }),
+        );
+        let reject = decode_test_frame(&rx.try_recv().expect("mesh create must reject"));
+        assert_eq!(reject["op"], "UpdateRejected");
+        assert_eq!(reject["comp"], "role_policy");
+        assert_eq!(reject["peer_role"], "mesh");
+        assert!(!state.entities.contains_key("bad-mesh-spawn"));
+
+        dispatch_test_frame(
+            &mut state,
+            "mesh-peer",
+            &json!({"op":"MeshAck","entity":"not-pending"}),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "mesh role gate must allow mesh-family ops through without role rejection"
+        );
+    }
+
+    #[test]
+    fn observer_role_rejects_write_ops_and_requires_inspector_for_inspector_query() {
+        let mut state = ServerState::new(30.0);
+        let mut rx = add_test_peer_with_rx(
+            &mut state,
+            "observer",
+            "OBS",
+            HashSet::from(["observer".to_string()]),
+        );
+
+        dispatch_test_frame(
+            &mut state,
+            "observer",
+            &json!({
+                "op":"CreateEntity",
+                "request_id":"obs-create",
+                "entity":"observer-spawn",
+                "components":{"pos":[0.0,0.0]}
+            }),
+        );
+        let create_reject = decode_test_frame(&rx.try_recv().expect("observer create must reject"));
+        assert_eq!(create_reject["op"], "UpdateRejected");
+        assert_eq!(create_reject["comp"], "role_policy");
+        assert_eq!(create_reject["peer_role"], "observer");
+        assert!(!state.entities.contains_key("observer-spawn"));
+
+        dispatch_test_frame(
+            &mut state,
+            "observer",
+            &json!({"op":"InspectorQuery","request_id":"inspect-denied"}),
+        );
+        let inspector_reject =
+            decode_test_frame(&rx.try_recv().expect("plain observer inspector must reject"));
+        assert_eq!(inspector_reject["op"], "UpdateRejected");
+        assert_eq!(inspector_reject["comp"], "role_policy");
+
+        state
+            .workers
+            .get_mut("observer")
+            .unwrap()
+            .attributes
+            .insert("inspector".to_string());
+        dispatch_test_frame(
+            &mut state,
+            "observer",
+            &json!({"op":"InspectorQuery","request_id":"inspect-ok","max_entities":0}),
+        );
+        let frame = decode_test_frame(&rx.try_recv().expect("inspector query must pass"));
+        assert_eq!(frame["op"], "InspectorFrame");
+        assert_eq!(frame["request_id"], "inspect-ok");
     }
 
     #[test]
