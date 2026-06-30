@@ -41,6 +41,8 @@ full SpatialOS replacement
 - Max frame size and basic per-peer ingress frame rate limits.
 - WorkerConnect authentication with both legacy shared-token mode and strict
   token-bound region/attribute claims.
+- Global OBS visibility is claim-gated: an OBS peer needs `observer`, `debug`,
+  or `inspector` to see the whole world without an AOI.
 - `godworks-protocol`, `godworks-core`, and `godworks-worker-sdk` alpha crates.
 - `zone_worker` outbound protocol I/O through the Worker SDK, with typed inbound
   handling for authority/rejection/lifecycle-critical frames.
@@ -92,7 +94,6 @@ The product needs a formal security layer:
 - broader worker/client role distinction and authorization policy;
 - stronger mesh authentication beyond the current token-claim baseline;
 - broader per-principal rate-limit policy;
-- observer/global-interest permissions;
 - TLS/mTLS option.
 
 ### 3D
