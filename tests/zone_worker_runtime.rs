@@ -6,6 +6,12 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const W_RUNTIME_TOKEN: &str = "runtime-w-token";
+const E_RUNTIME_TOKEN: &str = "runtime-e-token";
+const INSPECTOR_RUNTIME_TOKEN: &str = "runtime-inspector-token";
+const RUNTIME_AUTH_CLAIMS: &str =
+    "runtime-w-token:W:,runtime-e-token:E:,runtime-inspector-token:MESH:inspector";
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
@@ -44,6 +50,19 @@ fn start_broker(label: &str, port: u16) -> Child {
 }
 
 fn start_broker_with_auth(label: &str, port: u16, auth_token: Option<&str>) -> Child {
+    start_broker_configured(label, port, auth_token, None)
+}
+
+fn start_broker_with_claims(label: &str, port: u16, claims: &str) -> Child {
+    start_broker_configured(label, port, None, Some(claims))
+}
+
+fn start_broker_configured(
+    label: &str,
+    port: u16,
+    auth_token: Option<&str>,
+    claims: Option<&str>,
+) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_godworks_broker"));
     cmd.env("GW_HOST", "127.0.0.1")
         .env("GW_PORT", port.to_string())
@@ -58,6 +77,11 @@ fn start_broker_with_auth(label: &str, port: u16, auth_token: Option<&str>) -> C
         cmd.env("GW_AUTH_TOKEN", token);
     } else {
         cmd.env_remove("GW_AUTH_TOKEN");
+    }
+    if let Some(claims) = claims {
+        cmd.env("GW_AUTH_CLAIMS", claims);
+    } else {
+        cmd.env_remove("GW_AUTH_CLAIMS");
     }
     let child = cmd.spawn().expect("spawn broker");
     wait_for_port(port);
@@ -123,6 +147,7 @@ fn start_worker_with_motion(
     spawn_vel: &str,
     spawn_speed: &str,
     duration: &str,
+    auth_token: Option<&str>,
 ) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zone_worker"));
     cmd.env("GW_ZW_HOST", "127.0.0.1")
@@ -140,6 +165,12 @@ fn start_worker_with_motion(
         .env("GW_ZW_SEED", "4242")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    if let Some(token) = auth_token {
+        cmd.env("GW_ZW_AUTH_TOKEN", token);
+    } else {
+        cmd.env_remove("GW_ZW_AUTH_TOKEN");
+        cmd.env_remove("GW_AUTH_TOKEN");
+    }
     if let Some(b) = spawn_box {
         cmd.env("GW_ZW_SPAWN_BOX", b);
     } else {
@@ -235,19 +266,21 @@ fn read_frame(stream: &mut TcpStream) -> Value {
     serde_json::from_slice(&body).expect("json frame")
 }
 
-fn inspector_frame(port: u16, request_id: &str) -> Value {
+fn inspector_frame_with_auth(port: u16, request_id: &str, auth_token: Option<&str>) -> Value {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect inspector");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set inspector read timeout");
-    stream
-        .write_all(&frame(&json!({
+    let mut connect = json!({
             "op": "WorkerConnect",
             "worker_id": format!("inspector-{request_id}"),
             "region": "MESH",
             "attributes": ["inspector"]
-        })))
-        .expect("connect frame");
+    });
+    if let Some(token) = auth_token {
+        connect["auth_token"] = json!(token);
+    }
+    stream.write_all(&frame(&connect)).expect("connect frame");
     stream
         .write_all(&frame(&json!({
             "op": "InspectorQuery",
@@ -345,20 +378,29 @@ fn create_storm_w_strip_gain_matches_position_derived_region() {
 #[test]
 fn dense_seam_with_matching_e_worker_conserves_authority() {
     let port = free_port();
-    let mut broker = start_broker("dense_seam_conservation", port);
-    let mut east = start_worker(port, "E", "zw-E-conserve", 0, None, "6.0");
+    let mut broker = start_broker_with_claims("dense_seam_conservation", port, RUNTIME_AUTH_CLAIMS);
+    let mut east = start_worker_with_auth(
+        port,
+        "E",
+        "zw-E-conserve",
+        0,
+        None,
+        "6.0",
+        Some(E_RUNTIME_TOKEN),
+    );
     sleep(Duration::from_millis(250));
-    let mut west = start_worker(
+    let mut west = start_worker_with_auth(
         port,
         "W",
         "zw-W-conserve",
         100,
         Some("-18,18,-18,18"),
         "6.0",
+        Some(W_RUNTIME_TOKEN),
     );
     sleep(Duration::from_millis(2200));
 
-    let frame = inspector_frame(port, "dense-seam");
+    let frame = inspector_frame_with_auth(port, "dense-seam", Some(INSPECTOR_RUNTIME_TOKEN));
     stop(&mut west);
     stop(&mut east);
     stop(&mut broker);
@@ -406,8 +448,18 @@ fn dense_seam_with_matching_e_worker_conserves_authority() {
 #[test]
 fn moving_w_bodies_handoff_to_e_with_epoch_fencing_and_no_stale_ownership() {
     let port = free_port();
-    let mut broker = start_broker("moving_w_to_e_lifecycle", port);
-    let east = start_worker_with_motion(port, "E", "zw-E-lifecycle", 0, None, "0,0", "0", "5.0");
+    let mut broker = start_broker_with_claims("moving_w_to_e_lifecycle", port, RUNTIME_AUTH_CLAIMS);
+    let east = start_worker_with_motion(
+        port,
+        "E",
+        "zw-E-lifecycle",
+        0,
+        None,
+        "0,0",
+        "0",
+        "5.0",
+        Some(E_RUNTIME_TOKEN),
+    );
     sleep(Duration::from_millis(250));
     let west = start_worker_with_motion(
         port,
@@ -418,11 +470,12 @@ fn moving_w_bodies_handoff_to_e_with_epoch_fencing_and_no_stale_ownership() {
         "10,0",
         "0",
         "5.0",
+        Some(W_RUNTIME_TOKEN),
     );
 
     let west_out = wait_output(west);
     let east_out = wait_output(east);
-    let frame = inspector_frame(port, "moving-w-to-e");
+    let frame = inspector_frame_with_auth(port, "moving-w-to-e", Some(INSPECTOR_RUNTIME_TOKEN));
     stop(&mut broker);
 
     assert!(

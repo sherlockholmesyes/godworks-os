@@ -56,6 +56,23 @@ fn auth_token() -> Option<String> {
     env::var("GW_AUTH_TOKEN").ok().filter(|s| !s.is_empty())
 }
 
+fn auth_token_for_region(region: &str) -> Option<String> {
+    let region_key: String = region
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    env::var(format!("GW_AUTH_TOKEN_{region_key}"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(auth_token)
+}
+
 fn worker_connect_value(wid: &str, region: &str, attributes: &[&str]) -> Value {
     let mut value = json!({
         "op":"WorkerConnect",
@@ -64,7 +81,7 @@ fn worker_connect_value(wid: &str, region: &str, attributes: &[&str]) -> Value {
         "attributes":attributes,
         "proto":1
     });
-    if let Some(token) = auth_token() {
+    if let Some(token) = auth_token_for_region(region) {
         value["auth_token"] = json!(token);
     }
     value

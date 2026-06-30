@@ -27,12 +27,15 @@ authority, WAL, and epoch fences define the recoverable truth.
 - Ingress cost budget: every registered peer has a token bucket. The cost is
   derived from op class and received wire body length, and is charged before
   dispatch. Rejected ops do not mutate RAM or WAL.
-- WorkerConnect auth: `GW_AUTH_TOKEN` provides a legacy shared-token gate.
+- WorkerConnect auth: `GW_AUTH_TOKEN` provides a legacy shared-token gate for
+  ordinary worker regions only; it does not authorize broker-owned control
+  regions.
 - Token-bound claims: `GW_AUTH_CLAIMS` maps tokens to broker-owned
   region/attribute claims. Peers cannot self-assign a different region or
-  privileged attributes in strict mode.
+  privileged attributes in strict mode, and control regions (`MESH`, `OBS`,
+  `CLIENT`, `STANDBY`) require this claim provenance before registration.
 - Peer role policy: the broker derives an internal role (`worker`, `client`,
-  `observer`, or `mesh`) from broker-owned claims / legacy regions and rejects
+  `observer`, or `mesh`) from broker-owned claims / ordinary worker regions and rejects
   privileged op families before dispatch. Clients cannot lease worker regions,
   observers cannot write entity state, and mesh links can only use mesh-family
   traffic plus liveness.
