@@ -4,6 +4,13 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const W_RLG_TOKEN: &str = "rlg-w-token";
+const E_RLG_TOKEN: &str = "rlg-e-token";
+const OBS_RLG_TOKEN: &str = "rlg-obs-token";
+const CLIENT_RLG_TOKEN: &str = "rlg-client-token";
+const MESH_RLG_TOKEN: &str = "rlg-mesh-token";
+const RLG_AUTH_CLAIMS: &str = "rlg-w-token:W:physics|server,rlg-e-token:E:physics|server,rlg-obs-token:OBS:observer,rlg-client-token:CLIENT:role.client,rlg-mesh-token:MESH:role.mesh";
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
@@ -42,6 +49,7 @@ fn start_broker(
     region: &str,
     mesh: Option<(String, u16)>,
     auth_token: Option<&str>,
+    auth_claims: Option<&str>,
 ) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_godworks_broker"));
     cmd.env("GW_HOST", "127.0.0.1")
@@ -64,6 +72,11 @@ fn start_broker(
         cmd.env("GW_AUTH_TOKEN", token);
     } else {
         cmd.env_remove("GW_AUTH_TOKEN");
+    }
+    if let Some(claims) = auth_claims {
+        cmd.env("GW_AUTH_CLAIMS", claims);
+    } else {
+        cmd.env_remove("GW_AUTH_CLAIMS");
     }
     let child = cmd.spawn().expect("spawn broker");
     wait_for_port(port);
@@ -96,13 +109,19 @@ fn metric_u64(metrics: &HashMap<String, String>, key: &str) -> u64 {
         .unwrap_or_else(|_| panic!("bad integer metric {key}: {metrics:?}"))
 }
 
-fn run_cross_broker_reality_loadgen(auth_token: Option<&str>) {
+fn run_cross_broker_reality_loadgen(auth_claims: Option<&str>) {
     let port_w = free_port();
     let port_e = free_port();
     assert_ne!(port_w, port_e);
 
-    let mut broker_e = start_broker(port_e, "E", None, auth_token);
-    let mut broker_w = start_broker(port_w, "W", Some(("E".to_string(), port_e)), auth_token);
+    let mut broker_e = start_broker(port_e, "E", None, None, auth_claims);
+    let mut broker_w = start_broker(
+        port_w,
+        "W",
+        Some(("E".to_string(), port_e)),
+        None,
+        auth_claims,
+    );
     sleep(Duration::from_millis(900));
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_reality_loadgen"));
@@ -115,10 +134,20 @@ fn run_cross_broker_reality_loadgen(auth_token: Option<&str>) {
         .env("GW_EVENT_BURST", "6")
         .env("GW_REQUIRE_MESH", "1")
         .env("GW_SLOW_VIEWER", "1");
-    if let Some(token) = auth_token {
-        cmd.env("GW_AUTH_TOKEN", token);
+    if auth_claims.is_some() {
+        cmd.env("GW_AUTH_TOKEN_W", W_RLG_TOKEN)
+            .env("GW_AUTH_TOKEN_E", E_RLG_TOKEN)
+            .env("GW_AUTH_TOKEN_OBS", OBS_RLG_TOKEN)
+            .env("GW_AUTH_TOKEN_CLIENT", CLIENT_RLG_TOKEN)
+            .env("GW_AUTH_TOKEN_MESH", MESH_RLG_TOKEN)
+            .env_remove("GW_AUTH_TOKEN");
     } else {
-        cmd.env_remove("GW_AUTH_TOKEN");
+        cmd.env_remove("GW_AUTH_TOKEN")
+            .env_remove("GW_AUTH_TOKEN_W")
+            .env_remove("GW_AUTH_TOKEN_E")
+            .env_remove("GW_AUTH_TOKEN_OBS")
+            .env_remove("GW_AUTH_TOKEN_CLIENT")
+            .env_remove("GW_AUTH_TOKEN_MESH");
     }
     let output = cmd.output().expect("run reality_loadgen");
 
@@ -173,10 +202,10 @@ fn run_cross_broker_reality_loadgen(auth_token: Option<&str>) {
 
 #[test]
 fn cross_broker_reality_loadgen_requires_mesh_adoption() {
-    run_cross_broker_reality_loadgen(None);
+    run_cross_broker_reality_loadgen(Some(RLG_AUTH_CLAIMS));
 }
 
 #[test]
-fn cross_broker_reality_loadgen_with_worker_auth_still_adopts_mesh() {
-    run_cross_broker_reality_loadgen(Some("test-shared-secret"));
+fn cross_broker_reality_loadgen_with_claim_auth_still_adopts_mesh() {
+    run_cross_broker_reality_loadgen(Some(RLG_AUTH_CLAIMS));
 }

@@ -169,6 +169,30 @@ fn parse_connect_auth_claims_env() -> HashMap<String, PeerClaims> {
         .unwrap_or_default()
 }
 
+fn is_broker_owned_attribute(attr: &str) -> bool {
+    matches!(
+        attr,
+        "kernel_admin"
+            | "acl_admin"
+            | "inspector"
+            | "snapshot"
+            | "ops"
+            | "debug"
+            | "observer"
+            | "role.mesh"
+            | "role.observer"
+            | "role.client"
+    )
+}
+
+fn strip_peer_declared_broker_owned_attributes(attributes: &mut HashSet<String>) {
+    attributes.retain(|attr| !is_broker_owned_attribute(attr));
+}
+
+fn broker_owned_connect_region(region: &str) -> bool {
+    matches!(region, "MESH" | "OBS" | "CLIENT" | "STANDBY")
+}
+
 // ── DYNAMIC SPLITTING (load-based capacity-add, not just the W|E boundary-shift) ──
 // A coarse region under sustained high load SPLITS into sub-bands, each owned by a fresh
 // standby worker -- this ADDS capacity (rebalance() only shifts the W|E line between two
@@ -6458,11 +6482,36 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 let mut next = e.clone();
                 ensure_component_authority(&mut next, &comp);
                 let ca = next.authority.get_mut(&comp).unwrap();
+                let current_epoch = ca.epoch;
+                if let Some(expected_epoch) = requested_epoch {
+                    if expected_epoch != current_epoch {
+                        let reason = format!(
+                            "authority_epoch fence mismatch: expected current {current_epoch}, got {expected_epoch}"
+                        );
+                        if let Some(req) = request_id.clone() {
+                            emit(
+                                state,
+                                wid,
+                                json!({"op":"SetComponentAuthorityResponse","request_id":req,
+                                "entity":eid,"comp":comp,"success":false,
+                                "reason":reason,"current_authority_epoch":current_epoch}),
+                            );
+                        } else {
+                            emit(
+                                state,
+                                wid,
+                                json!({"op":"UpdateRejected","entity":eid,"comp":comp,
+                                "reason":reason,"current_authority_epoch":current_epoch}),
+                            );
+                        }
+                        return;
+                    }
+                }
                 if let Some(mode) = mode.clone() {
                     ca.mode = mode;
                 }
                 ca.owner = owner.clone();
-                ca.epoch = requested_epoch.unwrap_or_else(|| ca.epoch.saturating_add(1));
+                ca.epoch = current_epoch.saturating_add(1);
                 next.version = next.version.saturating_add(1);
                 (next.version, ca.epoch, ca.mode.as_wire_str().to_string())
             } else {
@@ -7339,6 +7388,7 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
         (s.connect_auth_token.clone(), s.connect_auth_claims.clone())
     };
     let provided_auth = first.get("auth_token").and_then(|v| v.as_str());
+    let mut used_broker_claims = false;
     match resolve_connect_claims(
         required_auth.as_deref(),
         &configured_claims,
@@ -7349,6 +7399,7 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
         Ok(Some(claims)) => {
             region = claims.region;
             attributes = claims.attributes;
+            used_broker_claims = true;
         }
         Ok(None) => {}
         Err(reason) => {
@@ -7377,6 +7428,36 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
             println!("[broker] worker '{wid}' REJECTED -- auth failed");
             return; // do NOT register; the connection drops as wr/rd go out of scope
         }
+    }
+    if !used_broker_claims {
+        if requested_region.is_some_and(broker_owned_connect_region) {
+            let reason = "broker-owned connect region requires token-bound claim";
+            {
+                let s = state.lock().await;
+                record_replay_tape_connect(
+                    &s,
+                    ReplayConnectRecord {
+                        wid: &wid,
+                        frame: &first,
+                        byte_len: first_byte_len,
+                        region: &region,
+                        attributes: &attributes,
+                        outcome: "rejected",
+                        reason: Some(reason),
+                    },
+                );
+            }
+            let rej = frame(&json!({
+                "op": "AuthReject",
+                "worker_id": wid,
+                "error": "auth_error",
+                "reason": reason
+            }));
+            let _ = wr.write_all(&rej).await;
+            println!("[broker] worker '{wid}' REJECTED -- broker-owned connect region requires token-bound claim");
+            return;
+        }
+        strip_peer_declared_broker_owned_attributes(&mut attributes);
     }
     let role = peer_role_for(&region, &attributes);
 
@@ -8958,6 +9039,327 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(derived.region, "W");
+    }
+
+    #[test]
+    fn peer_declared_broker_owned_attributes_are_stripped() {
+        let mut attributes = HashSet::from([
+            "physics".to_string(),
+            "kernel_admin".to_string(),
+            "acl_admin".to_string(),
+            "inspector".to_string(),
+            "role.client".to_string(),
+        ]);
+
+        strip_peer_declared_broker_owned_attributes(&mut attributes);
+
+        assert!(attributes.contains("physics"));
+        assert!(!attributes.contains("kernel_admin"));
+        assert!(!attributes.contains("acl_admin"));
+        assert!(!attributes.contains("inspector"));
+        assert!(!attributes.contains("role.client"));
+    }
+
+    #[tokio::test]
+    async fn worker_connect_peer_declared_kernel_admin_is_not_registered() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"fake-admin",
+                "region":"W",
+                "attributes":["physics","kernel_admin"]
+            })))
+            .await
+            .unwrap();
+
+        let mut registered_without_privilege = false;
+        for _ in 0..20 {
+            {
+                let s = state.lock().await;
+                registered_without_privilege = s.workers.get("fake-admin").is_some_and(|w| {
+                    w.attributes.contains("physics") && !w.attributes.contains("kernel_admin")
+                });
+            }
+            if registered_without_privilege {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registered_without_privilege,
+            "peer-declared attributes may carry ordinary project claims, but broker-owned privileges must not register from JSON"
+        );
+
+        client
+            .write_all(&frame(&json!({"op":"Disconnect"})))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_connect_shared_token_does_not_grant_kernel_admin() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            s.connect_auth_token = Some("shared".to_string());
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"shared-token-peer",
+                "region":"W",
+                "attributes":["physics","kernel_admin"],
+                "auth_token":"shared"
+            })))
+            .await
+            .unwrap();
+
+        let mut registered_without_privilege = false;
+        for _ in 0..20 {
+            {
+                let s = state.lock().await;
+                registered_without_privilege =
+                    s.workers.get("shared-token-peer").is_some_and(|w| {
+                        w.attributes.contains("physics") && !w.attributes.contains("kernel_admin")
+                    });
+            }
+            if registered_without_privilege {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registered_without_privilege,
+            "GW_AUTH_TOKEN authenticates membership only; broker-owned privileges require GW_AUTH_CLAIMS"
+        );
+
+        client
+            .write_all(&frame(&json!({"op":"Disconnect"})))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_connect_peer_declared_mesh_region_requires_claim() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"fake-mesh",
+                "region":"MESH"
+            })))
+            .await
+            .unwrap();
+
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await.unwrap();
+        let n = u32::from_be_bytes(hdr) as usize;
+        let mut body = vec![0u8; n];
+        client.read_exact(&mut body).await.unwrap();
+        let reject: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(reject["op"], "AuthReject");
+        assert_eq!(reject["worker_id"], "fake-mesh");
+        assert_eq!(
+            reject["reason"],
+            "broker-owned connect region requires token-bound claim"
+        );
+        server.await.unwrap();
+
+        let s = state.lock().await;
+        assert!(
+            !s.workers.contains_key("fake-mesh"),
+            "peer-declared MESH must not register as a mesh role"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_connect_shared_token_cannot_claim_mesh_region() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            s.connect_auth_token = Some("shared".to_string());
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"shared-token-mesh",
+                "region":"MESH",
+                "auth_token":"shared"
+            })))
+            .await
+            .unwrap();
+
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await.unwrap();
+        let n = u32::from_be_bytes(hdr) as usize;
+        let mut body = vec![0u8; n];
+        client.read_exact(&mut body).await.unwrap();
+        let reject: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(reject["op"], "AuthReject");
+        assert_eq!(
+            reject["reason"],
+            "broker-owned connect region requires token-bound claim"
+        );
+        server.await.unwrap();
+
+        let s = state.lock().await;
+        assert!(!s.workers.contains_key("shared-token-mesh"));
+    }
+
+    #[tokio::test]
+    async fn worker_connect_claim_token_can_register_mesh_region() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            s.connect_auth_claims.insert(
+                "mesh-secret".to_string(),
+                PeerClaims {
+                    region: "MESH".to_string(),
+                    attributes: HashSet::from(["role.mesh".to_string()]),
+                },
+            );
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"mesh-link",
+                "auth_token":"mesh-secret"
+            })))
+            .await
+            .unwrap();
+
+        let mut registered_as_mesh = false;
+        for _ in 0..20 {
+            {
+                let s = state.lock().await;
+                registered_as_mesh = s.workers.get("mesh-link").is_some_and(|w| {
+                    w.region == "MESH"
+                        && w.role == PeerRole::Mesh
+                        && w.attributes.contains("role.mesh")
+                });
+            }
+            if registered_as_mesh {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registered_as_mesh,
+            "token-bound claims, not peer JSON, grant the mesh role"
+        );
+
+        client
+            .write_all(&frame(&json!({"op":"Disconnect"})))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_connect_claim_token_can_register_kernel_admin() {
+        let state = Arc::new(Mutex::new(ServerState::new(30.0)));
+        {
+            let mut s = state.lock().await;
+            s.connect_auth_claims.insert(
+                "admin-secret".to_string(),
+                PeerClaims {
+                    region: "OBS".to_string(),
+                    attributes: HashSet::from(["kernel_admin".to_string()]),
+                },
+            );
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_conn(sock, server_state).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&frame(&json!({
+                "op":"WorkerConnect",
+                "worker_id":"admin",
+                "auth_token":"admin-secret"
+            })))
+            .await
+            .unwrap();
+
+        let mut registered_with_privilege = false;
+        for _ in 0..20 {
+            {
+                let s = state.lock().await;
+                registered_with_privilege = s
+                    .workers
+                    .get("admin")
+                    .is_some_and(|w| w.region == "OBS" && w.attributes.contains("kernel_admin"));
+            }
+            if registered_with_privilege {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registered_with_privilege,
+            "broker-owned claims, not peer JSON, are allowed to grant kernel_admin"
+        );
+
+        client
+            .write_all(&frame(&json!({"op":"Disconnect"})))
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -11369,6 +11771,141 @@ mod tests {
             .contains_key("loot"));
         assert_eq!(remove_state.entities["crate"].version, 1);
         assert!(remove_state.wal_degraded);
+    }
+
+    #[test]
+    fn set_component_authority_rejects_authority_epoch_rewind() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        let mut admin_rx = add_test_worker_with_rx(&mut state, "admin", "OBS");
+        state
+            .workers
+            .get_mut("admin")
+            .unwrap()
+            .attributes
+            .insert("kernel_admin".to_string());
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        set_component_authority_epoch(state.entities.get_mut("ship").unwrap(), "pos", 9);
+        grant_authority(&mut state, "w1", "ship", "pos");
+
+        dispatch_test_frame(
+            &mut state,
+            "admin",
+            &json!({"op":"SetComponentAuthority","request_id":"rewind",
+                "entity":"ship","comp":"pos","owner":"w2","authority_epoch":3}),
+        );
+
+        let response = decode_test_frame(&admin_rx.try_recv().expect("admin response"));
+        assert_eq!(response["op"], "SetComponentAuthorityResponse");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["current_authority_epoch"], 9);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w1".to_string())
+        );
+        assert_eq!(component_authority_epoch(&state.entities["ship"], "pos"), 9);
+        assert!(state.workers["w1"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "pos")));
+        assert!(!state.workers["w2"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "pos")));
+    }
+
+    #[test]
+    fn set_component_authority_current_epoch_bumps_epoch() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        let mut admin_rx = add_test_worker_with_rx(&mut state, "admin", "OBS");
+        state
+            .workers
+            .get_mut("admin")
+            .unwrap()
+            .attributes
+            .insert("kernel_admin".to_string());
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        set_component_authority_epoch(state.entities.get_mut("ship").unwrap(), "pos", 9);
+        grant_authority(&mut state, "w1", "ship", "pos");
+
+        dispatch_test_frame(
+            &mut state,
+            "admin",
+            &json!({"op":"SetComponentAuthority","request_id":"cas",
+                "entity":"ship","comp":"pos","owner":"w2","authority_epoch":9}),
+        );
+
+        let response = decode_test_frame(&admin_rx.try_recv().expect("admin response"));
+        assert_eq!(response["op"], "SetComponentAuthorityResponse");
+        assert_eq!(response["success"], true);
+        assert_eq!(response["authority_epoch"], 10);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w2".to_string())
+        );
+        assert_eq!(
+            component_authority_epoch(&state.entities["ship"], "pos"),
+            10
+        );
+        assert!(!state.workers["w1"]
+            .authority_epochs
+            .contains_key(&authority_key("ship", "pos")));
+        assert_eq!(
+            state.workers["w2"]
+                .authority_epochs
+                .get(&authority_key("ship", "pos")),
+            Some(&10)
+        );
+    }
+
+    #[test]
+    fn set_component_authority_omitted_epoch_bumps_from_current_epoch() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        let mut admin_rx = add_test_worker_with_rx(&mut state, "admin", "OBS");
+        state
+            .workers
+            .get_mut("admin")
+            .unwrap()
+            .attributes
+            .insert("kernel_admin".to_string());
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        set_component_authority_epoch(state.entities.get_mut("ship").unwrap(), "pos", 12);
+        grant_authority(&mut state, "w1", "ship", "pos");
+
+        dispatch_test_frame(
+            &mut state,
+            "admin",
+            &json!({"op":"SetComponentAuthority","request_id":"omitted",
+                "entity":"ship","comp":"pos","owner":"w2"}),
+        );
+
+        let response = decode_test_frame(&admin_rx.try_recv().expect("admin response"));
+        assert_eq!(response["op"], "SetComponentAuthorityResponse");
+        assert_eq!(response["success"], true);
+        assert_eq!(response["authority_epoch"], 13);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w2".to_string())
+        );
+        assert_eq!(
+            component_authority_epoch(&state.entities["ship"], "pos"),
+            13
+        );
+        assert_eq!(
+            state.workers["w2"]
+                .authority_epochs
+                .get(&authority_key("ship", "pos")),
+            Some(&13)
+        );
     }
 
     #[test]

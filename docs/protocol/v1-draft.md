@@ -48,6 +48,10 @@ the matching `auth_token` string. A missing or mismatched token receives:
 
 The peer is not registered and does not claim region ownership.
 
+The shared token is a legacy/dev membership gate. It does not let a peer
+self-assign broker-owned control regions such as `MESH`, `OBS`, `CLIENT`, or
+`STANDBY`; those regions require token-bound claims.
+
 For private-alpha / production-style runs, prefer `GW_AUTH_CLAIMS` over the
 single shared token. `GW_AUTH_CLAIMS` maps each token to broker-owned
 connection claims:
@@ -90,6 +94,10 @@ OBS or role.observer   -> observer
 CLIENT or role.client  -> client
 otherwise              -> worker
 ```
+
+`MESH`, `OBS`, `CLIENT`, and `STANDBY` are broker-owned region labels. A peer
+can receive those labels only from `GW_AUTH_CLAIMS`; peer-declared control
+regions are rejected before registration.
 
 Roles are an authorization boundary, not a replacement for component authority.
 A `client` may send `CommandRequest`, `Interest`, `EntityQuery`, and
