@@ -10,7 +10,7 @@ use godworks_protocol::{
     AddComponent, AddEntity, AuthorityChange, BatchUpdate, ComponentUpdate, CriticalSection,
     EntityQueryResponse, JsonFields, MeshGhost, Op, RemoveComponent, RemoveEntity, UpdateRejected,
 };
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
 /// Latest known authority state for one component from this client's view.
@@ -102,6 +102,53 @@ pub struct ClientBridgeSnapshot {
     pub entity_count: usize,
     pub rejection_count: usize,
     pub entities: Vec<ClientEntityView>,
+}
+
+impl ClientBridgeSnapshot {
+    /// Export the stable engine-bridge contract consumed by probe fixtures.
+    ///
+    /// This intentionally keeps the fixture shape owned by the Rust bridge
+    /// instead of making each engine-side probe invent a parallel snapshot
+    /// contract.
+    pub fn to_contract_value(&self) -> Value {
+        let entities: Vec<Value> = self
+            .entities
+            .iter()
+            .map(|row| {
+                let component_keys: Vec<_> = row.components.keys().cloned().collect();
+                let authority: Map<String, Value> = row
+                    .authority
+                    .iter()
+                    .map(|(component, auth)| {
+                        (
+                            component.clone(),
+                            json!({
+                                "authoritative": auth.authoritative,
+                                "authority_epoch": auth.authority_epoch,
+                                "mode": auth.mode,
+                            }),
+                        )
+                    })
+                    .collect();
+                json!({
+                    "entity": row.entity,
+                    "ghost": row.ghost,
+                    "owner_region": row.owner_region,
+                    "position2": row.position2,
+                    "component_keys": component_keys,
+                    "authority": authority,
+                })
+            })
+            .collect();
+
+        json!({
+            "phase": format!("{:?}", self.phase),
+            "critical_depth": self.critical_depth,
+            "entity_count": self.entity_count,
+            "rejection_count": self.rejection_count,
+            "entities": entities,
+        })
+    }
 }
 
 /// Transport-free bridge facade for engine integrations.
@@ -1054,7 +1101,7 @@ mod tests {
         }
 
         assert_eq!(
-            bridge_snapshot_contract_value(&bridge.snapshot()),
+            bridge.snapshot().to_contract_value(),
             fixture
                 .get("expected_snapshot")
                 .expect("expected_snapshot object")
@@ -1087,45 +1134,5 @@ mod tests {
             cache.connection_phase(),
             ClientConnectionPhase::Disconnected
         );
-    }
-
-    fn bridge_snapshot_contract_value(snapshot: &ClientBridgeSnapshot) -> Value {
-        let entities: Vec<Value> = snapshot
-            .entities
-            .iter()
-            .map(|row| {
-                let component_keys: Vec<_> = row.components.keys().cloned().collect();
-                let authority: Map<String, Value> = row
-                    .authority
-                    .iter()
-                    .map(|(component, auth)| {
-                        (
-                            component.clone(),
-                            json!({
-                                "authoritative": auth.authoritative,
-                                "authority_epoch": auth.authority_epoch,
-                                "mode": auth.mode,
-                            }),
-                        )
-                    })
-                    .collect();
-                json!({
-                    "entity": row.entity,
-                    "ghost": row.ghost,
-                    "owner_region": row.owner_region,
-                    "position2": row.position2,
-                    "component_keys": component_keys,
-                    "authority": authority,
-                })
-            })
-            .collect();
-
-        json!({
-            "phase": format!("{:?}", snapshot.phase),
-            "critical_depth": snapshot.critical_depth,
-            "entity_count": snapshot.entity_count,
-            "rejection_count": snapshot.rejection_count,
-            "entities": entities,
-        })
     }
 }

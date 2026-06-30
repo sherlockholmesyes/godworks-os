@@ -66,6 +66,9 @@ Godot, Unity, or custom engine binding:
 The bridge owns one `ClientCache`. Engine bindings should read
 `ClientBridge::snapshot()` and react to `ClientBridgeEvent` instead of
 maintaining a second, parallel cache in engine scripts.
+`ClientBridgeSnapshot::to_contract_value()` owns the stable JSON contract used
+by the shared Godot probe fixture, so engine-side probes do not define a second
+snapshot shape.
 
 Two fail-under-broken tests pin the contract:
 
@@ -79,11 +82,14 @@ Two fail-under-broken tests pin the contract:
 The shared bridge transcript fixture is
 `tests/fixtures/client_bridge/godot-resync-contract.json`. It is intentionally
 wire-shaped JSON decoded through `godworks-protocol` and replayed into
-`ClientBridge`. A Godot bridge should use this fixture as its first behavior
-contract before adding scene-node lifecycle:
+`ClientBridge`; the expected snapshot is produced by the Rust bridge contract
+export, not by a separate test-only schema. A Godot bridge should use this
+fixture as its first behavior contract before adding scene-node lifecycle:
 
 - stale stream rows are cleared on reconnect;
 - the full checkout becomes the canonical live view;
+- live `BatchUpdate` frames after the checkout mutate the same component rows as
+  single `ComponentUpdate` frames;
 - ghost rows remain read-only projections with no local authority;
 - snapshot row ordering is deterministic for simple engine diffing.
 

@@ -80,6 +80,34 @@ func apply_stream_op(op: Dictionary) -> void:
 			var row := _ensure_row(entity)
 			row["components"][component] = op.get("value", null)
 			_refresh_metadata(row)
+		"BatchUpdate":
+			var component := str(op.get("comp", op.get("component", "")))
+			if component == "":
+				return
+			var updates = op.get("updates", [])
+			if updates is Array:
+				for update in updates:
+					var entry_entity := ""
+					var value = null
+					if update is Array and update.size() >= 2:
+						entry_entity = str(update[0])
+						value = update[1]
+					elif update is Dictionary:
+						entry_entity = str(update.get("entity", ""))
+						value = update.get("value", null)
+					if entry_entity == "":
+						continue
+					var entry_row := _ensure_row(entry_entity)
+					entry_row["components"][component] = value
+					_refresh_metadata(entry_row)
+			elif updates is Dictionary:
+				for entity_key in updates.keys():
+					var map_entity := str(entity_key)
+					if map_entity == "":
+						continue
+					var map_row := _ensure_row(map_entity)
+					map_row["components"][component] = updates[entity_key]
+					_refresh_metadata(map_row)
 		"UpdateRejected":
 			rejections.append({
 				"entity": op.get("entity", null),
