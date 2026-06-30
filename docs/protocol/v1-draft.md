@@ -13,13 +13,14 @@ Current frame format:
 JSON body of exactly that length
 ```
 
-Immediate hardening requirement:
+Current hardening requirement:
 
 ```text
 A broker must reject oversized frames before allocating the full body.
+A broker must reject peers that exceed their inbound frame budget before the op is dispatched.
 ```
 
-The typed protocol crate now exposes `DEFAULT_MAX_FRAME_BYTES`; broker enforcement still needs to be wired into the frame reader.
+The typed protocol crate exposes `DEFAULT_MAX_FRAME_BYTES`; broker enforcement is wired into the frame reader. The broker also applies a per-peer token bucket (`GW_INGRESS_RATE_PER_SEC`, `GW_INGRESS_BURST_FRAMES`) and returns structured `rate_limit_error` rejections when a peer exhausts its frame budget.
 
 ## Version negotiation
 
@@ -167,5 +168,6 @@ conflict
 - [x] Add max frame size constant.
 - [x] Complete typed JSON coverage for the current v1 runtime operation families.
 - [x] Wire broker frame reader to `DEFAULT_MAX_FRAME_BYTES`.
+- [x] Add basic broker ingress frame rate limit.
 - [ ] Replace raw JSON construction in `zone_worker` with typed SDK calls.
 - [ ] Keep protocol docs synchronized with the typed enum.
