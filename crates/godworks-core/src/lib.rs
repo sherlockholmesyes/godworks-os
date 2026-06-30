@@ -50,6 +50,12 @@ impl AsRef<str> for ComponentName {
     }
 }
 
+/// Current spatial schema version carried by replay/snapshot artifacts.
+pub const SPATIAL_SCHEMA_VERSION: u64 = 1;
+
+/// Current coordinate codec version carried by replay/snapshot artifacts.
+pub const COORDINATE_CODEC_VERSION: u64 = 1;
+
 /// Stable numeric identity for a component schema.
 ///
 /// The current JSON wire still uses component names such as `pos` and `vel`.
@@ -296,6 +302,100 @@ impl ComponentRegistry {
 
     pub fn id_for_name(&self, name: &str) -> Option<ComponentId> {
         self.resolve_name(name).map(|schema| schema.id)
+    }
+}
+
+/// Spatial dimension contract for replay/snapshot artifacts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpatialDim {
+    D2,
+}
+
+impl SpatialDim {
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::D2 => "D2",
+        }
+    }
+
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        match value {
+            "D2" => Some(Self::D2),
+            _ => None,
+        }
+    }
+}
+
+/// Coordinate codec contract for replay/snapshot artifacts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinateCodec {
+    DebugF64_2,
+}
+
+impl CoordinateCodec {
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::DebugF64_2 => "debug_f64_2",
+        }
+    }
+
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        match value {
+            "debug_f64_2" => Some(Self::DebugF64_2),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartitionSchemaError {
+    ZeroGridDimension,
+}
+
+/// Partition topology contract. This describes artifact/schema shape, not the
+/// full runtime partition map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartitionSchema {
+    Strip1D { boundary_count: u64 },
+    Grid2D { cols: u64, rows: u64 },
+}
+
+impl PartitionSchema {
+    pub const fn strip1d(boundary_count: u64) -> Self {
+        Self::Strip1D { boundary_count }
+    }
+
+    pub const fn grid2d(cols: u64, rows: u64) -> Result<Self, PartitionSchemaError> {
+        if cols == 0 || rows == 0 {
+            Err(PartitionSchemaError::ZeroGridDimension)
+        } else {
+            Ok(Self::Grid2D { cols, rows })
+        }
+    }
+
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Strip1D { .. } => "strip1d",
+            Self::Grid2D { .. } => "grid2d",
+        }
+    }
+}
+
+/// The current spatial artifact contract shared by replay and snapshot rails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpatialSchema {
+    pub spatial_dim: SpatialDim,
+    pub coordinate_codec: CoordinateCodec,
+    pub partition_schema: PartitionSchema,
+}
+
+impl SpatialSchema {
+    pub const fn current_2d(partition_schema: PartitionSchema) -> Self {
+        Self {
+            spatial_dim: SpatialDim::D2,
+            coordinate_codec: CoordinateCodec::DebugF64_2,
+            partition_schema,
+        }
     }
 }
 
@@ -569,5 +669,35 @@ mod tests {
             ComponentRegistry::new(&duplicate_name),
             Err(ComponentRegistryError::DuplicateName { .. })
         ));
+    }
+
+    #[test]
+    fn partition_schema_rejects_zero_grid_dimensions() {
+        assert_eq!(
+            PartitionSchema::grid2d(0, 2),
+            Err(PartitionSchemaError::ZeroGridDimension)
+        );
+        assert_eq!(
+            PartitionSchema::grid2d(2, 0),
+            Err(PartitionSchemaError::ZeroGridDimension)
+        );
+        assert_eq!(
+            PartitionSchema::grid2d(2, 3),
+            Ok(PartitionSchema::Grid2D { cols: 2, rows: 3 })
+        );
+    }
+
+    #[test]
+    fn current_spatial_schema_pins_d2_debug_f64_2() {
+        let schema = SpatialSchema::current_2d(PartitionSchema::strip1d(1));
+
+        assert_eq!(SPATIAL_SCHEMA_VERSION, 1);
+        assert_eq!(COORDINATE_CODEC_VERSION, 1);
+        assert_eq!(schema.spatial_dim.as_wire_str(), "D2");
+        assert_eq!(schema.coordinate_codec.as_wire_str(), "debug_f64_2");
+        assert_eq!(
+            schema.partition_schema,
+            PartitionSchema::Strip1D { boundary_count: 1 }
+        );
     }
 }
