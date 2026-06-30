@@ -1,0 +1,14 @@
+[package]
+name = "godworks-client-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Minimal headless client cache for Godworks OS over the typed v1 protocol."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+godworks-core = { path = "../godworks-core" }
+godworks-protocol = { path = "../godworks-protocol" }
+serde_json = { version = "1", features = ["preserve_order"] }

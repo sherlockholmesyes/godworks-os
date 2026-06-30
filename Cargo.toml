@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/godworks-client-sdk",
     "crates/godworks-core",
     "crates/godworks-protocol",
     "crates/godworks-worker-sdk",
