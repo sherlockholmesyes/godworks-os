@@ -8,7 +8,7 @@
 use godworks_core::{ComponentName, EntityId};
 use godworks_protocol::{
     AddComponent, AddEntity, AuthorityChange, BatchUpdate, ComponentUpdate, CriticalSection,
-    JsonFields, MeshGhost, Op, RemoveComponent, RemoveEntity, UpdateRejected,
+    EntityQueryResponse, JsonFields, MeshGhost, Op, RemoveComponent, RemoveEntity, UpdateRejected,
 };
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -62,12 +62,23 @@ pub enum ClientCacheEvent {
     CriticalSectionChanged { depth: usize },
 }
 
+/// High-level lifecycle phase for a transport/engine using the cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClientConnectionPhase {
+    #[default]
+    Disconnected,
+    Connecting,
+    Resyncing,
+    Live,
+}
+
 /// Transport-free cache for a Godworks client/observer stream.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClientCache {
     entities: BTreeMap<EntityId, ClientEntity>,
     rejections: Vec<ClientRejection>,
     critical_depth: usize,
+    connection_phase: ClientConnectionPhase,
 }
 
 impl ClientCache {
@@ -85,6 +96,10 @@ impl ClientCache {
 
     pub fn rejections(&self) -> &[ClientRejection] {
         &self.rejections
+    }
+
+    pub fn connection_phase(&self) -> ClientConnectionPhase {
+        self.connection_phase
     }
 
     pub fn entity(&self, entity: impl AsRef<str>) -> Option<&ClientEntity> {
@@ -107,6 +122,45 @@ impl ClientCache {
         self.entity(entity).map(|e| e.ghost).unwrap_or(false)
     }
 
+    /// Clears all stream-derived state after a transport disconnect.
+    ///
+    /// A reconnect must not reuse authority epochs, ghost mirrors, rejections,
+    /// or critical-section state from an old broker connection.
+    pub fn reset_for_reconnect(&mut self) {
+        self.clear_stream_state();
+        self.connection_phase = ClientConnectionPhase::Disconnected;
+    }
+
+    pub fn mark_connecting(&mut self) {
+        self.connection_phase = ClientConnectionPhase::Connecting;
+    }
+
+    /// Starts a fresh checkout/requery pass.
+    pub fn begin_resync(&mut self) {
+        self.clear_stream_state();
+        self.connection_phase = ClientConnectionPhase::Resyncing;
+    }
+
+    /// Rebuilds the cache from a full `EntityQueryResponse` checkout.
+    ///
+    /// This is intentionally explicit instead of running from `apply_op`:
+    /// ordinary query responses may be partial, while reconnect resync needs a
+    /// canonical full cut that replaces the old view.
+    pub fn finish_resync_from_query_response(&mut self, response: &EntityQueryResponse) -> usize {
+        self.clear_stream_state();
+        if let Some(Value::Array(rows)) = response.fields.get("entities") {
+            for row in rows {
+                self.ingest_query_response_row(row);
+            }
+        }
+        self.connection_phase = ClientConnectionPhase::Live;
+        self.entities.len()
+    }
+
+    pub fn mark_live(&mut self) {
+        self.connection_phase = ClientConnectionPhase::Live;
+    }
+
     pub fn apply_op(&mut self, op: &Op) -> ClientCacheEvent {
         match op {
             Op::AddEntity(op) => self.apply_add_entity(op),
@@ -122,6 +176,38 @@ impl ClientCache {
             Op::MeshGhostRemove(op) => self.apply_mesh_ghost_remove(&op.fields),
             _ => ClientCacheEvent::Ignored,
         }
+    }
+
+    fn clear_stream_state(&mut self) {
+        self.entities.clear();
+        self.rejections.clear();
+        self.critical_depth = 0;
+    }
+
+    fn ingest_query_response_row(&mut self, value: &Value) {
+        let Some(row_obj) = value.as_object() else {
+            return;
+        };
+        let Some(entity) = row_obj.get("entity").and_then(Value::as_str) else {
+            return;
+        };
+        let mut row = ClientEntity::default();
+        if let Some(components) = row_obj.get("components") {
+            merge_component_bag(&mut row, components);
+        }
+        for top_level_component in ["pos", "vel", "region", "ghost", "owner_region"] {
+            if let Some(component_value) = row_obj.get(top_level_component) {
+                row.components.insert(
+                    ComponentName::from(top_level_component),
+                    component_value.clone(),
+                );
+            }
+        }
+        if let Some(authority) = row_obj.get("authority").and_then(Value::as_object) {
+            merge_authority_map(&mut row, authority);
+        }
+        refresh_metadata(&mut row);
+        self.entities.insert(EntityId::from(entity), row);
     }
 
     fn apply_add_entity(&mut self, op: &AddEntity) -> ClientCacheEvent {
@@ -273,6 +359,32 @@ fn merge_component_map(row: &mut ClientEntity, components: &Map<String, Value>) 
             .insert(ComponentName::from(name.clone()), value.clone());
     }
     refresh_metadata(row);
+}
+
+fn merge_authority_map(row: &mut ClientEntity, authority: &Map<String, Value>) {
+    for (component, spec) in authority {
+        let Some(spec) = spec.as_object() else {
+            continue;
+        };
+        let epoch = spec
+            .get("authority_epoch")
+            .or_else(|| spec.get("epoch"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mode = spec
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        row.authority.insert(
+            ComponentName::from(component.clone()),
+            ClientAuthority {
+                authoritative: true,
+                authority_epoch: epoch,
+                mode,
+            },
+        );
+    }
 }
 
 fn refresh_metadata(row: &mut ClientEntity) {
@@ -453,5 +565,169 @@ mod tests {
             entity: Some(EntityId::from("ship")),
         }));
         assert_eq!(cache.critical_depth(), 0);
+    }
+
+    #[test]
+    fn cache_reset_for_reconnect_clears_entities_authority_rejections_and_ghosts() {
+        let mut cache = ClientCache::new();
+        cache.apply_op(&Op::AddEntity(AddEntity {
+            entity: EntityId::from("ship"),
+            components: Some(json!({"pos":[1.0,2.0]})),
+        }));
+        cache.apply_op(&Op::AuthorityChange(AuthorityChange {
+            entity: EntityId::from("ship"),
+            component: ComponentName::from("pos"),
+            authoritative: true,
+            authority_epoch: 3,
+            mode: "server_physics_island".to_string(),
+            fields: JsonFields { fields: Map::new() },
+        }));
+        cache.apply_op(&Op::MeshGhost(MeshGhost {
+            fields: JsonFields {
+                fields: Map::from_iter([
+                    ("entity".to_string(), json!("remote")),
+                    ("pos".to_string(), json!([9.0, 1.0])),
+                    ("owner_region".to_string(), json!("E")),
+                ]),
+            },
+        }));
+        cache.apply_op(&Op::UpdateRejected(UpdateRejected {
+            entity: Some(EntityId::from("ship")),
+            component: Some(ComponentName::from("pos")),
+            reason: "stale".to_string(),
+            fields: JsonFields { fields: Map::new() },
+        }));
+        cache.apply_op(&Op::CriticalSection(CriticalSection {
+            phase: "begin".to_string(),
+            entity: Some(EntityId::from("ship")),
+        }));
+        cache.mark_live();
+
+        cache.reset_for_reconnect();
+
+        assert_eq!(
+            cache.connection_phase(),
+            ClientConnectionPhase::Disconnected
+        );
+        assert_eq!(cache.entity_count(), 0);
+        assert!(cache.rejections().is_empty());
+        assert_eq!(cache.critical_depth(), 0);
+        assert!(!cache.contains("ship"));
+        assert!(!cache.contains("remote"));
+    }
+
+    #[test]
+    fn cache_applies_full_recheckout_after_reset_without_duplicates() {
+        let mut cache = ClientCache::new();
+        cache.apply_op(&Op::AddEntity(AddEntity {
+            entity: EntityId::from("ship"),
+            components: Some(json!({"pos":[99.0,99.0]})),
+        }));
+        cache.reset_for_reconnect();
+        cache.mark_connecting();
+        cache.begin_resync();
+
+        let count = cache.finish_resync_from_query_response(&EntityQueryResponse {
+            fields: JsonFields {
+                fields: Map::from_iter([
+                    ("request_id".to_string(), json!("checkout-1")),
+                    (
+                        "entities".to_string(),
+                        json!([
+                            {
+                                "entity":"ship",
+                                "pos":[1.0,2.0],
+                                "components":{"kind":"sloop"},
+                                "region":"W",
+                                "authority":{"pos":{"owner":"zw-W","authority_epoch":7,"mode":"server_physics_island"}}
+                            },
+                            {
+                                "entity":"remote",
+                                "pos":[9.0,1.0],
+                                "components":{"kind":"ghosted"},
+                                "ghost":true,
+                                "owner_region":"E",
+                                "authority":{}
+                            }
+                        ]),
+                    ),
+                ]),
+            },
+        });
+
+        assert_eq!(count, 2);
+        assert_eq!(cache.connection_phase(), ClientConnectionPhase::Live);
+        assert_eq!(cache.entity_count(), 2);
+        assert_eq!(cache.position2("ship"), Some([1.0, 2.0]));
+        assert_eq!(cache.component("ship", "kind"), Some(&json!("sloop")));
+        assert_eq!(cache.component("ship", "region"), Some(&json!("W")));
+        let authority = cache
+            .entity("ship")
+            .and_then(|entity| entity.authority.get(&ComponentName::from("pos")))
+            .expect("resynced authority");
+        assert_eq!(authority.authority_epoch, 7);
+        assert_eq!(authority.mode, "server_physics_island");
+        assert!(authority.authoritative);
+        assert!(cache.is_ghost("remote"));
+        assert_eq!(
+            cache
+                .entity("remote")
+                .and_then(|entity| entity.owner_region.as_deref()),
+            Some("E")
+        );
+    }
+
+    #[test]
+    fn cache_reconnect_resync_removes_entities_absent_from_new_checkout() {
+        let mut cache = ClientCache::new();
+        cache.apply_op(&Op::AddEntity(AddEntity {
+            entity: EntityId::from("stale"),
+            components: Some(json!({"pos":[0.0,0.0]})),
+        }));
+        cache.apply_op(&Op::AddEntity(AddEntity {
+            entity: EntityId::from("fresh"),
+            components: Some(json!({"pos":[1.0,1.0]})),
+        }));
+
+        cache.begin_resync();
+        cache.finish_resync_from_query_response(&EntityQueryResponse {
+            fields: JsonFields {
+                fields: Map::from_iter([(
+                    "entities".to_string(),
+                    json!([{"entity":"fresh","pos":[2.0,3.0],"components":{},"authority":{}}]),
+                )]),
+            },
+        });
+
+        assert!(!cache.contains("stale"));
+        assert!(cache.contains("fresh"));
+        assert_eq!(cache.position2("fresh"), Some([2.0, 3.0]));
+    }
+
+    #[test]
+    fn cache_critical_section_depth_never_underflows_across_reconnect() {
+        let mut cache = ClientCache::new();
+        cache.apply_op(&Op::CriticalSection(CriticalSection {
+            phase: "end".to_string(),
+            entity: None,
+        }));
+        assert_eq!(cache.critical_depth(), 0);
+
+        cache.apply_op(&Op::CriticalSection(CriticalSection {
+            phase: "begin".to_string(),
+            entity: None,
+        }));
+        assert_eq!(cache.critical_depth(), 1);
+        cache.reset_for_reconnect();
+        cache.apply_op(&Op::CriticalSection(CriticalSection {
+            phase: "end".to_string(),
+            entity: None,
+        }));
+
+        assert_eq!(cache.critical_depth(), 0);
+        assert_eq!(
+            cache.connection_phase(),
+            ClientConnectionPhase::Disconnected
+        );
     }
 }
