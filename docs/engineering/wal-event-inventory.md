@@ -47,7 +47,7 @@ Current replay path:
 | Direct append + sync | single lifecycle/admin transitions | `wal_append` must succeed before RAM mutation or response |
 | Staged append + group sync | high-rate writes, local handoff, failover, block migration | append `nosync`, stage RAM, `wal_sync` once, then apply canonical RAM and publish |
 | Cross-broker seam | `mesh_out` / `mesh_acked` | source writes and fsyncs `mesh_out` before target can adopt; ack is durable before clearing resend state |
-| Compaction snapshot | bounded WAL size | rewrite live entities as `register`, preserve tombstones, preserve latest topology |
+| Compaction snapshot | bounded WAL size | rewrite live entities as `register`, preserve tombstones, preserve mesh-forwarded fences, preserve latest topology |
 
 If any persistent transition cannot cross its durability barrier, the broker
 goes fail-closed for persistent ops and does not publish success.
@@ -69,6 +69,7 @@ goes fail-closed for persistent ops and does not publish success.
 | `block_migration` | 2D rebalance block migration | atomically migrate a whole block's grants | whole block is one staged transition, not per-entity |
 | `mesh_out` | source cross-broker forward | remove local copy and rebuild pending resend state until acked | source-durable-gen gate prevents neighbour adopting unrecoverable state |
 | `mesh_acked` | source after target acknowledgement | clear pending resend state and keep local copy absent | WAL failure keeps pending handoff for resend |
+| `mesh_forwarded_fence` | compaction snapshot after completed onward mesh forward | keep local copy absent and remember latest forwarded authority epoch | prevents an old upstream resend from re-adopting an eid this broker already forwarded onward |
 | `partition_config` | partition boundary/split/mesh topology changes and compaction | restore latest routing topology before serving | prevents recovered placement/router disagreement |
 | `snapshot_marker` | `SnapshotMarker` admin op | no entity mutation; durable named cut offset | disables compaction for the broker lifetime so `GW_RESTORE_OFFSET` remains byte-valid |
 | `reserve_entity_ids` | `ReserveEntityIds` | advance entity id high-water mark | fsync before returning a block so restart never reissues ids |
@@ -86,6 +87,7 @@ goes fail-closed for persistent ops and does not publish success.
 - delete tombstones
 - latest partition topology
 - unacked `mesh_out` payloads for resend
+- mesh-forwarded per-entity fences for completed onward departures
 - reserved entity id high-water mark
 - integrity report with WAL version, selected/decoded event counts,
   corrupt-tail counts, unknown-kind inventory, truncated tail bytes, and refuse
@@ -106,8 +108,11 @@ and runtime tests:
 - Old-owner stale writes are rejected after recovered handoff.
 - `mesh_out` WAL failure does not send/remove; unacked mesh handoffs remain
   pending until durable ack.
+- Old upstream mesh resends after an onward forward are ACKed without
+  re-adopting the entity, including after WAL compaction and restart.
 - ReserveEntityIds persists the high-water mark.
-- WAL compaction preserves delete tombstones and latest topology.
+- WAL compaction preserves delete tombstones, mesh-forwarded fences, and latest
+  topology.
 - Zone-worker and reality-loadgen tests run brokers with `GW_WAL`.
 
 ## Next extraction seams
