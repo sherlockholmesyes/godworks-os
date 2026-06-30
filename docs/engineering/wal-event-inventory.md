@@ -121,8 +121,9 @@ and runtime tests:
 - Recovery currently ignores unknown WAL event kinds. The inspector should
   count and flag unknown kinds so operator review can catch drift before a
   replay silently drops a new transition.
-- The public protocol marks `ReserveEntityIds` and `MeshAck` as persistent.
-  Keep the runtime fail-closed persistent-op gate aligned with that contract.
+- Keep the runtime fail-closed persistent-op gate aligned with the public
+  protocol's persistent operations; `ReserveEntityIds` and `MeshAck` are now
+  covered by a regression test.
 - The broker-contact `component_authority` path should not mutate canonical RAM
   before its authority WAL record is known durable.
 - Add direct tests for v1 corrupt-tail truncation, mid-stream corruption
