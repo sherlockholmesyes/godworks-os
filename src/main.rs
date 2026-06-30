@@ -4237,9 +4237,11 @@ fn is_persistent_op(op: &str) -> bool {
             | "BatchUpdate"
             | "SetComponentAuthority"
             | "MeshHandoff"
+            | "MeshAck"
             | "ThresholdTx"
             | "Fold"
             | "SnapshotMarker"
+            | "ReserveEntityIds"
     )
 }
 
@@ -8434,6 +8436,36 @@ mod tests {
     }
 
     #[test]
+    fn persistent_gate_rejects_reserve_ids_when_wal_already_degraded() {
+        let mut state = ServerState::new(30.0);
+        state.wal_degraded = true;
+        let mut rx = add_test_worker_with_rx(&mut state, "w1", "W");
+
+        dispatch(
+            &mut state,
+            "w1",
+            &json!({"op":"ReserveEntityIds","request_id":"r1","count":7}),
+        );
+
+        assert_eq!(state.entity_id_reservations, 0);
+        let rejected =
+            decode_test_frame(&rx.try_recv().expect("ReserveEntityIds must fail closed"));
+        assert_eq!(
+            rejected.get("op").and_then(|v| v.as_str()),
+            Some("UpdateRejected")
+        );
+        assert_eq!(
+            rejected.get("request_id").and_then(|v| v.as_str()),
+            Some("r1")
+        );
+        assert!(rejected
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("WAL-degraded"));
+    }
+
+    #[test]
     fn snapshot_marker_wal_fail_does_not_disable_compaction_or_emit_cut() {
         let mut state = ServerState::new(30.0);
         state.wal_fail_inject = true;
@@ -8638,6 +8670,12 @@ mod tests {
 
         assert!(record_mesh_ack(&mut state, "ship"));
         assert!(!state.pending_mesh.contains_key("ship"));
+    }
+
+    #[test]
+    fn mesh_ack_is_classified_persistent_for_fail_closed_contract() {
+        assert!(is_persistent_op("MeshAck"));
+        assert!(is_persistent_op("ReserveEntityIds"));
     }
 
     #[test]
