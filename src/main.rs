@@ -60,8 +60,16 @@ const CHANNEL_CAP: usize = EGRESS_SOFT_CAP as usize * 4;
 // traffic and tests; operators can lower them with GW_INGRESS_RATE_PER_SEC / GW_INGRESS_BURST_FRAMES.
 const DEFAULT_INGRESS_RATE_PER_SEC: f64 = 2000.0;
 const DEFAULT_INGRESS_BURST_FRAMES: f64 = 4000.0;
+// Sustained large-but-valid JSON frames are the second half of the ingress-cost surface after MAX_FRAME:
+// one frame is not one unit of broker work. Charge at least one token per 8 KiB of parsed payload.
+const INGRESS_BYTES_PER_TOKEN: f64 = 8192.0;
 const PROTOCOL_VERSION: u64 = 1; // L4: this broker's wire-format version
 const MIN_PROTO: u64 = 1; // L4: oldest peer wire-version still understood
+
+struct InboundFrame {
+    value: Value,
+    byte_len: usize,
+}
 
 fn parse_nonnegative_f64_env(name: &str, default: f64) -> f64 {
     std::env::var(name)
@@ -2594,7 +2602,35 @@ fn refill_ingress_tokens(w: &mut WorkerHandle, rate_per_sec: f64, burst_frames: 
     w.ingress_last_refill = now;
 }
 
-fn reject_ingress_rate_limit(state: &mut ServerState, wid: &str, f: &Value) -> bool {
+fn ingress_frame_cost_units(f: &Value, byte_len: usize) -> f64 {
+    let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let op_cost: f64 = match op {
+        // Cheap keepalive / telemetry frames are still at least one ingress unit: a peer can otherwise
+        // spin these forever as a scheduler/lock tax.
+        "Heartbeat" | "Metrics" | "LogMessage" | "Disconnect" => 1.0,
+        // Read fan-out, ownership, identity, and component-bulk paths cost more than one scalar update.
+        "CreateEntity"
+        | "DeleteEntity"
+        | "EntityQuery"
+        | "ReserveEntityIds"
+        | "SetComponentAuthority"
+        | "BatchUpdate"
+        | "Fold"
+        | "CriticalSection" => 4.0,
+        // Cross-broker/control frames are trusted-authenticated but still expensive under a bad peer.
+        "MeshHandoff" | "MeshGhost" | "MeshAck" | "CommandRequest" | "CommandResponse" => 2.0,
+        _ => 1.0,
+    };
+    let byte_cost = byte_len as f64 / INGRESS_BYTES_PER_TOKEN;
+    op_cost.max(byte_cost).max(1.0)
+}
+
+fn reject_ingress_rate_limit(
+    state: &mut ServerState,
+    wid: &str,
+    f: &Value,
+    byte_len: usize,
+) -> bool {
     let rate = state.ingress_rate_per_sec;
     let burst = state.ingress_burst_frames.max(1.0);
     let now = Instant::now();
@@ -2603,12 +2639,14 @@ fn reject_ingress_rate_limit(state: &mut ServerState, wid: &str, f: &Value) -> b
     };
 
     refill_ingress_tokens(w, rate, burst, now);
-    if w.ingress_tokens >= 1.0 {
-        w.ingress_tokens -= 1.0;
+    let cost = ingress_frame_cost_units(f, byte_len);
+    if w.ingress_tokens >= cost {
+        w.ingress_tokens -= cost;
         return false;
     }
 
     w.ingress_rejected = w.ingress_rejected.saturating_add(1);
+    let remaining_tokens = w.ingress_tokens;
     let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
     emit(
         state,
@@ -2621,7 +2659,9 @@ fn reject_ingress_rate_limit(state: &mut ServerState, wid: &str, f: &Value) -> b
             "error": "rate_limit_error",
             "rate_limited": true,
             "limited_op": op,
-            "reason": "rate_limit_error: ingress frame budget exceeded"
+            "rate_limit_cost": cost,
+            "rate_limit_tokens": remaining_tokens,
+            "reason": "rate_limit_error: ingress cost budget exceeded"
         }),
     );
     true
@@ -4785,8 +4825,8 @@ fn apply_one_update(
     true
 }
 
-fn dispatch(state: &mut ServerState, wid: &str, f: &Value) {
-    if reject_ingress_rate_limit(state, wid, f) {
+fn dispatch_frame(state: &mut ServerState, wid: &str, f: &Value, byte_len: usize) {
+    if reject_ingress_rate_limit(state, wid, f, byte_len) {
         reap_disconnecting(state);
         return;
     }
@@ -4796,6 +4836,12 @@ fn dispatch(state: &mut ServerState, wid: &str, f: &Value) {
     // most CHANNEL_CAP frames before the socket is torn down -- the structural RAM bound. Runs on EVERY
     // dispatch path (the inner fn has many early returns) by wrapping, so no overflow path can skip the reap.
     reap_disconnecting(state);
+}
+
+#[cfg(test)]
+fn dispatch_test_frame(state: &mut ServerState, wid: &str, f: &Value) {
+    let byte_len = serde_json::to_vec(f).map(|body| body.len()).unwrap_or(0);
+    dispatch_frame(state, wid, f, byte_len);
 }
 
 fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
@@ -6550,7 +6596,7 @@ fn matches_query(e: &Entity, q: &Value) -> bool {
 // Keep the broker bound to the protocol crate's public v1 contract so SDKs, docs, and runtime agree.
 const MAX_FRAME: usize = DEFAULT_MAX_FRAME_BYTES;
 
-async fn read_frame<R: AsyncReadExt + Unpin>(rd: &mut R) -> Option<Value> {
+async fn read_frame<R: AsyncReadExt + Unpin>(rd: &mut R) -> Option<InboundFrame> {
     let mut hdr = [0u8; 4];
     rd.read_exact(&mut hdr).await.ok()?;
     let n = u32::from_be_bytes(hdr) as usize;
@@ -6559,7 +6605,10 @@ async fn read_frame<R: AsyncReadExt + Unpin>(rd: &mut R) -> Option<Value> {
     }
     let mut body = vec![0u8; n];
     rd.read_exact(&mut body).await.ok()?;
-    serde_json::from_slice(&body).ok()
+    Some(InboundFrame {
+        value: serde_json::from_slice(&body).ok()?,
+        byte_len: n,
+    })
 }
 
 fn auth_token_matches(required: Option<&str>, provided: Option<&str>) -> bool {
@@ -6613,6 +6662,7 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
         Some(f) => f,
         None => return,
     };
+    let first = first.value;
     if first.get("op").and_then(|v| v.as_str()) != Some("WorkerConnect") {
         return;
     }
@@ -6786,7 +6836,7 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
         match frame {
             None => break,
             Some(f) => {
-                if f.get("op").and_then(|v| v.as_str()) == Some("Disconnect") {
+                if f.value.get("op").and_then(|v| v.as_str()) == Some("Disconnect") {
                     break;
                 }
                 {
@@ -6796,7 +6846,7 @@ async fn handle_conn(sock: tokio::net::TcpStream, state: Arc<Mutex<ServerState>>
                     // InspectorFrame reflects the storm -- the monitor-tick instrumentation does NOT cover
                     // this path. record_lock_hold keeps only a max (cheap), so it's safe at high op rates.
                     let _t = Instant::now();
-                    dispatch(&mut s, &wid, &f);
+                    dispatch_frame(&mut s, &wid, &f.value, f.byte_len);
                     record_lock_hold(&mut s, "dispatch", _t.elapsed());
                 }
                 if disconnect_rd.load(Ordering::Relaxed) {
@@ -6902,8 +6952,10 @@ fn spawn_mesh_link_dynamic(st: Arc<Mutex<ServerState>>, region: String, reg_dir:
                         let st_ack = st.clone();
                         tokio::spawn(async move {
                             while let Some(f) = read_frame(&mut rd).await {
-                                if f.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
-                                    if let Some(eid) = f.get("entity").and_then(|v| v.as_str()) {
+                                if f.value.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
+                                    if let Some(eid) =
+                                        f.value.get("entity").and_then(|v| v.as_str())
+                                    {
                                         let mut s = st_ack.lock().await;
                                         record_mesh_ack(&mut s, eid);
                                     }
@@ -7246,8 +7298,10 @@ async fn main() {
                             // the only inbound on our OUTBOUND mesh link is the neighbour's MeshAck ->
                             // release the parked entity from pending_mesh (the 2-phase handoff confirmed).
                             while let Some(f) = read_frame(&mut rd).await {
-                                if f.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
-                                    if let Some(eid) = f.get("entity").and_then(|v| v.as_str()) {
+                                if f.value.get("op").and_then(|v| v.as_str()) == Some("MeshAck") {
+                                    if let Some(eid) =
+                                        f.value.get("entity").and_then(|v| v.as_str())
+                                    {
                                         let mut s = st_ack.lock().await;
                                         // B2 recovery: record the confirmed departure so a crash-restart
                                         // does not resurrect an entity that already landed on the neighbour.
@@ -7656,7 +7710,7 @@ mod tests {
         ));
         let mut rx = add_test_worker_with_rx(&mut state, "viewer", "OBS");
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "viewer",
             &json!({"op":"EntityQuery","request_id":"q1","query":{"type":"all"}}),
@@ -7690,7 +7744,7 @@ mod tests {
         update_interest_grid(&mut state, "observer");
         assert!(state.global_workers.contains("observer"));
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "observer",
             &json!({"op":"EntityQuery","request_id":"q1","query":{"type":"all"}}),
@@ -7712,7 +7766,7 @@ mod tests {
             "plain OBS peer must not start as a global observer"
         );
 
-        dispatch(&mut state, "viewer", &json!({"op":"Interest"}));
+        dispatch_test_frame(&mut state, "viewer", &json!({"op":"Interest"}));
 
         let rejected = decode_test_frame(&rx.try_recv().expect("global OBS interest must reject"));
         assert_eq!(rejected["op"], "UpdateRejected");
@@ -8007,17 +8061,17 @@ mod tests {
         state.ingress_burst_frames = 2.0;
         let mut rx = add_test_worker_with_rx(&mut state, "spam", "W");
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "spam",
             &json!({"op":"LogMessage","msg":"budget-1"}),
         );
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "spam",
             &json!({"op":"LogMessage","msg":"budget-2"}),
         );
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "spam",
             &json!({
@@ -8057,7 +8111,7 @@ mod tests {
             w.ingress_last_refill = Instant::now() - Duration::from_millis(250);
         }
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "refill",
             &json!({"op":"LogMessage","msg":"after-refill"}),
@@ -8069,6 +8123,60 @@ mod tests {
             state.workers["refill"].ingress_tokens < 1.0,
             "the refilled token should be consumed by the accepted frame"
         );
+    }
+
+    #[test]
+    fn ingress_rate_limit_charges_expensive_ops_above_one_frame() {
+        let mut state = ServerState::new(30.0);
+        state.ingress_rate_per_sec = 0.0;
+        state.ingress_burst_frames = 3.0;
+        let mut rx = add_test_worker_with_rx(&mut state, "expensive", "W");
+
+        dispatch_test_frame(
+            &mut state,
+            "expensive",
+            &json!({
+                "op":"CreateEntity",
+                "request_id":"expensive-create",
+                "entity":"must-not-create",
+                "components":{"pos":[-1.0,0.0],"vel":[0.0,0.0]}
+            }),
+        );
+
+        assert!(
+            !state.entities.contains_key("must-not-create"),
+            "an expensive persistent op must not bypass the ingress cost budget as a single cheap frame"
+        );
+        let reject = decode_test_frame(
+            &rx.try_recv()
+                .expect("expensive op must receive a structured rate-limit rejection"),
+        );
+        assert_eq!(reject["limited_op"], "CreateEntity");
+        assert!(reject["rate_limit_cost"].as_f64().unwrap() >= 4.0);
+        assert_eq!(reject["request_id"], "expensive-create");
+    }
+
+    #[test]
+    fn ingress_rate_limit_charges_large_valid_payload_by_bytes() {
+        let mut state = ServerState::new(30.0);
+        state.ingress_rate_per_sec = 0.0;
+        state.ingress_burst_frames = 1.0;
+        let mut rx = add_test_worker_with_rx(&mut state, "large", "W");
+        let payload = "x".repeat(INGRESS_BYTES_PER_TOKEN as usize + 512);
+
+        dispatch_test_frame(
+            &mut state,
+            "large",
+            &json!({"op":"LogMessage","request_id":"large-log","msg":payload}),
+        );
+
+        let reject = decode_test_frame(
+            &rx.try_recv()
+                .expect("large-but-valid payload must be charged above a one-frame unit"),
+        );
+        assert_eq!(reject["limited_op"], "LogMessage");
+        assert!(reject["rate_limit_cost"].as_f64().unwrap() > 1.0);
+        assert_eq!(reject["request_id"], "large-log");
     }
 
     #[test]
@@ -8424,7 +8532,7 @@ mod tests {
             .entities
             .insert("b".to_string(), test_entity([-2.0, 0.0], "W"));
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "w1",
             &json!({"op":"BatchUpdate","comp":"pos","updates":[["a",[10.0,0.0]],["b",[11.0,0.0]]]}),
@@ -8543,7 +8651,7 @@ mod tests {
             .entities
             .insert("victim".to_string(), test_entity([-1.0, 0.0], "W"));
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "w1",
             &json!({"op":"DeleteEntity","entity":"victim"}),
@@ -9066,7 +9174,7 @@ mod tests {
         );
         add_test_worker(&mut state, "w1", "W");
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "w1",
             &json!({"op":"ReserveEntityIds","request_id":"r1","count":7}),
@@ -9083,7 +9191,7 @@ mod tests {
         failed.wal_fail_inject = true;
         failed.wal_degraded = false;
         add_test_worker(&mut failed, "w1", "W");
-        dispatch(
+        dispatch_test_frame(
             &mut failed,
             "w1",
             &json!({"op":"ReserveEntityIds","request_id":"r1","count":7}),
@@ -9100,7 +9208,7 @@ mod tests {
         state.wal_degraded = true;
         let mut rx = add_test_worker_with_rx(&mut state, "w1", "W");
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "w1",
             &json!({"op":"ReserveEntityIds","request_id":"r1","count":7}),
@@ -9137,7 +9245,7 @@ mod tests {
             .attributes
             .insert("snapshot".to_string());
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "snap",
             &json!({"op":"SnapshotMarker","request_id":"s1","snapshot_id":"cut-1"}),
@@ -9158,7 +9266,7 @@ mod tests {
             .insert("crate".to_string(), test_entity([-1.0, 0.0], "W"));
         grant_region_physics_island_authority(&mut add_state, "w1", "crate");
 
-        dispatch(
+        dispatch_test_frame(
             &mut add_state,
             "w1",
             &json!({"op":"AddComponent","entity":"crate","comp":"loot","value":3}),
@@ -9183,7 +9291,7 @@ mod tests {
             .insert("loot".to_string(), json!(3));
         ensure_component_authority(remove_state.entities.get_mut("crate").unwrap(), "loot");
 
-        dispatch(
+        dispatch_test_frame(
             &mut remove_state,
             "w1",
             &json!({"op":"RemoveComponent","entity":"crate","comp":"loot"}),
@@ -9215,7 +9323,7 @@ mod tests {
             .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
         grant_region_physics_island_authority(&mut failed, "w1", "ship");
 
-        dispatch(
+        dispatch_test_frame(
             &mut failed,
             "admin",
             &json!({"op":"SetComponentAuthority","entity":"ship","comp":"pos","owner":"w2"}),
@@ -9247,7 +9355,7 @@ mod tests {
             .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
         grant_region_physics_island_authority(&mut state, "w1", "ship");
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "admin",
             &json!({"op":"SetComponentAuthority","entity":"ship","comp":"pos","owner":"w2"}),
@@ -9278,7 +9386,7 @@ mod tests {
         grant_region_physics_island_authority(&mut state, "w1", "ship");
         let old_epoch = component_authority_epoch(&state.entities["ship"], "pos");
 
-        dispatch(
+        dispatch_test_frame(
             &mut state,
             "w1",
             &json!({"op":"ThresholdTx","entity":"ship","tx_id":"tx1","phase":"commit","from":"W","to":"E"}),
