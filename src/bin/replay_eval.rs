@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::process;
 
+use godworks_core::{CoordinateCodec, PartitionSchema, SpatialDim};
 use godworks_protocol::operation_semantics;
 use serde_json::{json, Value};
 
@@ -98,22 +99,22 @@ fn validate_event_contract(event: &Value, line_no: usize, errors: &mut Vec<Strin
         return;
     };
     if kind.starts_with("broker_") {
-        require_str(event, line_no, "spatial_dim", errors);
-        require_str(event, line_no, "coordinate_codec", errors);
-        require_u64(event, line_no, "component_registry_version", errors);
+        require_spatial_dim(event, line_no, errors);
+        require_coordinate_codec(event, line_no, errors);
+        let _ = require_u64(event, line_no, "component_registry_version", errors);
         require_partition_schema(event, line_no, errors);
     }
     if let Some(summary) = event.get("op_summary") {
         require_str(summary, line_no, "op", errors);
-        require_u64(summary, line_no, "wire_bytes", errors);
+        let _ = require_u64(summary, line_no, "wire_bytes", errors);
         validate_op_summary_semantics(summary, line_no, errors);
     }
     match kind {
         "broker_handoff" => {
             require_str(event, line_no, "path", errors);
             require_str(event, line_no, "entity", errors);
-            require_u64(event, line_no, "authority_epoch", errors);
-            require_u64(event, line_no, "durable_gen", errors);
+            let _ = require_u64(event, line_no, "authority_epoch", errors);
+            let _ = require_u64(event, line_no, "durable_gen", errors);
         }
         "broker_ingress" => {
             require_str(event, line_no, "outcome", errors);
@@ -208,15 +209,50 @@ fn require_partition_schema(event: &Value, line_no: usize, errors: &mut Vec<Stri
     };
     match kind {
         "grid2d" => {
-            require_positive_u64(schema, line_no, "cols", errors);
-            require_positive_u64(schema, line_no, "rows", errors);
+            let cols = require_positive_u64(schema, line_no, "cols", errors);
+            let rows = require_positive_u64(schema, line_no, "rows", errors);
+            if let (Some(cols), Some(rows)) = (cols, rows) {
+                if PartitionSchema::grid2d(cols, rows).is_err() {
+                    errors.push(format!(
+                        "line {line_no}: partition_schema.grid2d dimensions must be positive"
+                    ));
+                }
+            }
         }
         "strip1d" => {
-            require_u64(schema, line_no, "boundary_count", errors);
+            if let Some(boundary_count) = require_u64(schema, line_no, "boundary_count", errors) {
+                let _ = PartitionSchema::strip1d(boundary_count);
+            }
         }
         other => errors.push(format!(
             "line {line_no}: unknown partition_schema.kind {other}"
         )),
+    }
+}
+
+fn require_spatial_dim(event: &Value, line_no: usize, errors: &mut Vec<String>) {
+    let Some(value) = get_path(event, "spatial_dim")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        errors.push(format!("line {line_no}: missing string spatial_dim"));
+        return;
+    };
+    if SpatialDim::from_wire_str(value).is_none() {
+        errors.push(format!("line {line_no}: unknown spatial_dim {value}"));
+    }
+}
+
+fn require_coordinate_codec(event: &Value, line_no: usize, errors: &mut Vec<String>) {
+    let Some(value) = get_path(event, "coordinate_codec")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        errors.push(format!("line {line_no}: missing string coordinate_codec"));
+        return;
+    };
+    if CoordinateCodec::from_wire_str(value).is_none() {
+        errors.push(format!("line {line_no}: unknown coordinate_codec {value}"));
     }
 }
 
@@ -230,20 +266,27 @@ fn require_str(value: &Value, line_no: usize, key: &str, errors: &mut Vec<String
     }
 }
 
-fn require_u64(value: &Value, line_no: usize, key: &str, errors: &mut Vec<String>) {
-    if get_path(value, key).and_then(Value::as_u64).is_none() {
+fn require_u64(value: &Value, line_no: usize, key: &str, errors: &mut Vec<String>) -> Option<u64> {
+    let found = get_path(value, key).and_then(Value::as_u64);
+    if found.is_none() {
         errors.push(format!("line {line_no}: missing u64 {key}"));
     }
+    found
 }
 
-fn require_positive_u64(value: &Value, line_no: usize, key: &str, errors: &mut Vec<String>) {
-    if get_path(value, key)
+fn require_positive_u64(
+    value: &Value,
+    line_no: usize,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Option<u64> {
+    let found = get_path(value, key)
         .and_then(Value::as_u64)
-        .filter(|value| *value > 0)
-        .is_none()
-    {
+        .filter(|value| *value > 0);
+    if found.is_none() {
         errors.push(format!("line {line_no}: missing positive u64 {key}"));
     }
+    found
 }
 
 fn get_path<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
@@ -356,6 +399,16 @@ mod tests {
             .errors
             .iter()
             .any(|err| err.contains("missing positive u64 rows")));
+    }
+
+    #[test]
+    fn grid2d_zero_dimension_fails() {
+        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"grid2d","cols":0,"rows":2},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
+        let report = validate_tape(tape);
+        assert!(report
+            .errors
+            .iter()
+            .any(|err| err.contains("missing positive u64 cols")));
     }
 
     #[test]

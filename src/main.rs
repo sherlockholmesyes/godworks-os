@@ -28,7 +28,10 @@ use std::sync::atomic::AtomicBool;
 use godworks_broker::wal::{
     crc32_ieee, read_wal_events, wal_v1_envelope_line, wal_v1_header_line, WalReadReport,
 };
-use godworks_core::STANDARD_COMPONENT_REGISTRY_VERSION;
+use godworks_core::{
+    PartitionSchema, SpatialSchema, COORDINATE_CODEC_VERSION, SPATIAL_SCHEMA_VERSION,
+    STANDARD_COMPONENT_REGISTRY_VERSION,
+};
 use godworks_protocol::{operation_semantics, DEFAULT_MAX_FRAME_BYTES};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,9 +74,6 @@ const PROTOCOL_VERSION: u64 = 1; // L4: this broker's wire-format version
 const MIN_PROTO: u64 = 1; // L4: oldest peer wire-version still understood
 const SNAPSHOT_MANIFEST_VERSION: u64 = 1;
 const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
-const SPATIAL_SCHEMA_VERSION: u64 = 1;
-const COORDINATE_CODEC_VERSION: u64 = 1;
-
 struct InboundFrame {
     value: Value,
     byte_len: usize,
@@ -2658,39 +2658,64 @@ fn replay_tape_op_summary(f: &Value, byte_len: usize) -> Value {
     Value::Object(summary)
 }
 
-fn partition_schema_contract(state: &ServerState) -> Value {
+fn partition_schema_for_state(state: &ServerState) -> PartitionSchema {
     if let Some((cols, rows, _cell_w, _cell_h)) = state.grid2d {
-        json!({
-            "kind": "grid2d",
-            "cols": cols,
-            "rows": rows
-        })
+        // parse_grid2d already rejects zero dimensions; keep the core constructor as the contract gate.
+        PartitionSchema::grid2d(cols as u64, rows as u64)
+            .expect("runtime grid2d dimensions must satisfy the spatial contract")
     } else {
-        json!({
-            "kind": "strip1d",
-            "boundary_count": state.boundaries.len()
-        })
+        PartitionSchema::strip1d(state.boundaries.len() as u64)
     }
 }
 
+fn partition_schema_contract_value(schema: PartitionSchema) -> Value {
+    match schema {
+        PartitionSchema::Grid2D { cols, rows } => {
+            json!({
+                "kind": "grid2d",
+                "cols": cols,
+                "rows": rows
+            })
+        }
+        PartitionSchema::Strip1D { boundary_count } => {
+            json!({
+                "kind": "strip1d",
+                "boundary_count": boundary_count
+            })
+        }
+    }
+}
+
+fn spatial_schema_for_state(state: &ServerState) -> SpatialSchema {
+    SpatialSchema::current_2d(partition_schema_for_state(state))
+}
+
 fn spatial_schema_contract(state: &ServerState) -> Value {
+    let schema = spatial_schema_for_state(state);
     json!({
-        "spatial_dim": "D2",
-        "coordinate_codec": "debug_f64_2",
-        "partition_schema": partition_schema_contract(state)
+        "spatial_dim": schema.spatial_dim.as_wire_str(),
+        "coordinate_codec": schema.coordinate_codec.as_wire_str(),
+        "partition_schema": partition_schema_contract_value(schema.partition_schema)
     })
 }
 
 fn record_replay_tape_spatial_contract(state: &ServerState, event: &mut Map<String, Value>) {
-    event.insert("spatial_dim".to_string(), json!("D2"));
-    event.insert("coordinate_codec".to_string(), json!("debug_f64_2"));
+    let schema = spatial_schema_for_state(state);
+    event.insert(
+        "spatial_dim".to_string(),
+        json!(schema.spatial_dim.as_wire_str()),
+    );
+    event.insert(
+        "coordinate_codec".to_string(),
+        json!(schema.coordinate_codec.as_wire_str()),
+    );
     event.insert(
         "component_registry_version".to_string(),
         json!(STANDARD_COMPONENT_REGISTRY_VERSION),
     );
     event.insert(
         "partition_schema".to_string(),
-        partition_schema_contract(state),
+        partition_schema_contract_value(schema.partition_schema),
     );
 }
 
