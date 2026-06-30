@@ -18,29 +18,26 @@ Expected commands:
 
 ## Runtime smoke test
 
-Terminal 1:
+Use the checked-in smoke runner:
 
-```bash
-GW_WAL=.local/smoke.wal cargo run --bin godworks_broker
+```powershell
+.\scripts\runtime_smoke.ps1
 ```
 
-Terminal 2:
+The script runs two separate rulers:
 
-```bash
-GW_ZW_REGION=W GW_ZW_ID=zw-W cargo run --bin zone_worker
-```
+- `broker + reality_loadgen`: the loadgen owns its own `rlg-owner-W` /
+  `rlg-owner-E` clients and exercises create, AOI, updates, events, commands,
+  queries, and slow-consumer handling.
+- `broker + W/E zone_worker`: real `zone_worker` processes spawn W bodies,
+  cross the W/E seam, hand authority to E, and emit structured
+  `zone_worker_summary` lines.
 
-Terminal 3:
-
-```bash
-GW_ZW_REGION=E GW_ZW_ID=zw-E cargo run --bin zone_worker
-```
-
-Terminal 4:
-
-```bash
-cargo run --bin reality_loadgen
-```
+Do not run `reality_loadgen` at the same time as long-lived `zone_worker`
+processes claiming the same `W` / `E` regions. `reality_loadgen` registers its
+own W/E owner clients; pre-claiming those regions makes the broker correctly
+refuse the loadgen owners and turns the smoke test into an authority-lease
+conflict instead of a product runtime ruler.
 
 ## Recovery smoke test
 
