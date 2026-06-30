@@ -110,7 +110,21 @@ The current architecture is effectively 2D:
 - partitioning is 1D strip or 2D grid;
 - the provided physics worker uses Rapier2D.
 
-The 1.0 product target should be 2D. 3D should be handled as a separate feasibility branch and later major version.
+The first product slice should stay 2D. That keeps authority, handoff, WAL,
+interest, SDK, and product ergonomics cheap to prove.
+
+However, new schemas should not encode a hidden "2D forever" assumption. The
+project now has a 3D foundation rail for contracts and fixtures:
+
+- dimensioned spatial schema;
+- coordinate codec terms for future fixed/mixed precision;
+- 3D component and physics-island names;
+- 3D AOI and partition schema names;
+- snapshot/WAL/replay spatial metadata;
+- protocol fixtures that preserve 3D component bags.
+
+Full 3D runtime, a 3D physics worker, and a 3D client remain later work. See
+`docs/spatial/3d-foundation.md`.
 
 ## Initial hardening milestones
 

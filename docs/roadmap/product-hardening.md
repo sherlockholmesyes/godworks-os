@@ -1,13 +1,15 @@
 # Product Hardening Roadmap
 
-This roadmap turns Godworks OS from a pre-1.0 spatial backend into a usable 2D multiplayer world platform.
+This roadmap turns Godworks OS from a pre-1.0 spatial backend into a usable
+multiplayer world platform. The first product slice is 2D, but the contracts
+must keep a 3D rail open from now on.
 
 ## Product target
 
 Godworks OS 1.0 targets:
 
 ```text
-2D distributed-authority multiplayer worlds
+2D distributed-authority multiplayer worlds, with 3D-ready spatial contracts
 ```
 
 The product is a server-side spatial backend plus SDKs and tooling, not a full renderer/editor game engine.
@@ -57,6 +59,8 @@ with compatibility tests rather than rebuilding a second protocol path.
 - Broader per-principal rate-limit policy for public hosted deployments.
 - Metrics exporter.
 - Redacted replay tape for offline eval and policy experiments.
+- 3D foundation rail: coordinate/schema docs, future-proof component names,
+  partition schemas, and protocol fixtures that do not lock in 2D-only data.
 - Agent contribution trace/eval gate.
 - Docker Compose.
 - WAL inspect/recovery CLI.
@@ -76,10 +80,14 @@ with compatibility tests rather than rebuilding a second protocol path.
 ## Non-goals for 1.0
 
 - 3D production support.
+- A 3D physics worker or 3D client runtime.
 - Managed hosted cloud product.
 - Full visual world editor.
 - Unity/Unreal official plugins.
 - Global multi-region orchestration.
+
+3D production runtime is out of scope for 1.0, but 3D-compatible contracts are
+in scope. See `docs/spatial/3d-foundation.md`.
 
 ## First practical sequence
 
@@ -93,8 +101,11 @@ with compatibility tests rather than rebuilding a second protocol path.
    recovery still owns the reducer.
 7. Build worker SDK — alpha done.
 8. Rewrite `zone_worker` on the SDK — done for the current worker protocol surface.
-9. Build client SDK.
-10. Build playable top-down arena.
+9. Add the 3D foundation rail: spatial docs, coordinate/schema terms, and
+   protocol fixtures that preserve 3D component bags without changing current
+   runtime behavior.
+10. Build client SDK.
+11. Build playable top-down arena.
 
 ## Product beta definition
 
