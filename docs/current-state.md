@@ -7,7 +7,8 @@ This document is the starting point for hardening Godworks OS into a product-qua
 Godworks OS currently builds as a Rust server-side runtime, not a full client game engine. The repository contains these binaries:
 
 - `godworks_broker` — authoritative store, operation router, handoff runtime, WAL durability, mesh runtime.
-- `zone_worker` — a Rapier2D-based physics zone worker that speaks the Godworks wire protocol.
+- `zone_worker` — a Rapier2D-based physics zone worker migrated onto the
+  Rust Worker SDK framing and typed-op helpers.
 - `reality_loadgen` — a product/reality harness that drives the live protocol through create, interest/AOI, updates, events, commands, queries, mesh movement, and slow-consumer behavior.
 
 ## Product classification
@@ -38,7 +39,12 @@ full SpatialOS replacement
 - Coarse fidelity updates.
 - Backpressure and bounded egress channels.
 - Max frame size and basic per-peer ingress frame rate limits.
-- Basic shared-token WorkerConnect authentication.
+- WorkerConnect authentication with both legacy shared-token mode and strict
+  token-bound region/attribute claims.
+- `godworks-protocol`, `godworks-core`, and `godworks-worker-sdk` alpha crates.
+- `zone_worker` outbound protocol I/O through the Worker SDK, with typed inbound
+  handling for authority/rejection/lifecycle-critical frames.
+- Shared WAL decoder and `wal_inspect` CLI.
 - Health/inspector-oriented runtime state.
 - Rapier2D physics worker demo.
 - Reality/load harness.
@@ -50,12 +56,11 @@ full SpatialOS replacement
 
 The server runtime is not enough for a game team. The product needs:
 
-- Rust worker SDK;
 - client SDK;
 - Godot bridge;
 - typed component helpers;
 - reconnect/resync behavior;
-- examples that do not require hand-writing JSON frames.
+- more examples that do not require hand-writing JSON frames.
 
 ### Protocol stability
 
@@ -84,11 +89,10 @@ The runtime needs a repeatable operations story:
 
 The product needs a formal security layer:
 
-- stronger worker/client authentication and identity binding;
-- mesh authentication;
+- broader worker/client role distinction and authorization policy;
+- stronger mesh authentication beyond the current token-claim baseline;
 - broader per-principal rate-limit policy;
 - observer/global-interest permissions;
-- token-bound worker attributes;
 - TLS/mTLS option.
 
 ### 3D
@@ -103,15 +107,16 @@ The 1.0 product target should be 2D. 3D should be handled as a separate feasibil
 
 ## Initial hardening milestones
 
-1. Reproducible build and CI.
-2. Workspace/module split.
-3. Protocol v1 draft.
-4. WAL/recovery module and CLI.
-5. Worker SDK v0.
+1. Reproducible build and CI — done for the current Rust baseline.
+2. Workspace/module split — protocol/core/worker-sdk crates exist.
+3. Protocol v1 draft — initial draft exists.
+4. WAL/recovery module and CLI — shared WAL reader and `wal_inspect` exist.
+5. Worker SDK v0 — alpha exists and `zone_worker` uses it.
 6. Client SDK v0.
 7. Godot bridge v0.
 8. Top-down arena demo.
-9. Security v0.
+9. Security v0 — max-frame, ingress frame-rate, shared-token auth, and
+   token-bound WorkerConnect claims exist; broader role/rate/TLS policy remains.
 10. Ops/deployment layer.
 
 ## Definition of product beta

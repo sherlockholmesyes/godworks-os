@@ -16,12 +16,12 @@ The product is a server-side spatial backend plus SDKs and tooling, not a full r
 
 ### v0.2 — Engineering baseline
 
-- CI and reproducible toolchain.
-- Developer command runner.
-- Current-state audit.
-- Protocol v1 draft inventory.
-- Environment/config inventory.
-- Initial workspace root.
+- CI and reproducible toolchain. Status: current baseline exists.
+- Developer command runner. Status: `just gate` exists when `just` is installed.
+- Current-state audit. Status: exists and should be kept current.
+- Protocol v1 draft inventory. Status: exists.
+- Environment/config inventory. Status: exists.
+- Initial workspace root. Status: complete.
 
 ### v0.4 — Protocol and SDK alpha
 
@@ -31,6 +31,9 @@ The product is a server-side spatial backend plus SDKs and tooling, not a full r
 - Protocol golden tests.
 - `godworks-worker-sdk` alpha.
 - `zone_worker` migrated to SDK.
+
+Status: implemented as the current protocol/worker baseline. Keep extending it
+with compatibility tests rather than rebuilding a second protocol path.
 
 ### v0.6 — Client and demo alpha
 
@@ -45,8 +48,9 @@ The product is a server-side spatial backend plus SDKs and tooling, not a full r
 - Frame size limits.
 - Basic broker ingress frame rate limits.
 - Basic WorkerConnect auth.
-- Stronger worker/client identity model.
-- Mesh auth.
+- Token-bound WorkerConnect region/attribute claims.
+- Stronger worker/client role and authorization policy.
+- Mesh auth beyond the current token-claim baseline.
 - Broader per-principal rate-limit policy.
 - Metrics exporter.
 - Agent contribution trace/eval gate.
@@ -78,11 +82,13 @@ The product is a server-side spatial backend plus SDKs and tooling, not a full r
 1. Protect the repo with CI and a local gate.
 2. Document the current system before changing it.
 3. Add a workspace root without changing behavior.
-4. Extract typed protocol structs.
-5. Extract core entity/authority types.
-6. Extract WAL/recovery module.
-7. Build worker SDK.
-8. Rewrite `zone_worker` on the SDK.
+4. Extract typed protocol structs — done for the current JSON protocol.
+5. Extract core entity/authority types — initial crate exists; keep moving shared
+   types out of the broker as needed.
+6. Extract WAL/recovery module — shared WAL decoder and inspector exist; broker
+   recovery still owns the reducer.
+7. Build worker SDK — alpha done.
+8. Rewrite `zone_worker` on the SDK — done for the current worker protocol surface.
 9. Build client SDK.
 10. Build playable top-down arena.
 
