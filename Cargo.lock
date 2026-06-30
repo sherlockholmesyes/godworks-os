@@ -168,6 +168,9 @@ dependencies = [
 name = "godworks_broker"
 version = "0.1.0"
 dependencies = [
+ "godworks-core",
+ "godworks-protocol",
+ "godworks-worker-sdk",
  "rapier2d",
  "serde_json",
  "tokio",

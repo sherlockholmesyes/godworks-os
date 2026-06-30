@@ -734,6 +734,23 @@ mod tests {
     }
 
     #[test]
+    fn mesh_handoff_roundtrips_current_broker_src_region_wire_shape() {
+        assert_roundtrip(json!({
+            "op": "MeshHandoff",
+            "entity": "node-1",
+            "src_region": "W",
+            "target": "E",
+            "pos": [1.0, 2.0],
+            "vel": [3.0, 4.0],
+            "authority_epoch": 9,
+            "lease_epoch": 11,
+            "source_durable_gen": 12,
+            "authority": { "pos": { "owner": "zw-E", "epoch": 9, "mode": "server_physics_island" } },
+            "components": { "mass": 2.0, "kind": "unit" }
+        }));
+    }
+
+    #[test]
     fn authority_change_preserves_loss_imminent_metadata() {
         assert_roundtrip(json!({
             "op": "AuthorityChange",

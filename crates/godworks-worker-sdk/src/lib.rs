@@ -11,10 +11,10 @@ use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId};
 use godworks_protocol::json::{decode_json_value, encode_json_value};
 use godworks_protocol::{
     AddEntity, AuthorityChange, BatchUpdate, BatchUpdateEntry, CommandRequest, ComponentUpdate,
-    CriticalSection, EntityEvent, Interest, MeshHandoff, Op, UpdateComponent, UpdateRejected,
-    WorkerConnect, DEFAULT_MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    CreateEntity, CriticalSection, EntityEvent, Fold, Heartbeat, Interest, JsonFields, MeshHandoff,
+    Op, UpdateComponent, UpdateRejected, WorkerConnect, DEFAULT_MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub type Result<T> = std::result::Result<T, WorkerSdkError>;
@@ -294,6 +294,50 @@ pub fn batch_entry(
     }
 }
 
+pub fn legacy_worker_connect_op(worker_id: impl Into<PeerId>, region: impl Into<RegionId>) -> Op {
+    Op::WorkerConnect(WorkerConnect {
+        worker_id: worker_id.into(),
+        region: region.into(),
+        proto: None,
+        attributes: Vec::new(),
+    })
+}
+
+pub fn heartbeat_op(worker_id: impl Into<PeerId>) -> Op {
+    Op::Heartbeat(Heartbeat {
+        worker_id: Some(worker_id.into()),
+    })
+}
+
+pub fn disconnect_op() -> Op {
+    Op::Disconnect
+}
+
+pub fn create_entity_op(
+    entity: impl Into<EntityId>,
+    region: impl Into<RegionId>,
+    components: Value,
+) -> Op {
+    Op::CreateEntity(CreateEntity {
+        entity: entity.into(),
+        request_id: None,
+        requested_region: Some(region.into()),
+        components,
+    })
+}
+
+pub fn fold_op(entity: impl Into<EntityId>, region: impl Into<RegionId>, pos: [f32; 2]) -> Op {
+    let entity = entity.into();
+    let region = region.into();
+    let mut fields = Map::new();
+    fields.insert("entity".to_string(), json!(entity.as_ref()));
+    fields.insert("region".to_string(), json!(region.as_ref()));
+    fields.insert("pos".to_string(), json!([pos[0], pos[1]]));
+    Op::Fold(Fold {
+        fields: JsonFields { fields },
+    })
+}
+
 pub fn encode_frame_payload(op: &Op) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&encode_json_value(op))?)
 }
@@ -418,6 +462,54 @@ mod tests {
             "ghost": true,
             "owner_region": "E"
         }));
+    }
+
+    #[test]
+    fn zone_worker_outbound_helpers_match_current_wire_shapes() {
+        assert_eq!(
+            encode_json_value(&legacy_worker_connect_op("zw-W", "W")),
+            json!({"op":"WorkerConnect","worker_id":"zw-W","region":"W"})
+        );
+        assert_eq!(
+            encode_json_value(&Op::Interest(circle_interest(
+                Position2::new(0.0, 0.0),
+                100.0,
+                None
+            ))),
+            json!({"op":"Interest","center":[0.0,0.0],"radius":100.0})
+        );
+        assert_eq!(
+            encode_json_value(&create_entity_op(
+                "W-b0",
+                "W",
+                json!({"pos":[1.0,2.0],"vel":[3.0,4.0],"mass":2.5})
+            )),
+            json!({
+                "op":"CreateEntity",
+                "entity":"W-b0",
+                "region":"W",
+                "components":{"pos":[1.0,2.0],"vel":[3.0,4.0],"mass":2.5}
+            })
+        );
+        assert_eq!(
+            encode_json_value(&fold_op("W-b0", "E", [5.0, 6.0])),
+            json!({"op":"Fold","entity":"W-b0","region":"E","pos":[5.0,6.0]})
+        );
+        assert_eq!(
+            encode_json_value(&Op::BatchUpdate(BatchUpdate {
+                component: "pos".into(),
+                updates: vec![batch_entry("W-b0", json!([7.0, 8.0]), Some(9))]
+            })),
+            json!({"op":"BatchUpdate","comp":"pos","updates":[["W-b0",[7.0,8.0],9]]})
+        );
+        assert_eq!(
+            encode_json_value(&heartbeat_op("zw-W")),
+            json!({"op":"Heartbeat","worker_id":"zw-W"})
+        );
+        assert_eq!(
+            encode_json_value(&disconnect_op()),
+            json!({"op":"Disconnect"})
+        );
     }
 
     #[tokio::test]
