@@ -24,6 +24,12 @@ pub const MIN_PROTOCOL_VERSION: u64 = 1;
 /// Conservative frame ceiling for future hardened readers.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Current `SnapshotManifest` envelope version.
+pub const SNAPSHOT_MANIFEST_VERSION: u64 = 1;
+
+/// Current snapshot artifact schema version.
+pub const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
+
 /// Returns whether a peer protocol version is currently supported.
 pub const fn supports_protocol(version: u64) -> bool {
     version >= MIN_PROTOCOL_VERSION && version <= PROTOCOL_VERSION
@@ -730,6 +736,106 @@ pub struct SnapshotMarker {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SnapshotManifest {
     pub fields: JsonFields,
+}
+
+impl SnapshotManifest {
+    pub fn request_id(&self) -> Option<&str> {
+        self.fields.str("request_id")
+    }
+
+    pub fn snapshot_id(&self) -> Option<&str> {
+        self.fields.str("snapshot_id")
+    }
+
+    pub fn snapshot_manifest_version(&self) -> Option<u64> {
+        self.fields.u64("snapshot_manifest_version")
+    }
+
+    pub fn snapshot_schema_version(&self) -> Option<u64> {
+        self.fields.u64("snapshot_schema_version")
+    }
+
+    pub fn spatial_schema_version(&self) -> Option<u64> {
+        self.fields.u64("spatial_schema_version")
+    }
+
+    pub fn coordinate_codec_version(&self) -> Option<u64> {
+        self.fields.u64("coordinate_codec_version")
+    }
+
+    pub fn component_registry_version(&self) -> Option<u64> {
+        self.fields.u64("component_registry_version")
+    }
+
+    pub fn partition_map_version(&self) -> Option<u64> {
+        self.fields.u64("partition_map_version")
+    }
+
+    pub fn wal_offset(&self) -> Option<u64> {
+        self.fields.u64("wal_offset")
+    }
+
+    pub fn entity_count(&self) -> Option<u64> {
+        self.fields.u64("entity_count")
+    }
+
+    pub fn pending_mesh(&self) -> Option<u64> {
+        self.fields.u64("pending_mesh")
+    }
+
+    pub fn broker_id(&self) -> Option<&str> {
+        self.fields.str("broker_id")
+    }
+
+    pub fn authority_hash(&self) -> Option<&str> {
+        self.fields.str("authority_hash")
+    }
+
+    pub fn spatial_schema(&self) -> Option<SpatialSchema> {
+        parse_spatial_schema_contract(self.fields.get("spatial_schema")?)
+    }
+
+    pub fn has_current_versions(&self) -> bool {
+        self.snapshot_manifest_version() == Some(SNAPSHOT_MANIFEST_VERSION)
+            && self.snapshot_schema_version() == Some(SNAPSHOT_SCHEMA_VERSION)
+            && self.spatial_schema_version() == Some(SPATIAL_SCHEMA_VERSION)
+            && self.coordinate_codec_version() == Some(COORDINATE_CODEC_VERSION)
+            && self.component_registry_version() == Some(STANDARD_COMPONENT_REGISTRY_VERSION)
+    }
+}
+
+pub fn parse_spatial_schema_contract(value: &Value) -> Option<SpatialSchema> {
+    let obj = value.as_object()?;
+    let spatial_dim = obj
+        .get("spatial_dim")
+        .and_then(Value::as_str)
+        .and_then(SpatialDim::from_wire_str)?;
+    let coordinate_codec = obj
+        .get("coordinate_codec")
+        .and_then(Value::as_str)
+        .and_then(CoordinateCodec::from_wire_str)?;
+    let partition_schema = parse_partition_schema_contract(obj.get("partition_schema")?)?;
+    Some(SpatialSchema {
+        spatial_dim,
+        coordinate_codec,
+        partition_schema,
+    })
+}
+
+pub fn parse_partition_schema_contract(value: &Value) -> Option<PartitionSchema> {
+    let obj = value.as_object()?;
+    match obj.get("kind").and_then(Value::as_str)? {
+        "grid2d" => {
+            let cols = obj.get("cols").and_then(Value::as_u64)?;
+            let rows = obj.get("rows").and_then(Value::as_u64)?;
+            PartitionSchema::grid2d(cols, rows).ok()
+        }
+        "strip1d" => {
+            let boundary_count = obj.get("boundary_count").and_then(Value::as_u64)?;
+            Some(PartitionSchema::strip1d(boundary_count))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
