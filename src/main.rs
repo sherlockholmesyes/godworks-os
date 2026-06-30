@@ -1597,6 +1597,7 @@ struct ServerState {
     // invariant: an entity crossing the seam is in EXACTLY ONE of {here.entities, pending_mesh, neighbour}
     // -- it never vanishes (the old path removed it before any confirmation).
     pending_mesh: HashMap<String, (Value, Instant, String)>, // eid -> (MeshHandoff frame, when-sent, TARGET region) -- target picks the re-send link
+    mesh_forwarded_epoch: HashMap<String, u64>, // eid -> latest durable mesh_out epoch; fences old-source re-sends after this broker forwarded the entity onward
     // B1 fix: this broker is CONFIGURED to mesh east (GW_MESH_EAST set), independent of whether the link
     // is momentarily up (mesh_east Some). Routing must NOT depend on the link being up at the instant an
     // entity crosses -- else a cross while the neighbour is down fell through to a LOCAL handoff and
@@ -1713,6 +1714,7 @@ impl ServerState {
             connect_auth_claims: parse_connect_auth_claims_env(),
             mesh: HashMap::new(),
             pending_mesh: HashMap::new(),
+            mesh_forwarded_epoch: HashMap::new(),
             mesh_regions: HashSet::new(),
             mesh_link_spawned: HashSet::new(),
             region_lease_epoch: HashMap::new(),
@@ -1909,6 +1911,33 @@ impl ServerState {
                 "kind": "delete_tombstone",
                 "entity": eid,
                 "version": 0,
+                "writer": "wal_compaction",
+            });
+            buf.clear();
+            buf.push_str(&wal_v1_envelope_line(&ev));
+            buf.push('\n');
+            if out.write_all(buf.as_bytes()).is_err() {
+                self.wal_degraded = true;
+                return;
+            }
+            bytes += buf.len() as u64;
+        }
+        // Preserve completed onward mesh departures across compaction. Without this durable fence, an old
+        // upstream MeshHandoff resend after a restart could re-adopt an eid this broker already forwarded.
+        let mut forwarded: Vec<(String, u64)> = self
+            .mesh_forwarded_epoch
+            .iter()
+            .map(|(eid, epoch)| (eid.clone(), *epoch))
+            .collect();
+        forwarded.sort_by(|a, b| a.0.cmp(&b.0));
+        for (eid, authority_epoch) in forwarded {
+            if self.entities.contains_key(&eid) || self.deleted_entities.contains(&eid) {
+                continue;
+            }
+            let ev = json!({
+                "kind": "mesh_forwarded_fence",
+                "entity": eid,
+                "authority_epoch": authority_epoch,
                 "writer": "wal_compaction",
             });
             buf.clear();
@@ -2177,6 +2206,7 @@ type RecoveredStore = (
     HashSet<String>,
     Option<Value>,
     HashMap<String, Value>,
+    HashMap<String, u64>,
     u64,
     RecoverReport,
 );
@@ -2186,6 +2216,7 @@ type ReplayStore = (
     HashSet<String>,
     Option<Value>,
     HashMap<String, Value>,
+    HashMap<String, u64>,
     u64,
 );
 
@@ -2241,14 +2272,21 @@ fn recover_from_wal_report(path: &str, up_to_offset: Option<u64>) -> RecoveredSt
             HashSet::new(),
             None,
             HashMap::new(),
+            HashMap::new(),
             0,
             report,
         );
     }
 
     let good_events: Vec<&Value> = read.events.iter().collect();
-    let (store, tombstones, last_partition, recovered_pending, recovered_id_hwm) =
-        apply_wal_events(&good_events);
+    let (
+        store,
+        tombstones,
+        last_partition,
+        recovered_pending,
+        mesh_forwarded_epoch,
+        recovered_id_hwm,
+    ) = apply_wal_events(&good_events);
     if report.truncated_tail_bytes > 0 {
         println!(
             "[rust-broker] #2 WAL: truncated {} corrupt trailing byte(s) ({} record(s)) — the in-progress write from the crash",
@@ -2260,6 +2298,7 @@ fn recover_from_wal_report(path: &str, up_to_offset: Option<u64>) -> RecoveredSt
         tombstones,
         last_partition,
         recovered_pending,
+        mesh_forwarded_epoch,
         recovered_id_hwm,
         report,
     )
@@ -2272,6 +2311,7 @@ fn apply_wal_events(events: &[&Value]) -> ReplayStore {
     let mut tombstones: HashSet<String> = HashSet::new();
     let mut last_partition: Option<Value> = None; // R0.2: the latest partition_config (boundary/splits/mesh) to restore
     let mut recovered_pending: HashMap<String, Value> = HashMap::new(); // G2.1d: mesh_out not acked by the cut -> resend on restore
+    let mut mesh_forwarded_epoch: HashMap<String, u64> = HashMap::new(); // latest durable departure epoch per eid; fences late old-source resends after onward forwarding
     let mut recovered_id_hwm: u64 = 0; // ReserveEntityIds high-water mark: never reissue a block after restart
     let g2d_off = std::env::var("GW_G2D_OFF").is_ok(); // G2.1d test toggle: OFF reverts to pre-resolver (proves the wire-transit LOSS)
     for ev in events {
@@ -2282,6 +2322,7 @@ fn apply_wal_events(events: &[&Value]) -> ReplayStore {
                 if tombstones.contains(&eid) {
                     continue;
                 }
+                mesh_forwarded_epoch.remove(&eid);
                 let pos = arr2(ev.get("pos"));
                 let vel = arr2(ev.get("vel"));
                 let components = ev
@@ -2358,6 +2399,20 @@ fn apply_wal_events(events: &[&Value]) -> ReplayStore {
                 let eid = ev["entity"].as_str().unwrap_or("");
                 tombstones.insert(eid.to_string());
                 store.remove(eid);
+                mesh_forwarded_epoch.remove(eid);
+            }
+            "mesh_forwarded_fence" => {
+                let eid = ev["entity"].as_str().unwrap_or("");
+                if tombstones.contains(eid) {
+                    continue;
+                }
+                let forwarded_epoch = ev["authority_epoch"].as_u64().unwrap_or(0);
+                store.remove(eid);
+                recovered_pending.remove(eid);
+                mesh_forwarded_epoch
+                    .entry(eid.to_string())
+                    .and_modify(|epoch| *epoch = (*epoch).max(forwarded_epoch))
+                    .or_insert(forwarded_epoch);
             }
             "transfer" => {
                 let eid = ev["entity"].as_str().unwrap_or("");
@@ -2517,6 +2572,14 @@ fn apply_wal_events(events: &[&Value]) -> ReplayStore {
                 // channel", so restore recreates pending_mesh from this record and resends (exactly-once).
                 let eid = ev["entity"].as_str().unwrap_or("");
                 store.remove(eid);
+                let forwarded_epoch = ev["authority_epoch"]
+                    .as_u64()
+                    .or_else(|| ev["source_durable_gen"].as_u64())
+                    .unwrap_or(0);
+                mesh_forwarded_epoch
+                    .entry(eid.to_string())
+                    .and_modify(|epoch| *epoch = (*epoch).max(forwarded_epoch))
+                    .or_insert(forwarded_epoch);
                 if !g2d_off {
                     recovered_pending.insert(eid.to_string(), ev.clone());
                 }
@@ -2554,6 +2617,7 @@ fn apply_wal_events(events: &[&Value]) -> ReplayStore {
         tombstones,
         last_partition,
         recovered_pending,
+        mesh_forwarded_epoch,
         recovered_id_hwm,
     )
 }
@@ -3380,6 +3444,7 @@ fn spawn_committed_region(
     if state.deleted_entities.contains(eid) {
         return false;
     }
+    state.mesh_forwarded_epoch.remove(eid);
     let epoch = authority.epoch.unwrap_or(1);
     state.entities.insert(
         eid.to_string(),
@@ -3533,6 +3598,11 @@ fn mesh_forward(state: &mut ServerState, eid: &str, target: &str) {
         return;
     }
     state.durable_gen = state.durable_gen.max(source_gen);
+    state
+        .mesh_forwarded_epoch
+        .entry(eid.to_string())
+        .and_modify(|epoch| *epoch = (*epoch).max(authority_epoch))
+        .or_insert(authority_epoch);
     record_replay_tape_handoff(
         state,
         ReplayHandoffRecord {
@@ -7024,6 +7094,40 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             // don't double-spawn, but DO re-ACK below so the sender can release it. ACK in BOTH cases.
             let pos = arr2(f.get("pos"));
             let authority_epoch = f.get("authority_epoch").and_then(|v| v.as_u64());
+            if let Some(forwarded_epoch) = state.mesh_forwarded_epoch.get(&eid).copied() {
+                let stale_or_legacy = authority_epoch
+                    .map(|epoch| epoch <= forwarded_epoch)
+                    .unwrap_or(true);
+                if stale_or_legacy {
+                    state.rejected.push(json!({
+                        "reason":"mesh handoff stale after onward forward",
+                        "entity":eid,
+                        "authority_epoch":authority_epoch,
+                        "forwarded_authority_epoch":forwarded_epoch
+                    }));
+                    if state.rejected.len() > 256 {
+                        let drop = state.rejected.len() - 256;
+                        state.rejected.drain(0..drop);
+                    }
+                    emit(state, wid, json!({"op":"MeshAck","entity":eid}));
+                    return;
+                }
+                if state.pending_mesh.contains_key(&eid) && !record_mesh_ack(state, &eid) {
+                    return;
+                }
+            } else if state.pending_mesh.contains_key(&eid) {
+                state.rejected.push(json!({
+                    "reason":"mesh handoff stale while onward handoff pending",
+                    "entity":eid,
+                    "authority_epoch":authority_epoch
+                }));
+                if state.rejected.len() > 256 {
+                    let drop = state.rejected.len() - 256;
+                    state.rejected.drain(0..drop);
+                }
+                emit(state, wid, json!({"op":"MeshAck","entity":eid}));
+                return;
+            }
             let target = f.get("target").and_then(|v| v.as_str());
             let Some(adopt_region) = receiving_region_for_adopt(state, pos, target) else {
                 state.rejected.push(json!({
@@ -7661,8 +7765,15 @@ async fn main() {
         let restore_offset = std::env::var("GW_RESTORE_OFFSET")
             .ok()
             .and_then(|s| s.parse::<u64>().ok());
-        let (store, tombstones, topology, recovered_pending, recovered_id_hwm, report) =
-            recover_from_wal_report(&path, restore_offset);
+        let (
+            store,
+            tombstones,
+            topology,
+            recovered_pending,
+            recovered_forwarded,
+            recovered_id_hwm,
+            report,
+        ) = recover_from_wal_report(&path, restore_offset);
 
         // #2 RESTORE DRY-RUN: GW_RESTORE_DRYRUN=1 validates a WAL (version / corrupt-tail / content hash /
         // entity_count) and EXITS WITHOUT serving, so automation can vet a WAL before booting the broker on it.
@@ -7695,6 +7806,7 @@ async fn main() {
         let n = store.len();
         state.entities = store;
         state.deleted_entities = tombstones;
+        state.mesh_forwarded_epoch = recovered_forwarded;
         state.entity_id_reservations = recovered_id_hwm;
         // R0.2: restore the partition topology (boundary/splits/mesh) so the router matches recovered placement.
         if let Some(pc) = topology {
@@ -9708,7 +9820,7 @@ mod tests {
 
         assert_eq!(state.entities["ship"].region, "E");
         drop(state.wal.take());
-        let (store, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
+        let (store, _, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
         assert!(report.error.is_none(), "{:?}", report.error);
         assert_eq!(store["ship"].region, "E");
     }
@@ -9763,7 +9875,7 @@ mod tests {
             Some(&"cell-worker".to_string())
         );
         drop(state.wal.take());
-        let (store, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
+        let (store, _, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
         assert!(report.error.is_none(), "{:?}", report.error);
         assert_eq!(store["ship"].region, "Z2_3");
     }
@@ -9818,7 +9930,7 @@ mod tests {
             Some(&"cell-worker".to_string())
         );
         drop(state.wal.take());
-        let (store, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
+        let (store, _, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
         assert!(report.error.is_none(), "{:?}", report.error);
         assert_eq!(store["ship"].region, "Z2_3");
     }
@@ -9930,6 +10042,123 @@ mod tests {
                 == Some("mesh handoff existing-entity mismatch")
         }));
         assert_eq!(component_authority_epoch(&state.entities["ship"], "pos"), 3);
+    }
+
+    #[test]
+    fn mesh_handoff_old_upstream_resend_after_onward_forward_is_reacked_without_readopt() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_mesh_forwarded_fence_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        state.ensure_wal_header();
+        add_test_worker(&mut state, "east-worker", "E");
+        let mut upstream_rx = add_test_worker_with_rx(&mut state, "mesh-link-W", "MESH");
+
+        let upstream_handoff = json!({
+            "op":"MeshHandoff",
+            "entity":"ship",
+            "source_region":"W",
+            "target":"E",
+            "source_durable_gen":7,
+            "lease_epoch":1,
+            "authority_epoch":9,
+            "pos":[5.0,0.0],
+            "vel":[1.0,0.0],
+            "components":{"pos":[5.0,0.0],"vel":[1.0,0.0]}
+        });
+
+        state.mesh_ack_drop = true;
+        dispatch_inner(&mut state, "mesh-link-W", &upstream_handoff);
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "first ACK is intentionally lost"
+        );
+        assert!(state.entities.contains_key("ship"));
+
+        state.mesh_ack_drop = false;
+        let (tx_f, mut rx_f) = mpsc::unbounded_channel();
+        state.mesh.insert("F".to_string(), tx_f);
+        mesh_forward(&mut state, "ship", "F");
+        let onward = decode_test_frame(
+            &rx_f
+                .try_recv()
+                .expect("onward MeshHandoff to F must be emitted"),
+        );
+        assert_eq!(onward["op"], "MeshHandoff");
+        let forwarded_epoch = state
+            .mesh_forwarded_epoch
+            .get("ship")
+            .copied()
+            .expect("onward mesh_forward must record the departure fence");
+        assert!(forwarded_epoch > 9);
+        assert!(record_mesh_ack(&mut state, "ship"));
+        assert!(!state.entities.contains_key("ship"));
+        assert!(!state.pending_mesh.contains_key("ship"));
+        state.snapshot_seen = false;
+        state.wal_compact_bytes = 1;
+        state.wal_bytes = state.wal_bytes.max(4096);
+        state.maybe_compact_wal();
+        assert_eq!(
+            state.metrics.wal_compactions, 1,
+            "compaction must preserve the forwarded fence, not force WAL growth forever"
+        );
+
+        drop(state.wal.take());
+        let (_store, _deleted, _cfg, recovered_pending, recovered_forwarded, _id_hwm, report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert!(
+            recovered_pending.is_empty(),
+            "the onward handoff was ACKed, so restart must not resend E->F"
+        );
+        assert_eq!(
+            recovered_forwarded.get("ship").copied(),
+            Some(forwarded_epoch),
+            "restart must preserve the fact that E already forwarded this lineage onward"
+        );
+
+        let mut recovered = ServerState::new(30.0);
+        recovered.mesh_forwarded_epoch = recovered_forwarded;
+        add_test_worker(&mut recovered, "east-worker", "E");
+        let mut recovered_upstream_rx =
+            add_test_worker_with_rx(&mut recovered, "mesh-link-W", "MESH");
+
+        dispatch_inner(&mut recovered, "mesh-link-W", &upstream_handoff);
+
+        let ack = decode_test_frame(
+            &recovered_upstream_rx
+                .try_recv()
+                .expect("old upstream resend should be ACKed so W clears pending_mesh"),
+        );
+        assert_eq!(ack["op"], "MeshAck");
+        assert_eq!(ack["entity"], "ship");
+        assert!(
+            !recovered.entities.contains_key("ship"),
+            "old W->E resend must not recreate ship on E after E already forwarded it to F"
+        );
+        assert!(recovered.rejected.iter().any(|r| {
+            r.get("reason").and_then(|v| v.as_str())
+                == Some("mesh handoff stale after onward forward")
+        }));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -10592,7 +10821,7 @@ mod tests {
         assert!(new_epoch > old_epoch);
         drop(state.wal.take());
 
-        let (entities, _deleted, _cfg, _pending, _id_hwm, report) =
+        let (entities, _deleted, _cfg, _pending, _forwarded, _id_hwm, report) =
             recover_from_wal_report(&wal_path, None);
         assert!(
             report.error.is_none(),
@@ -10686,7 +10915,7 @@ mod tests {
         );
         drop(state.wal.take());
 
-        let (entities, _deleted, _cfg, _pending, _id_hwm, report) =
+        let (entities, _deleted, _cfg, _pending, _forwarded, _id_hwm, report) =
             recover_from_wal_report(&wal_path, None);
         assert!(
             report.error.is_none(),
@@ -10836,7 +11065,7 @@ mod tests {
             .collect();
         drop(state.wal.take());
 
-        let (entities, _deleted, _cfg, _pending, _id_hwm, report) =
+        let (entities, _deleted, _cfg, _pending, _forwarded, _id_hwm, report) =
             recover_from_wal_report(&wal_path, None);
         assert!(
             report.error.is_none(),
@@ -10881,7 +11110,7 @@ mod tests {
         assert_eq!(state.entity_id_reservations, 7);
         drop(state.wal.take());
 
-        let (_entities, _deleted, _cfg, _pending, id_hwm, report) =
+        let (_entities, _deleted, _cfg, _pending, _forwarded, id_hwm, report) =
             recover_from_wal_report(&wal_path, None);
         assert!(report.error.is_none());
         assert_eq!(id_hwm, 7);
@@ -11021,7 +11250,7 @@ mod tests {
         ));
         drop(state.wal.take());
 
-        let (cut_store, _deleted, _cfg, cut_pending, _id_hwm, cut_report) =
+        let (cut_store, _deleted, _cfg, cut_pending, _forwarded, _id_hwm, cut_report) =
             recover_from_wal_report(&wal_path, Some(cut_offset));
         assert!(cut_report.error.is_none(), "{:?}", cut_report.error);
         assert_eq!(
@@ -11035,7 +11264,7 @@ mod tests {
         );
         assert!(cut_pending.is_empty());
 
-        let (full_store, _deleted, _cfg, _pending, _id_hwm, full_report) =
+        let (full_store, _deleted, _cfg, _pending, _forwarded, _id_hwm, full_report) =
             recover_from_wal_report(&wal_path, None);
         assert!(full_report.error.is_none(), "{:?}", full_report.error);
         assert!(full_store.contains_key("pre-cut"));
@@ -11113,7 +11342,7 @@ mod tests {
         assert_eq!(state.entities["snapshot-ship"].pos, [4.0, 0.0]);
         drop(state.wal.take());
 
-        let (cut_store, _deleted, _cfg, cut_pending, _id_hwm, cut_report) =
+        let (cut_store, _deleted, _cfg, cut_pending, _forwarded, _id_hwm, cut_report) =
             recover_from_wal_report(&wal_path, Some(cut_offset));
         assert!(cut_report.error.is_none(), "{:?}", cut_report.error);
         let recovered = cut_store
@@ -11281,7 +11510,7 @@ mod tests {
             .as_u64()
             .expect("manifest must expose a WAL cut offset");
 
-        let (cut_store, _deleted, _cfg, cut_pending, _id_hwm, cut_report) =
+        let (cut_store, _deleted, _cfg, cut_pending, _forwarded, _id_hwm, cut_report) =
             recover_from_wal_report(&wal_path, Some(cut_offset));
         assert!(cut_report.error.is_none(), "{:?}", cut_report.error);
         assert!(
@@ -11307,7 +11536,7 @@ mod tests {
         assert!(record_mesh_ack(&mut state, "ship"));
         drop(state.wal.take());
 
-        let (full_store, _deleted, _cfg, full_pending, _id_hwm, full_report) =
+        let (full_store, _deleted, _cfg, full_pending, _forwarded, _id_hwm, full_report) =
             recover_from_wal_report(&wal_path, None);
         assert!(full_report.error.is_none(), "{:?}", full_report.error);
         assert!(
@@ -11553,7 +11782,7 @@ mod tests {
         assert_eq!(state.entities["foldy"].pos, [100.0, 200.0]);
         drop(state.wal.take());
 
-        let (entities, _deleted, _cfg, _pending, _id_hwm, report) =
+        let (entities, _deleted, _cfg, _pending, _forwarded, _id_hwm, report) =
             recover_from_wal_report(&wal_path, None);
         assert!(
             report.error.is_none(),
@@ -11597,7 +11826,7 @@ mod tests {
         assert!(!state.wal_degraded, "compaction must succeed");
 
         // Replay the compacted WAL exactly as a restart would.
-        let (entities, deleted, _cfg, _comp, _id_hwm, report) =
+        let (entities, deleted, _cfg, _comp, _forwarded, _id_hwm, report) =
             recover_from_wal_report(&wal_path, None);
         assert!(
             report.error.is_none(),
