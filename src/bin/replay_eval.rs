@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::process;
 
+use godworks_protocol::operation_semantics;
 use serde_json::{json, Value};
 
 const REDACTED_KEYS: &[&str] = &["auth_token", "value", "payload", "components", "updates"];
@@ -117,6 +118,7 @@ fn validate_event_contract(event: &Value, line_no: usize, errors: &mut Vec<Strin
             };
             require_str(summary, line_no, "op", errors);
             require_u64(summary, line_no, "wire_bytes", errors);
+            validate_op_summary_semantics(summary, line_no, errors);
             if event.get("outcome").and_then(Value::as_str) == Some("rejected")
                 && event.get("reason").and_then(Value::as_str) == Some("role_policy_error")
                 && summary
@@ -148,6 +150,42 @@ fn validate_event_contract(event: &Value, line_no: usize, errors: &mut Vec<Strin
             }
         }
         _ => {}
+    }
+}
+
+fn validate_op_summary_semantics(summary: &Value, line_no: usize, errors: &mut Vec<String>) {
+    let Some(op) = summary.get("op").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(semantics) = operation_semantics(op) else {
+        return;
+    };
+    if let Some(persistence) = summary.get("persistence").and_then(Value::as_str) {
+        let expected = semantics.persistence.as_str();
+        if persistence != expected {
+            errors.push(format!(
+                "line {line_no}: op_summary.persistence for {op} must be {expected}, got {persistence}"
+            ));
+        }
+    }
+    if let Some(category) = summary.get("category").and_then(Value::as_str) {
+        let expected = semantics.category.as_str();
+        if category != expected {
+            errors.push(format!(
+                "line {line_no}: op_summary.category for {op} must be {expected}, got {category}"
+            ));
+        }
+    }
+    if let Some(response_op) = summary.get("response_op").and_then(Value::as_str) {
+        match semantics.response_op {
+            Some(expected) if response_op == expected => {}
+            Some(expected) => errors.push(format!(
+                "line {line_no}: op_summary.response_op for {op} must be {expected}, got {response_op}"
+            )),
+            None => errors.push(format!(
+                "line {line_no}: op_summary.response_op for {op} must be omitted"
+            )),
+        }
     }
 }
 
@@ -272,6 +310,19 @@ mod tests {
             .errors
             .iter()
             .any(|err| err.contains("missing string rejected_op")));
+    }
+
+    #[test]
+    fn wrong_operation_semantic_tag_fails() {
+        let tape = r#"{"kind":"broker_ingress","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d","boundary_count":1},"outcome":"dispatched","op_summary":{"op":"CommandRequest","wire_bytes":96,"persistence":"persistent","category":"entity_lifecycle"}}"#;
+        let report = validate_tape(tape);
+        assert!(report.errors.iter().any(|err| {
+            err.contains("op_summary.persistence for CommandRequest must be transient")
+        }));
+        assert!(report
+            .errors
+            .iter()
+            .any(|err| err.contains("op_summary.category for CommandRequest must be command_rpc")));
     }
 
     #[test]

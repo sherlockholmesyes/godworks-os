@@ -28,6 +28,111 @@ pub const fn supports_protocol(version: u64) -> bool {
     version >= MIN_PROTOCOL_VERSION && version <= PROTOCOL_VERSION
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationPersistence {
+    Persistent,
+    Transient,
+}
+
+impl OperationPersistence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Persistent => "persistent",
+            Self::Transient => "transient",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationCategory {
+    EntityLifecycle,
+    LifecycleResponse,
+    CommandRpc,
+    EntityEvent,
+}
+
+impl OperationCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EntityLifecycle => "entity_lifecycle",
+            Self::LifecycleResponse => "lifecycle_response",
+            Self::CommandRpc => "command_rpc",
+            Self::EntityEvent => "entity_event",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperationSemantics {
+    pub op: &'static str,
+    pub persistence: OperationPersistence,
+    pub category: OperationCategory,
+    pub response_op: Option<&'static str>,
+}
+
+pub const OPERATION_SEMANTICS: &[OperationSemantics] = &[
+    OperationSemantics {
+        op: "CreateEntity",
+        persistence: OperationPersistence::Persistent,
+        category: OperationCategory::EntityLifecycle,
+        response_op: Some("CreateEntityResponse"),
+    },
+    OperationSemantics {
+        op: "CreateEntityResponse",
+        persistence: OperationPersistence::Transient,
+        category: OperationCategory::LifecycleResponse,
+        response_op: None,
+    },
+    OperationSemantics {
+        op: "DeleteEntity",
+        persistence: OperationPersistence::Persistent,
+        category: OperationCategory::EntityLifecycle,
+        response_op: Some("DeleteEntityResponse"),
+    },
+    OperationSemantics {
+        op: "DeleteEntityResponse",
+        persistence: OperationPersistence::Transient,
+        category: OperationCategory::LifecycleResponse,
+        response_op: None,
+    },
+    OperationSemantics {
+        op: "ReserveEntityIds",
+        persistence: OperationPersistence::Persistent,
+        category: OperationCategory::EntityLifecycle,
+        response_op: Some("ReserveEntityIdsResponse"),
+    },
+    OperationSemantics {
+        op: "ReserveEntityIdsResponse",
+        persistence: OperationPersistence::Transient,
+        category: OperationCategory::LifecycleResponse,
+        response_op: None,
+    },
+    OperationSemantics {
+        op: "CommandRequest",
+        persistence: OperationPersistence::Transient,
+        category: OperationCategory::CommandRpc,
+        response_op: Some("CommandResponse"),
+    },
+    OperationSemantics {
+        op: "CommandResponse",
+        persistence: OperationPersistence::Transient,
+        category: OperationCategory::CommandRpc,
+        response_op: None,
+    },
+    OperationSemantics {
+        op: "EntityEvent",
+        persistence: OperationPersistence::Transient,
+        category: OperationCategory::EntityEvent,
+        response_op: None,
+    },
+];
+
+pub fn operation_semantics(op: &str) -> Option<&'static OperationSemantics> {
+    OPERATION_SEMANTICS
+        .iter()
+        .find(|semantics| semantics.op == op)
+}
+
 /// Coarse peer role inferred from the current `WorkerConnect.region` model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerRole {
@@ -152,6 +257,28 @@ pub struct JsonFields {
     pub fields: Map<String, Value>,
 }
 
+impl JsonFields {
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.fields.get(key)
+    }
+
+    pub fn str(&self, key: &str) -> Option<&str> {
+        self.get(key).and_then(Value::as_str)
+    }
+
+    pub fn bool(&self, key: &str) -> Option<bool> {
+        self.get(key).and_then(Value::as_bool)
+    }
+
+    pub fn u64(&self, key: &str) -> Option<u64> {
+        self.get(key).and_then(Value::as_u64)
+    }
+
+    pub fn f64(&self, key: &str) -> Option<f64> {
+        self.get(key).and_then(Value::as_f64)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CriticalSection {
     pub phase: String,
@@ -182,6 +309,24 @@ pub struct CreateEntityResponse {
     pub fields: JsonFields,
 }
 
+impl CreateEntityResponse {
+    pub fn request_id(&self) -> Option<&str> {
+        self.fields.str("request_id")
+    }
+
+    pub fn entity(&self) -> Option<&str> {
+        self.fields.str("entity")
+    }
+
+    pub fn success(&self) -> Option<bool> {
+        self.fields.bool("success")
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.fields.str("reason")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteEntity {
     pub entity: EntityId,
@@ -194,6 +339,28 @@ pub struct DeleteEntityResponse {
     pub fields: JsonFields,
 }
 
+impl DeleteEntityResponse {
+    pub fn request_id(&self) -> Option<&str> {
+        self.fields.str("request_id")
+    }
+
+    pub fn entity(&self) -> Option<&str> {
+        self.fields.str("entity")
+    }
+
+    pub fn success(&self) -> Option<bool> {
+        self.fields.bool("success")
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.fields.str("reason")
+    }
+
+    pub fn idempotent(&self) -> Option<bool> {
+        self.fields.bool("idempotent")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReserveEntityIds {
     pub request_id: Option<String>,
@@ -203,6 +370,20 @@ pub struct ReserveEntityIds {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReserveEntityIdsResponse {
     pub fields: JsonFields,
+}
+
+impl ReserveEntityIdsResponse {
+    pub fn request_id(&self) -> Option<&str> {
+        self.fields.str("request_id")
+    }
+
+    pub fn first_id(&self) -> Option<u64> {
+        self.fields.u64("first_id")
+    }
+
+    pub fn count(&self) -> Option<u64> {
+        self.fields.u64("count")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -314,14 +495,104 @@ pub struct CommandRequest {
     pub fields: JsonFields,
 }
 
+impl CommandRequest {
+    pub fn request_id(&self) -> Option<&str> {
+        self.fields.str("request_id")
+    }
+
+    pub fn entity(&self) -> Option<&str> {
+        self.fields.str("entity")
+    }
+
+    pub fn command(&self) -> Option<&Value> {
+        self.fields.get("command")
+    }
+
+    pub fn payload(&self) -> Option<&Value> {
+        self.fields.get("payload")
+    }
+
+    pub fn caller(&self) -> Option<&str> {
+        self.fields.str("caller")
+    }
+
+    pub fn idempotency_key(&self) -> Option<&str> {
+        self.fields.str("idempotency_key")
+    }
+
+    pub fn timeout_ms(&self) -> Option<u64> {
+        self.fields.u64("timeout_ms")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommandResponse {
     pub fields: JsonFields,
 }
 
+impl CommandResponse {
+    pub fn request_id(&self) -> Option<&str> {
+        self.fields.str("request_id")
+    }
+
+    pub fn success(&self) -> Option<bool> {
+        self.fields.bool("success")
+    }
+
+    pub fn success_or_default(&self) -> bool {
+        self.success().unwrap_or(true)
+    }
+
+    pub fn payload(&self) -> Option<&Value> {
+        self.fields.get("payload")
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.fields.str("reason")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntityEvent {
     pub fields: JsonFields,
+}
+
+impl EntityEvent {
+    pub fn entity(&self) -> Option<&str> {
+        self.fields.str("entity")
+    }
+
+    pub fn event(&self) -> Option<&Value> {
+        self.fields.get("event")
+    }
+
+    pub fn payload(&self) -> Option<&Value> {
+        self.fields.get("payload")
+    }
+
+    pub fn sim_time(&self) -> Option<f64> {
+        self.fields.f64("sim_time")
+    }
+
+    pub fn gen(&self) -> Option<u64> {
+        self.fields.u64("gen")
+    }
+
+    pub fn class(&self) -> Option<&str> {
+        self.fields.str("class")
+    }
+
+    pub fn class_or_default(&self) -> &str {
+        self.class().unwrap_or("critical")
+    }
+
+    pub fn coalesce_key(&self) -> Option<&str> {
+        self.fields.str("coalesce_key")
+    }
+
+    pub fn count(&self) -> Option<u64> {
+        self.fields.u64("count")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

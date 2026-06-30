@@ -670,6 +670,7 @@ mod tests {
     use super::*;
     use crate::ProtocolErrorKind;
     use crate::PROTOCOL_VERSION;
+    use crate::{operation_semantics, OperationCategory, OperationPersistence};
 
     fn assert_roundtrip(raw: Value) {
         let decoded = decode_json_value(&raw).unwrap();
@@ -885,6 +886,193 @@ mod tests {
                 "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
             }
         }));
+    }
+
+    #[test]
+    fn command_and_event_semantic_accessors_match_current_wire_names() {
+        let command = decode_json_value(&json!({
+            "op": "CommandRequest",
+            "request_id": "cmd-1",
+            "entity": "node-1",
+            "command": "UseTool",
+            "payload": { "slot": 2 },
+            "caller": "client-1",
+            "idempotency_key": "cmd-1/client-1",
+            "timeout_ms": 250
+        }))
+        .unwrap();
+        let Op::CommandRequest(command) = command else {
+            panic!("expected CommandRequest");
+        };
+        assert_eq!(command.request_id(), Some("cmd-1"));
+        assert_eq!(command.entity(), Some("node-1"));
+        assert_eq!(command.command(), Some(&json!("UseTool")));
+        assert_eq!(command.payload(), Some(&json!({ "slot": 2 })));
+        assert_eq!(command.caller(), Some("client-1"));
+        assert_eq!(command.idempotency_key(), Some("cmd-1/client-1"));
+        assert_eq!(command.timeout_ms(), Some(250));
+
+        let response = decode_json_value(&json!({
+            "op": "CommandResponse",
+            "request_id": "cmd-1",
+            "success": false,
+            "reason": "cooldown",
+            "payload": { "remaining_ms": 50 }
+        }))
+        .unwrap();
+        let Op::CommandResponse(response) = response else {
+            panic!("expected CommandResponse");
+        };
+        assert_eq!(response.request_id(), Some("cmd-1"));
+        assert_eq!(response.success(), Some(false));
+        assert!(!response.success_or_default());
+        assert_eq!(response.reason(), Some("cooldown"));
+        assert_eq!(response.payload(), Some(&json!({ "remaining_ms": 50 })));
+
+        let event = decode_json_value(&json!({
+            "op": "EntityEvent",
+            "entity": "node-1",
+            "event": "StatusChanged",
+            "payload": { "amount": 12 },
+            "sim_time": 123.5,
+            "gen": 77,
+            "class": "visual",
+            "coalesce_key": "node-1:status",
+            "count": 3
+        }))
+        .unwrap();
+        let Op::EntityEvent(event) = event else {
+            panic!("expected EntityEvent");
+        };
+        assert_eq!(event.entity(), Some("node-1"));
+        assert_eq!(event.event(), Some(&json!("StatusChanged")));
+        assert_eq!(event.payload(), Some(&json!({ "amount": 12 })));
+        assert_eq!(event.sim_time(), Some(123.5));
+        assert_eq!(event.gen(), Some(77));
+        assert_eq!(event.class(), Some("visual"));
+        assert_eq!(event.class_or_default(), "visual");
+        assert_eq!(event.coalesce_key(), Some("node-1:status"));
+        assert_eq!(event.count(), Some(3));
+    }
+
+    #[test]
+    fn lifecycle_response_semantic_accessors_match_current_wire_names() {
+        let create = decode_json_value(&json!({
+            "op": "CreateEntityResponse",
+            "request_id": "create-1",
+            "entity": "node-1",
+            "success": false,
+            "reason": "draining"
+        }))
+        .unwrap();
+        let Op::CreateEntityResponse(create) = create else {
+            panic!("expected CreateEntityResponse");
+        };
+        assert_eq!(create.request_id(), Some("create-1"));
+        assert_eq!(create.entity(), Some("node-1"));
+        assert_eq!(create.success(), Some(false));
+        assert_eq!(create.reason(), Some("draining"));
+
+        let delete = decode_json_value(&json!({
+            "op": "DeleteEntityResponse",
+            "request_id": "delete-1",
+            "entity": "node-1",
+            "success": true,
+            "idempotent": true
+        }))
+        .unwrap();
+        let Op::DeleteEntityResponse(delete) = delete else {
+            panic!("expected DeleteEntityResponse");
+        };
+        assert_eq!(delete.request_id(), Some("delete-1"));
+        assert_eq!(delete.entity(), Some("node-1"));
+        assert_eq!(delete.success(), Some(true));
+        assert_eq!(delete.reason(), None);
+        assert_eq!(delete.idempotent(), Some(true));
+
+        let reserve = decode_json_value(&json!({
+            "op": "ReserveEntityIdsResponse",
+            "request_id": "reserve-1",
+            "first_id": 1000,
+            "count": 32
+        }))
+        .unwrap();
+        let Op::ReserveEntityIdsResponse(reserve) = reserve else {
+            panic!("expected ReserveEntityIdsResponse");
+        };
+        assert_eq!(reserve.request_id(), Some("reserve-1"));
+        assert_eq!(reserve.first_id(), Some(1000));
+        assert_eq!(reserve.count(), Some(32));
+    }
+
+    #[test]
+    fn command_response_and_event_defaults_match_broker_semantics() {
+        let response = decode_json_value(&json!({
+            "op": "CommandResponse",
+            "request_id": "cmd-2"
+        }))
+        .unwrap();
+        let Op::CommandResponse(response) = response else {
+            panic!("expected CommandResponse");
+        };
+        assert_eq!(response.success(), None);
+        assert!(response.success_or_default());
+
+        let event = decode_json_value(&json!({
+            "op": "EntityEvent",
+            "entity": "node-1",
+            "event": "Ping"
+        }))
+        .unwrap();
+        let Op::EntityEvent(event) = event else {
+            panic!("expected EntityEvent");
+        };
+        assert_eq!(event.class(), None);
+        assert_eq!(event.class_or_default(), "critical");
+    }
+
+    #[test]
+    fn lifecycle_command_and_event_semantics_are_canonical() {
+        let create = operation_semantics("CreateEntity").expect("CreateEntity semantics");
+        assert_eq!(create.persistence, OperationPersistence::Persistent);
+        assert_eq!(create.category, OperationCategory::EntityLifecycle);
+        assert_eq!(create.response_op, Some("CreateEntityResponse"));
+
+        let delete = operation_semantics("DeleteEntity").expect("DeleteEntity semantics");
+        assert_eq!(delete.persistence, OperationPersistence::Persistent);
+        assert_eq!(delete.category, OperationCategory::EntityLifecycle);
+        assert_eq!(delete.response_op, Some("DeleteEntityResponse"));
+
+        let reserve = operation_semantics("ReserveEntityIds").expect("ReserveEntityIds semantics");
+        assert_eq!(reserve.persistence, OperationPersistence::Persistent);
+        assert_eq!(reserve.category, OperationCategory::EntityLifecycle);
+        assert_eq!(reserve.response_op, Some("ReserveEntityIdsResponse"));
+
+        for response in [
+            "CreateEntityResponse",
+            "DeleteEntityResponse",
+            "ReserveEntityIdsResponse",
+        ] {
+            let semantics = operation_semantics(response).expect("lifecycle response semantics");
+            assert_eq!(semantics.persistence, OperationPersistence::Transient);
+            assert_eq!(semantics.category, OperationCategory::LifecycleResponse);
+            assert_eq!(semantics.response_op, None);
+        }
+
+        let command = operation_semantics("CommandRequest").expect("CommandRequest semantics");
+        assert_eq!(command.persistence, OperationPersistence::Transient);
+        assert_eq!(command.category, OperationCategory::CommandRpc);
+        assert_eq!(command.response_op, Some("CommandResponse"));
+
+        let response = operation_semantics("CommandResponse").expect("CommandResponse semantics");
+        assert_eq!(response.persistence, OperationPersistence::Transient);
+        assert_eq!(response.category, OperationCategory::CommandRpc);
+        assert_eq!(response.response_op, None);
+
+        let event = operation_semantics("EntityEvent").expect("EntityEvent semantics");
+        assert_eq!(event.persistence, OperationPersistence::Transient);
+        assert_eq!(event.category, OperationCategory::EntityEvent);
+        assert_eq!(event.response_op, None);
     }
 
     #[test]

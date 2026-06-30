@@ -73,6 +73,8 @@ The evaluator fails if:
 - a redacted key appears anywhere in the tape;
 - a broker event lacks spatial contract metadata;
 - a spatial contract has a malformed `partition_schema`;
+- a known `op_summary` semantic tag contradicts the protocol table, such as
+  `CommandRequest` marked `persistent`;
 - a handoff event lacks authority epoch or durable-generation context;
 - a role-policy `UpdateRejected` breadcrumb omits the rejected op or peer role.
 

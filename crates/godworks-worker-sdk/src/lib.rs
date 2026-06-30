@@ -543,6 +543,7 @@ where
 mod tests {
     use super::*;
     use godworks_protocol::json::encode_json_value;
+    use godworks_protocol::{operation_semantics, OperationCategory, OperationPersistence};
     use serde_json::json;
     use tokio::io::duplex;
 
@@ -723,6 +724,26 @@ mod tests {
             ]))),
             json!({"op":"EntityEvent","entity":"W-b0","event":"StatusChanged","payload":{"amount":12},"sim_time":123.5,"gen":77,"class":"critical"})
         );
+    }
+
+    #[test]
+    fn sdk_lifecycle_command_event_helpers_bind_to_protocol_semantics() {
+        let reserve = operation_semantics("ReserveEntityIds").expect("ReserveEntityIds semantics");
+        assert_eq!(reserve.persistence, OperationPersistence::Persistent);
+        assert_eq!(reserve.category, OperationCategory::EntityLifecycle);
+        assert_eq!(reserve.response_op, Some("ReserveEntityIdsResponse"));
+
+        let command_response =
+            operation_semantics("CommandResponse").expect("CommandResponse semantics");
+        assert_eq!(
+            command_response.persistence,
+            OperationPersistence::Transient
+        );
+        assert_eq!(command_response.category, OperationCategory::CommandRpc);
+
+        let event = operation_semantics("EntityEvent").expect("EntityEvent semantics");
+        assert_eq!(event.persistence, OperationPersistence::Transient);
+        assert_eq!(event.category, OperationCategory::EntityEvent);
     }
 
     #[tokio::test]
