@@ -1,0 +1,9 @@
+; Godworks OS headless client probes.
+; Run with Godot 4.x:
+; godot --headless --path client_probes/godot --script res://cross_broker_handoff_probe.gd
+config_version=5
+
+[application]
+
+config/name="Godworks OS Client Probes"
+config/features=PackedStringArray("4.3")

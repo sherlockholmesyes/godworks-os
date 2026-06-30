@@ -114,6 +114,43 @@ cargo test cross_broker_reality_loadgen_requires_mesh_adoption -- --nocapture
 cargo test dense_seam_with_matching_e_worker_conserves_authority -- --nocapture
 ```
 
+## Godot Headless Client Probe
+
+The Godot cross-broker probe drives the same TCP protocol from a real Godot
+runtime and checks that a scene entity crosses W -> E, the E-side write becomes
+public, and a stale W-side write is rejected.
+
+Start two release brokers:
+
+```powershell
+# E broker
+$env:GW_BIND="127.0.0.1"; $env:GW_PORT="7802"; $env:GW_BOUNDARY="0"
+$env:GW_ADVERTISE="E=127.0.0.1:7802"; $env:GW_DURABLE_FLUSH_MS="5"
+.\target\release\godworks_broker.exe
+
+# W broker
+$env:GW_BIND="127.0.0.1"; $env:GW_PORT="7801"; $env:GW_BOUNDARY="0"
+$env:GW_ADVERTISE="W=127.0.0.1:7801"; $env:GW_MESH="E=127.0.0.1:7802"
+$env:GW_DURABLE_FLUSH_MS="5"
+.\target\release\godworks_broker.exe
+```
+
+Run the probe:
+
+```powershell
+$env:GW_HOST="127.0.0.1"; $env:GW_PORT_W="7801"; $env:GW_PORT_E="7802"
+godot --headless --path client_probes/godot --script res://cross_broker_handoff_probe.gd
+```
+
+If Godot is not on `PATH`, replace `godot` with the full path to a Godot 4.x
+console/editor binary.
+
+Expected result:
+
+```text
+GODOT CROSS-BROKER: PASS -- Godot runtime entity crossed W->E, E write is public, stale W owner fenced
+```
+
 For manual experiments, run one broker per region and connect them with `GW_MESH` / `GW_ADVERTISE`. Keep broker and worker processes alive in foreground terminals or under a process manager; shell-backgrounded children may exit when their launcher exits.
 
 ## Runtime Notes
