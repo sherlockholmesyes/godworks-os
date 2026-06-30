@@ -341,6 +341,16 @@ async fn main() {
                 ),
                 Op::UpdateRejected(rejected) => {
                     apply_update_rejected(rejected, &region, &mut metrics);
+                    drop_local_body_after_authority_reject(
+                        rejected,
+                        &region,
+                        &mut bots,
+                        &mut bodies,
+                        &mut islands,
+                        &mut colliders,
+                        &mut ijoints,
+                        &mut mjoints,
+                    );
                 }
                 Op::RemoveEntity(remove) => apply_remove_entity(
                     remove,
@@ -626,6 +636,33 @@ fn apply_update_rejected(rejected: &UpdateRejected, region: &str, metrics: &mut 
         .entry(reject_class_key(rejected))
         .or_insert(0) += 1;
     eprintln!("{}", update_rejected_log_line(region, rejected));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drop_local_body_after_authority_reject(
+    rejected: &UpdateRejected,
+    region: &str,
+    bots: &mut HashMap<String, Bot>,
+    bodies: &mut RigidBodySet,
+    islands: &mut IslandManager,
+    colliders: &mut ColliderSet,
+    ijoints: &mut ImpulseJointSet,
+    mjoints: &mut MultibodyJointSet,
+) {
+    if reject_reason_kind(&rejected.reason) != "not_authoritative" {
+        return;
+    }
+    let comp = reject_component(rejected);
+    if comp != "pos" && comp != "vel" {
+        return;
+    }
+    let Some(eid) = rejected.entity.as_ref().map(|entity| entity.as_ref()) else {
+        return;
+    };
+    if let Some(bot) = bots.remove(eid) {
+        destroy_body(bot.handle, bodies, islands, colliders, ijoints, mjoints);
+        eprintln!("[zw {region}] AUTH-REJECT-DROP e={eid} comp={comp}");
+    }
 }
 
 fn apply_add_entity(
@@ -963,6 +1000,38 @@ mod tests {
                 .get("comp=pos|reason=ghost_read_only|owner=E"),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn not_authoritative_reject_drops_local_physics_body() {
+        let rejected = UpdateRejected {
+            entity: Some("ship".into()),
+            component: Some("vel".into()),
+            reason: "not authoritative; owner=zw-E-lifecycle".to_string(),
+            fields: JsonFields { fields: Map::new() },
+        };
+
+        let mut bots = HashMap::new();
+        let mut bodies = RigidBodySet::new();
+        let mut islands = IslandManager::new();
+        let mut colliders = ColliderSet::new();
+        let mut ijoints = ImpulseJointSet::new();
+        let mut mjoints = MultibodyJointSet::new();
+        let handle = add_test_bot("ship", 7, &mut bots, &mut bodies);
+
+        drop_local_body_after_authority_reject(
+            &rejected,
+            "W",
+            &mut bots,
+            &mut bodies,
+            &mut islands,
+            &mut colliders,
+            &mut ijoints,
+            &mut mjoints,
+        );
+
+        assert!(bots.is_empty());
+        assert!(bodies.get(handle).is_none());
     }
 
     #[test]
