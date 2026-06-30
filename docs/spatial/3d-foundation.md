@@ -61,6 +61,9 @@ Candidate concepts:
 Do not add ad-hoc `pos`, `position`, `pos3`, `rot`, `rotation`, `lin`, and
 `ang` variants over time. Use stable names or a component registry.
 
+The built-in registry now assigns stable IDs to the current 2D wire names and
+the future 3D rail names. See `docs/protocol/component-registry.md`.
+
 Candidate core component names:
 
 - `core.pos2`

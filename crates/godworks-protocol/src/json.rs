@@ -14,8 +14,8 @@ use crate::{
     EntityQueryResponse, FlagUpdate, Fold, Heartbeat, InspectorFrame, InspectorQuery, Interest,
     JsonFields, LogMessage, MeshAck, MeshGhost, MeshGhostRemove, MeshHandoff, Metrics, Op,
     ProtocolError, RemoveComponent, RemoveEntity, ReserveEntityIds, ReserveEntityIdsResponse,
-    SetComponentAuthority, SetComponentAuthorityResponse, SnapshotMarker, ThresholdTx,
-    ThresholdTxResponse, UpdateComponent, UpdateRejected, WorkerConnect,
+    SetComponentAuthority, SetComponentAuthorityResponse, SnapshotManifest, SnapshotMarker,
+    ThresholdTx, ThresholdTxResponse, UpdateComponent, UpdateRejected, WorkerConnect,
 };
 
 pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
@@ -138,6 +138,9 @@ pub fn decode_json_value(value: &Value) -> Result<Op, ProtocolError> {
         "SnapshotMarker" => Ok(Op::SnapshotMarker(SnapshotMarker {
             fields: json_fields(value),
         })),
+        "SnapshotManifest" => Ok(Op::SnapshotManifest(SnapshotManifest {
+            fields: json_fields(value),
+        })),
         "MeshHandoff" => decode_mesh_handoff(value),
         "MeshAck" => Ok(Op::MeshAck(MeshAck {
             entity: EntityId::from(required_str(value, "entity")?),
@@ -198,6 +201,7 @@ pub fn encode_json_value(op: &Op) -> Value {
         Op::FlagUpdate(op) => encode_json_fields("FlagUpdate", &op.fields),
         Op::Metrics(op) => encode_json_fields("Metrics", &op.fields),
         Op::SnapshotMarker(op) => encode_json_fields("SnapshotMarker", &op.fields),
+        Op::SnapshotManifest(op) => encode_json_fields("SnapshotManifest", &op.fields),
         Op::MeshHandoff(op) => encode_mesh_handoff(op),
         Op::MeshAck(op) => json!({ "op": "MeshAck", "entity": op.entity.as_ref() }),
         Op::MeshGhost(op) => encode_json_fields("MeshGhost", &op.fields),
@@ -864,6 +868,23 @@ mod tests {
         assert_roundtrip(
             json!({ "op": "SnapshotMarker", "request_id": "snap-1", "snapshot_id": "s-1", "offset": 2048 }),
         );
+        assert_roundtrip(json!({
+            "op": "SnapshotManifest",
+            "request_id": "snap-1",
+            "snapshot_id": "s-1",
+            "wal_offset": 2048,
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            }
+        }));
     }
 
     #[test]

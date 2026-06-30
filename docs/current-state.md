@@ -48,6 +48,10 @@ full SpatialOS replacement
 - Global OBS visibility is claim-gated: an OBS peer needs `observer`, `debug`,
   or `inspector` to see the whole world without an AOI.
 - `godworks-protocol`, `godworks-core`, and `godworks-worker-sdk` alpha crates.
+- Stable built-in component registry v1 in `godworks-core`. The current JSON
+  wire still uses names such as `pos` and `vel`, but registry IDs now provide
+  the compatibility anchor for snapshots, replay/eval, SDKs, and a future
+  binary codec. See `docs/protocol/component-registry.md`.
 - `zone_worker` outbound protocol I/O through the Worker SDK, with typed inbound
   handling for authority/rejection/lifecycle-critical frames.
 - Shared WAL decoder and `wal_inspect` CLI.
@@ -122,6 +126,8 @@ project now has a 3D foundation rail for contracts and fixtures:
 - 3D AOI and partition schema names;
 - snapshot/WAL/replay spatial metadata;
 - protocol fixtures that preserve 3D component bags.
+- built-in component registry entries for current 2D names and future 3D
+  component names.
 
 Full 3D runtime, a 3D physics worker, and a 3D client remain later work. See
 `docs/spatial/3d-foundation.md`.

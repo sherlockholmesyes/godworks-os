@@ -61,6 +61,8 @@ with compatibility tests rather than rebuilding a second protocol path.
 - Redacted replay tape for offline eval and policy experiments.
 - 3D foundation rail: coordinate/schema docs, future-proof component names,
   partition schemas, and protocol fixtures that do not lock in 2D-only data.
+- Stable built-in component registry v1 for current 2D names and future 3D
+  component names.
 - Agent contribution trace/eval gate.
 - Docker Compose.
 - WAL inspect/recovery CLI.
@@ -104,8 +106,10 @@ in scope. See `docs/spatial/3d-foundation.md`.
 9. Add the 3D foundation rail: spatial docs, coordinate/schema terms, and
    protocol fixtures that preserve 3D component bags without changing current
    runtime behavior.
-10. Build client SDK.
-11. Build playable top-down arena.
+10. Add the stable component registry rail: numeric IDs for built-in current
+    and future spatial components without changing JSON wire behavior.
+11. Build client SDK.
+12. Build playable top-down arena.
 
 ## Product beta definition
 

@@ -62,6 +62,10 @@ jobs:
             echo "legacy string partition_schema replay tape unexpectedly passed"
             exit 1
           fi
+          if cargo run --quiet --bin replay_eval -- tests/fixtures/replay_eval/invalid-missing-component-registry.jsonl; then
+            echo "replay tape missing component_registry_version unexpectedly passed"
+            exit 1
+          fi
 
       - name: Release build
         run: cargo build --workspace --release

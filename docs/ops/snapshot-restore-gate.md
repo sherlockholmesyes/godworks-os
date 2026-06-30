@@ -25,6 +25,10 @@ snapshot restore into a second persistence system. The point is that the cut
 names the same spatial/partition contract as replay and future protocol
 fixtures.
 
+`component_registry_version = 1` means the cut can be interpreted against the
+built-in registry in `godworks-core`; it does not mean unknown project-specific
+components are rejected by the broker yet.
+
 To restore a broker to that point-in-time cut, restart it with the same WAL and:
 
 ```text

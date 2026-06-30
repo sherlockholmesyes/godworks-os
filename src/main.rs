@@ -28,6 +28,7 @@ use std::sync::atomic::AtomicBool;
 use godworks_broker::wal::{
     crc32_ieee, read_wal_events, wal_v1_envelope_line, wal_v1_header_line, WalReadReport,
 };
+use godworks_core::STANDARD_COMPONENT_REGISTRY_VERSION;
 use godworks_protocol::DEFAULT_MAX_FRAME_BYTES;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -72,7 +73,6 @@ const SNAPSHOT_MANIFEST_VERSION: u64 = 1;
 const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
 const SPATIAL_SCHEMA_VERSION: u64 = 1;
 const COORDINATE_CODEC_VERSION: u64 = 1;
-const COMPONENT_REGISTRY_VERSION: u64 = 0;
 
 struct InboundFrame {
     value: Value,
@@ -2660,6 +2660,10 @@ fn spatial_schema_contract(state: &ServerState) -> Value {
 fn record_replay_tape_spatial_contract(state: &ServerState, event: &mut Map<String, Value>) {
     event.insert("spatial_dim".to_string(), json!("D2"));
     event.insert("coordinate_codec".to_string(), json!("debug_f64_2"));
+    event.insert(
+        "component_registry_version".to_string(),
+        json!(STANDARD_COMPONENT_REGISTRY_VERSION),
+    );
     event.insert(
         "partition_schema".to_string(),
         partition_schema_contract(state),
@@ -6234,7 +6238,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     "snapshot_schema_version": SNAPSHOT_SCHEMA_VERSION,
                     "spatial_schema_version": SPATIAL_SCHEMA_VERSION,
                     "coordinate_codec_version": COORDINATE_CODEC_VERSION,
-                    "component_registry_version": COMPONENT_REGISTRY_VERSION,
+                    "component_registry_version": STANDARD_COMPONENT_REGISTRY_VERSION,
                     "partition_map_version": state.zone_topology_rev,
                     "spatial_schema": spatial_schema_contract(state),
                     "broker_id": broker_id, "wal_offset": wal_offset, "entity_count": state.entities.len(),
@@ -8363,6 +8367,10 @@ mod tests {
                 && event.get("to").and_then(Value::as_str) == Some("E")
                 && event.get("spatial_dim").and_then(Value::as_str) == Some("D2")
                 && event.get("coordinate_codec").and_then(Value::as_str) == Some("debug_f64_2")
+                && event
+                    .get("component_registry_version")
+                    .and_then(Value::as_u64)
+                    == Some(STANDARD_COMPONENT_REGISTRY_VERSION)
                 && event
                     .get("partition_schema")
                     .and_then(|schema| schema.get("kind"))
@@ -10586,7 +10594,10 @@ mod tests {
         assert_eq!(manifest["snapshot_schema_version"], 1);
         assert_eq!(manifest["spatial_schema_version"], 1);
         assert_eq!(manifest["coordinate_codec_version"], 1);
-        assert_eq!(manifest["component_registry_version"], 0);
+        assert_eq!(
+            manifest["component_registry_version"],
+            STANDARD_COMPONENT_REGISTRY_VERSION
+        );
         assert_eq!(manifest["partition_map_version"], 7);
         assert_eq!(manifest["spatial_schema"]["spatial_dim"], "D2");
         assert_eq!(
