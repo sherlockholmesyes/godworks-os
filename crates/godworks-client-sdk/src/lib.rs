@@ -72,6 +72,125 @@ pub enum ClientConnectionPhase {
     Live,
 }
 
+/// Engine-facing event emitted by [`ClientBridge`].
+///
+/// Engine bindings should react to these events and read [`ClientBridge::snapshot`]
+/// instead of maintaining a second cache in the engine runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientBridgeEvent {
+    PhaseChanged(ClientConnectionPhase),
+    Stream(ClientCacheEvent),
+    Resynced { entity_count: usize },
+}
+
+/// One entity row exported for engine bindings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClientEntityView {
+    pub entity: String,
+    pub components: BTreeMap<String, Value>,
+    pub authority: BTreeMap<String, ClientAuthority>,
+    pub ghost: bool,
+    pub owner_region: Option<String>,
+    pub position2: Option<[f64; 2]>,
+}
+
+/// A stable snapshot of the client bridge state for engine bindings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClientBridgeSnapshot {
+    pub phase: ClientConnectionPhase,
+    pub critical_depth: usize,
+    pub entity_count: usize,
+    pub rejection_count: usize,
+    pub entities: Vec<ClientEntityView>,
+}
+
+/// Transport-free bridge facade for engine integrations.
+///
+/// This is the first Godot/engine-facing layer, but it deliberately does not
+/// open sockets or depend on a Godot binding. A GDExtension/GDScript wrapper
+/// should delegate lifecycle and cache mutations to this facade so reconnect
+/// and full-resync behavior stays identical to the headless Rust tests.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClientBridge {
+    cache: ClientCache,
+}
+
+impl ClientBridge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cache(&self) -> &ClientCache {
+        &self.cache
+    }
+
+    pub fn connection_phase(&self) -> ClientConnectionPhase {
+        self.cache.connection_phase()
+    }
+
+    pub fn on_transport_closed(&mut self) -> ClientBridgeEvent {
+        self.cache.reset_for_reconnect();
+        ClientBridgeEvent::PhaseChanged(self.cache.connection_phase())
+    }
+
+    pub fn on_transport_connecting(&mut self) -> ClientBridgeEvent {
+        self.cache.mark_connecting();
+        ClientBridgeEvent::PhaseChanged(self.cache.connection_phase())
+    }
+
+    pub fn begin_full_resync(&mut self) -> ClientBridgeEvent {
+        self.cache.begin_resync();
+        ClientBridgeEvent::PhaseChanged(self.cache.connection_phase())
+    }
+
+    pub fn finish_full_resync(&mut self, response: &EntityQueryResponse) -> ClientBridgeEvent {
+        let entity_count = self.cache.finish_resync_from_query_response(response);
+        ClientBridgeEvent::Resynced { entity_count }
+    }
+
+    pub fn mark_live(&mut self) -> ClientBridgeEvent {
+        self.cache.mark_live();
+        ClientBridgeEvent::PhaseChanged(self.cache.connection_phase())
+    }
+
+    pub fn apply_stream_op(&mut self, op: &Op) -> ClientBridgeEvent {
+        ClientBridgeEvent::Stream(self.cache.apply_op(op))
+    }
+
+    pub fn snapshot(&self) -> ClientBridgeSnapshot {
+        let entities = self
+            .cache
+            .entities
+            .iter()
+            .map(|(entity, row)| ClientEntityView {
+                entity: entity.as_ref().to_string(),
+                components: row
+                    .components
+                    .iter()
+                    .map(|(component, value)| (component.as_ref().to_string(), value.clone()))
+                    .collect(),
+                authority: row
+                    .authority
+                    .iter()
+                    .map(|(component, authority)| {
+                        (component.as_ref().to_string(), authority.clone())
+                    })
+                    .collect(),
+                ghost: row.ghost,
+                owner_region: row.owner_region.clone(),
+                position2: row.position2(),
+            })
+            .collect();
+        ClientBridgeSnapshot {
+            phase: self.cache.connection_phase(),
+            critical_depth: self.cache.critical_depth(),
+            entity_count: self.cache.entity_count(),
+            rejection_count: self.cache.rejections().len(),
+            entities,
+        }
+    }
+}
+
 /// Transport-free cache for a Godworks client/observer stream.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClientCache {
@@ -702,6 +821,128 @@ mod tests {
         assert!(!cache.contains("stale"));
         assert!(cache.contains("fresh"));
         assert_eq!(cache.position2("fresh"), Some([2.0, 3.0]));
+    }
+
+    #[test]
+    fn bridge_reconnect_resync_exports_only_the_new_checkout_cut() {
+        let mut bridge = ClientBridge::new();
+        bridge.apply_stream_op(&Op::AddEntity(AddEntity {
+            entity: EntityId::from("stale"),
+            components: Some(json!({"pos":[99.0,99.0],"kind":"old"})),
+        }));
+        bridge.apply_stream_op(&Op::AuthorityChange(AuthorityChange {
+            entity: EntityId::from("stale"),
+            component: ComponentName::from("pos"),
+            authoritative: true,
+            authority_epoch: 3,
+            mode: "server_physics_island".to_string(),
+            fields: JsonFields { fields: Map::new() },
+        }));
+        bridge.apply_stream_op(&Op::MeshGhost(MeshGhost {
+            fields: JsonFields {
+                fields: Map::from_iter([
+                    ("entity".to_string(), json!("old-ghost")),
+                    ("pos".to_string(), json!([4.0, 4.0])),
+                    ("owner_region".to_string(), json!("E")),
+                ]),
+            },
+        }));
+        bridge.apply_stream_op(&Op::UpdateRejected(UpdateRejected {
+            entity: Some(EntityId::from("stale")),
+            component: Some(ComponentName::from("pos")),
+            reason: "stale authority_epoch".to_string(),
+            fields: JsonFields { fields: Map::new() },
+        }));
+        bridge.apply_stream_op(&Op::CriticalSection(CriticalSection {
+            phase: "begin".to_string(),
+            entity: Some(EntityId::from("stale")),
+        }));
+        bridge.mark_live();
+
+        assert_eq!(bridge.snapshot().entity_count, 2);
+        assert_eq!(
+            bridge.on_transport_closed(),
+            ClientBridgeEvent::PhaseChanged(ClientConnectionPhase::Disconnected)
+        );
+        let disconnected = bridge.snapshot();
+        assert_eq!(disconnected.phase, ClientConnectionPhase::Disconnected);
+        assert_eq!(disconnected.entity_count, 0);
+        assert_eq!(disconnected.rejection_count, 0);
+        assert_eq!(disconnected.critical_depth, 0);
+
+        assert_eq!(
+            bridge.on_transport_connecting(),
+            ClientBridgeEvent::PhaseChanged(ClientConnectionPhase::Connecting)
+        );
+        assert_eq!(
+            bridge.begin_full_resync(),
+            ClientBridgeEvent::PhaseChanged(ClientConnectionPhase::Resyncing)
+        );
+        assert_eq!(bridge.snapshot().entity_count, 0);
+
+        let resync = EntityQueryResponse {
+            fields: JsonFields {
+                fields: Map::from_iter([(
+                    "entities".to_string(),
+                    json!([
+                        {
+                            "entity":"fresh",
+                            "pos":[2.0,3.0],
+                            "components":{"kind":"new"},
+                            "region":"E",
+                            "authority":{"pos":{"owner":"zw-E","authority_epoch":8,"mode":"server_physics_island"}}
+                        }
+                    ]),
+                )]),
+            },
+        };
+        assert_eq!(
+            bridge.finish_full_resync(&resync),
+            ClientBridgeEvent::Resynced { entity_count: 1 }
+        );
+
+        let live = bridge.snapshot();
+        assert_eq!(live.phase, ClientConnectionPhase::Live);
+        assert_eq!(live.entity_count, 1);
+        assert_eq!(live.entities[0].entity, "fresh");
+        assert_eq!(live.entities[0].position2, Some([2.0, 3.0]));
+        assert_eq!(live.entities[0].components.get("kind"), Some(&json!("new")));
+        assert_eq!(
+            live.entities[0]
+                .authority
+                .get("pos")
+                .map(|a| a.authority_epoch),
+            Some(8)
+        );
+        assert!(!bridge.cache().contains("stale"));
+        assert!(!bridge.cache().contains("old-ghost"));
+    }
+
+    #[test]
+    fn bridge_ordinary_query_response_does_not_replace_live_cache() {
+        let mut bridge = ClientBridge::new();
+        bridge.apply_stream_op(&Op::AddEntity(AddEntity {
+            entity: EntityId::from("live"),
+            components: Some(json!({"pos":[1.0,1.0]})),
+        }));
+        bridge.mark_live();
+
+        let partial_query = Op::EntityQueryResponse(EntityQueryResponse {
+            fields: JsonFields {
+                fields: Map::from_iter([(
+                    "entities".to_string(),
+                    json!([{"entity":"other","pos":[9.0,9.0],"components":{}}]),
+                )]),
+            },
+        });
+
+        assert_eq!(
+            bridge.apply_stream_op(&partial_query),
+            ClientBridgeEvent::Stream(ClientCacheEvent::Ignored)
+        );
+        assert!(bridge.cache().contains("live"));
+        assert!(!bridge.cache().contains("other"));
+        assert_eq!(bridge.snapshot().entity_count, 1);
     }
 
     #[test]

@@ -48,6 +48,8 @@ full SpatialOS replacement
 - Global OBS visibility is claim-gated: an OBS peer needs `observer`, `debug`,
   or `inspector` to see the whole world without an AOI.
 - `godworks-protocol`, `godworks-core`, and `godworks-worker-sdk` alpha crates.
+- `godworks-client-sdk` alpha crate with a headless cache and transport-free
+  `ClientBridge` facade for engine bindings.
 - Stable built-in component registry v1 in `godworks-core`. The current JSON
   wire still uses names such as `pos` and `vel`, but registry IDs now provide
   the compatibility anchor for snapshots, replay/eval, SDKs, and a future
@@ -68,10 +70,9 @@ full SpatialOS replacement
 
 The server runtime is not enough for a game team. The product needs:
 
-- client SDK;
-- Godot bridge;
+- Godot bridge/binding that consumes `godworks-client-sdk::ClientBridge`;
 - typed component helpers;
-- reconnect/resync behavior;
+- transport examples for reconnect/resync over real sockets;
 - more examples that do not require hand-writing JSON frames.
 
 ### Protocol stability
@@ -139,8 +140,8 @@ Full 3D runtime, a 3D physics worker, and a 3D client remain later work. See
 3. Protocol v1 draft — initial draft exists.
 4. WAL/recovery module and CLI — shared WAL reader and `wal_inspect` exist.
 5. Worker SDK v0 — alpha exists and `zone_worker` uses it.
-6. Client SDK v0.
-7. Godot bridge v0.
+6. Client SDK v0 — alpha cache and engine bridge facade exist.
+7. Godot bridge v0 — binding/example remains.
 8. Top-down arena demo.
 9. Security v0 — max-frame, ingress frame-rate, shared-token auth,
    token-bound WorkerConnect claims, and peer role policy exist; broader

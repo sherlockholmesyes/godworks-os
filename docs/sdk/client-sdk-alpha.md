@@ -14,6 +14,7 @@ The alpha cache handles:
 - `MeshGhost` / `MeshGhostRemove` read-only projection markers
 - reconnect/resync cache lifecycle, including full rebuild from
   `EntityQueryResponse`
+- `ClientBridge`, a transport-free engine-facing facade over the cache
 
 The crate does not open sockets, run interpolation, predict movement, or expose an engine-specific API. Godot/Unity bridges should wrap this cache instead of duplicating protocol state handling in engine scripts.
 
@@ -49,3 +50,28 @@ Do not merge old rows into a new checkout. Authority epochs from the old
 connection are advisory history only; they must not drive writes after a
 reconnect. The Godot cross-broker probe is a runtime ruler for the wire path,
 not yet a reusable engine bridge.
+
+## Engine bridge facade
+
+`ClientBridge` is the first thin engine-facing layer. It is still headless and
+transport-free, but it makes the reconnect/resync lifecycle explicit for a
+Godot, Unity, or custom engine binding:
+
+1. `on_transport_closed()`
+2. `on_transport_connecting()`
+3. `begin_full_resync()`
+4. `finish_full_resync(EntityQueryResponse)`
+5. `apply_stream_op(Op)`
+
+The bridge owns one `ClientCache`. Engine bindings should read
+`ClientBridge::snapshot()` and react to `ClientBridgeEvent` instead of
+maintaining a second, parallel cache in engine scripts.
+
+Two fail-under-broken tests pin the contract:
+
+- `bridge_reconnect_resync_exports_only_the_new_checkout_cut` fails if stale
+  entities, ghost rows, rejected writes, or critical-section depth survive a
+  reconnect/full-resync cycle.
+- `bridge_ordinary_query_response_does_not_replace_live_cache` fails if a
+  partial `EntityQueryResponse` in normal live mode is accidentally treated as
+  the canonical reconnect checkout.

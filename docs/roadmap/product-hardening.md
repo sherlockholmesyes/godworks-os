@@ -41,6 +41,7 @@ with compatibility tests rather than rebuilding a second protocol path.
 
 - `godworks-client-sdk` alpha.
 - Headless client cache.
+- Transport-free engine bridge facade over the client cache.
 - Godot bridge v0.
 - Top-down arena demo with one broker.
 - Two-broker seamless handoff demo.
@@ -108,8 +109,9 @@ in scope. See `docs/spatial/3d-foundation.md`.
    runtime behavior.
 10. Add the stable component registry rail: numeric IDs for built-in current
     and future spatial components without changing JSON wire behavior.
-11. Build client SDK.
-12. Build playable top-down arena.
+11. Build client SDK — alpha cache and engine bridge facade exist.
+12. Build Godot bridge v0.
+13. Build playable top-down arena.
 
 ## Product beta definition
 
