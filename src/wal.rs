@@ -19,6 +19,7 @@ pub struct WalReadReport {
     pub decoded_record_count: u64,
     pub corrupt_tail_record_count: u64,
     pub truncated_tail_bytes: u64,
+    pub recoverable_prefix_bytes: u64,
     pub unknown_kind_count: u64,
     pub kind_counts: BTreeMap<String, u64>,
     pub unknown_kinds: BTreeMap<String, u64>,
@@ -128,8 +129,38 @@ pub fn is_known_wal_event_kind(kind: &str) -> bool {
 }
 
 pub fn read_wal_events(path: &str, up_to_offset: Option<u64>) -> WalReadResult {
-    let raw_lines: Vec<String> = match File::open(path) {
-        Ok(f) => BufReader::new(f).lines().map_while(Result::ok).collect(),
+    struct RawLine {
+        text: String,
+        bytes: u64,
+        cum_end: u64,
+    }
+
+    let raw_lines: Vec<RawLine> = match File::open(path) {
+        Ok(f) => {
+            let mut reader = BufReader::new(f);
+            let mut out = Vec::new();
+            let mut cumulative = 0u64;
+            loop {
+                let mut buf = Vec::new();
+                let n = match reader.read_until(b'\n', &mut buf) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                cumulative += n as u64;
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                out.push(RawLine {
+                    text: String::from_utf8_lossy(&buf).into_owned(),
+                    bytes: n as u64,
+                    cum_end: cumulative,
+                });
+            }
+            out
+        }
         Err(_) => {
             return WalReadResult {
                 events: Vec::new(),
@@ -144,11 +175,11 @@ pub fn read_wal_events(path: &str, up_to_offset: Option<u64>) -> WalReadResult {
     let mut wal_version: u64 = 0;
     let mut first_idx: Option<usize> = None;
     for (i, raw) in raw_lines.iter().enumerate() {
-        if raw.trim().is_empty() {
+        if raw.text.trim().is_empty() {
             continue;
         }
         first_idx = Some(i);
-        if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
+        if let Ok(v) = serde_json::from_str::<Value>(raw.text.trim()) {
             if v.get("kind").and_then(|k| k.as_str()) == Some("wal_header") {
                 wal_version = v.get("wal_version").and_then(|x| x.as_u64()).unwrap_or(0);
             }
@@ -180,11 +211,9 @@ pub fn read_wal_events(path: &str, up_to_offset: Option<u64>) -> WalReadResult {
     }
 
     let mut recs: Vec<Rec> = Vec::with_capacity(raw_lines.len());
-    let mut cumulative: u64 = 0;
     for (i, raw) in raw_lines.iter().enumerate() {
-        let span = raw.len() as u64 + 1;
-        cumulative += span;
-        let trimmed = raw.trim();
+        let span = raw.bytes;
+        let trimmed = raw.text.trim();
         if trimmed.is_empty() || Some(i) == header_idx {
             continue;
         }
@@ -200,7 +229,7 @@ pub fn read_wal_events(path: &str, up_to_offset: Option<u64>) -> WalReadResult {
         recs.push(Rec {
             ev,
             bytes: span,
-            cum_end: cumulative,
+            cum_end: raw.cum_end,
         });
     }
 
@@ -232,6 +261,17 @@ pub fn read_wal_events(path: &str, up_to_offset: Option<u64>) -> WalReadResult {
             };
         }
     }
+    let recoverable_prefix_bytes = if v1_mode {
+        if good_prefix_len > 0 {
+            recs[good_prefix_len - 1].cum_end
+        } else if let Some(idx) = header_idx {
+            raw_lines.get(idx).map(|r| r.cum_end).unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        raw_lines.last().map(|r| r.cum_end).unwrap_or(0)
+    };
 
     let mut events = Vec::new();
     let mut kind_counts = BTreeMap::new();
@@ -265,6 +305,7 @@ pub fn read_wal_events(path: &str, up_to_offset: Option<u64>) -> WalReadResult {
             decoded_record_count,
             corrupt_tail_record_count: tail_corrupt as u64,
             truncated_tail_bytes,
+            recoverable_prefix_bytes,
             unknown_kind_count,
             kind_counts,
             unknown_kinds,
@@ -335,6 +376,36 @@ mod tests {
         assert_eq!(read.events.len(), 1);
         assert_eq!(read.report.corrupt_tail_record_count, 1);
         assert!(read.report.truncated_tail_bytes > 0);
+        assert!(read.report.recoverable_prefix_bytes > 0);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn shared_wal_reader_reports_exact_recoverable_prefix_without_final_newline() {
+        let header = wal_v1_header_line();
+        let first = wal_v1_envelope_line(&json!({"kind":"register","entity":"e1"}));
+        let corrupt_tail = "{\"_c\":0,\"_d\":\"{\\\"kind\\\":\\\"write\\\"}\"}";
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "godworks_corrupt_tail_no_newline_{}_{}.wal",
+            std::process::id(),
+            nanos
+        ));
+        let body = format!("{header}\n{first}\n{corrupt_tail}");
+        fs::write(&path, body.as_bytes()).unwrap();
+
+        let read = read_wal_events(&path.to_string_lossy(), None);
+        assert!(read.report.error.is_none());
+        assert_eq!(read.events.len(), 1);
+        assert_eq!(
+            read.report.recoverable_prefix_bytes,
+            (header.len() + 1 + first.len() + 1) as u64
+        );
+        assert_eq!(read.report.truncated_tail_bytes, corrupt_tail.len() as u64);
 
         let _ = fs::remove_file(path);
     }
