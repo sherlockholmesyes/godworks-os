@@ -1,0 +1,56 @@
+{
+  "trace_version": 1,
+  "task_id": "gw-worker-auth-2026-06-29",
+  "date": "2026-06-29",
+  "agent_role": "implementation-verifier",
+  "repo_ref": "codex/broker-worker-auth-gate@fcf44e6",
+  "prompt_versions": {
+    "godworks_goal": "2026-06-29"
+  },
+  "intent": "Add a basic WorkerConnect authentication gate without changing the unauthenticated local-dev wire shape.",
+  "invariant": "When broker auth is configured, a peer cannot register, allocate egress state, or claim region ownership unless WorkerConnect carries the matching token.",
+  "inputs": {
+    "files": [
+      "src/main.rs",
+      "src/bin/zone_worker.rs",
+      "src/bin/reality_loadgen.rs",
+      "crates/godworks-protocol/src/lib.rs",
+      "crates/godworks-worker-sdk/src/lib.rs"
+    ],
+    "notes": [
+      "The gate must run before worker registration.",
+      "Cross-broker mesh links must authenticate when both brokers require auth."
+    ]
+  },
+  "actions": [
+    {
+      "type": "patch",
+      "summary": "Added optional auth_token on WorkerConnect plus AuthReject."
+    },
+    {
+      "type": "test",
+      "summary": "Added unit and runtime tests for rejected and accepted auth paths."
+    }
+  ],
+  "verification": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo check --workspace --all-targets",
+      "cargo clippy --workspace --all-targets",
+      "cargo test --workspace --all-targets -- --test-threads=1",
+      "cargo build --workspace --release"
+    ],
+    "runtime_gates": [
+      "worker_connect_auth_rejects_before_registration",
+      "zone_worker_auth_token_connects_to_auth_broker",
+      "cross_broker_reality_loadgen_with_worker_auth_still_adopts_mesh"
+    ],
+    "ci": "https://github.com/sherlockholmesyes/godworks-os/pull/25"
+  },
+  "failure_tags": [],
+  "decision": "accept",
+  "promotion_candidate": true,
+  "links": [
+    "https://github.com/sherlockholmesyes/godworks-os/pull/25"
+  ]
+}

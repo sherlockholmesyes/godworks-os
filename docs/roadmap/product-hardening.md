@@ -49,6 +49,7 @@ The product is a server-side spatial backend plus SDKs and tooling, not a full r
 - Mesh auth.
 - Broader per-principal rate-limit policy.
 - Metrics exporter.
+- Agent contribution trace/eval gate.
 - Docker Compose.
 - WAL inspect/recovery CLI.
 - Chaos/recovery tests.

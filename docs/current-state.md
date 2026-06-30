@@ -42,6 +42,7 @@ full SpatialOS replacement
 - Health/inspector-oriented runtime state.
 - Rapier2D physics worker demo.
 - Reality/load harness.
+- Agent reality-gate scaffold for trace/eval/promotion of agent-produced changes.
 
 ## Major product gaps
 
@@ -77,6 +78,7 @@ The runtime needs a repeatable operations story:
 - structured logs;
 - recovery CLI;
 - runbooks.
+- trace ledger for externally produced patches and reviews.
 
 ### Security
 
