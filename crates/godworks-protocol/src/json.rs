@@ -1076,6 +1076,92 @@ mod tests {
     }
 
     #[test]
+    fn mesh_authority_update_and_durability_semantics_are_canonical() {
+        for op in [
+            "AddComponent",
+            "RemoveComponent",
+            "UpdateComponent",
+            "BatchUpdate",
+        ] {
+            let semantics = operation_semantics(op).expect("entity update semantics");
+            assert_eq!(semantics.persistence, OperationPersistence::Persistent);
+            assert_eq!(semantics.category, OperationCategory::EntityUpdate);
+            assert_eq!(semantics.response_op, None);
+        }
+
+        let component_update =
+            operation_semantics("ComponentUpdate").expect("ComponentUpdate semantics");
+        assert_eq!(
+            component_update.persistence,
+            OperationPersistence::Transient
+        );
+        assert_eq!(component_update.category, OperationCategory::EntityUpdate);
+
+        let set_authority =
+            operation_semantics("SetComponentAuthority").expect("SetComponentAuthority semantics");
+        assert_eq!(set_authority.persistence, OperationPersistence::Persistent);
+        assert_eq!(set_authority.category, OperationCategory::AuthorityControl);
+        assert_eq!(
+            set_authority.response_op,
+            Some("SetComponentAuthorityResponse")
+        );
+
+        let authority_response = operation_semantics("SetComponentAuthorityResponse")
+            .expect("SetComponentAuthorityResponse semantics");
+        assert_eq!(
+            authority_response.persistence,
+            OperationPersistence::Transient
+        );
+        assert_eq!(
+            authority_response.category,
+            OperationCategory::AuthorityResponse
+        );
+
+        let authority_change =
+            operation_semantics("AuthorityChange").expect("AuthorityChange semantics");
+        assert_eq!(
+            authority_change.persistence,
+            OperationPersistence::Transient
+        );
+        assert_eq!(authority_change.category, OperationCategory::AuthorityEvent);
+
+        let fold = operation_semantics("Fold").expect("Fold semantics");
+        assert_eq!(fold.persistence, OperationPersistence::Persistent);
+        assert_eq!(fold.category, OperationCategory::HandoffControl);
+
+        let tx = operation_semantics("ThresholdTx").expect("ThresholdTx semantics");
+        assert_eq!(tx.persistence, OperationPersistence::Persistent);
+        assert_eq!(tx.category, OperationCategory::TransactionControl);
+        assert_eq!(tx.response_op, Some("ThresholdTxResponse"));
+
+        let tx_response =
+            operation_semantics("ThresholdTxResponse").expect("ThresholdTxResponse semantics");
+        assert_eq!(tx_response.persistence, OperationPersistence::Transient);
+        assert_eq!(tx_response.category, OperationCategory::TransactionResponse);
+
+        let snapshot = operation_semantics("SnapshotMarker").expect("SnapshotMarker semantics");
+        assert_eq!(snapshot.persistence, OperationPersistence::Persistent);
+        assert_eq!(snapshot.category, OperationCategory::DurabilityControl);
+
+        let handoff = operation_semantics("MeshHandoff").expect("MeshHandoff semantics");
+        assert_eq!(handoff.persistence, OperationPersistence::Persistent);
+        assert_eq!(handoff.category, OperationCategory::MeshHandoff);
+        assert_eq!(handoff.response_op, Some("MeshAck"));
+
+        let ack = operation_semantics("MeshAck").expect("MeshAck semantics");
+        assert_eq!(ack.persistence, OperationPersistence::Persistent);
+        assert_eq!(ack.category, OperationCategory::MeshHandoff);
+        assert_eq!(ack.response_op, None);
+
+        for op in ["MeshGhost", "MeshGhostRemove"] {
+            let semantics = operation_semantics(op).expect("mesh ghost semantics");
+            assert_eq!(semantics.persistence, OperationPersistence::Transient);
+            assert_eq!(semantics.category, OperationCategory::InterestProjection);
+            assert_eq!(semantics.response_op, None);
+        }
+    }
+
+    #[test]
     fn misc_and_mesh_visibility_frames_roundtrip() {
         assert_roundtrip(
             json!({ "op": "Fold", "entity": "node-1", "region": "MARS", "pos": [100.0, 200.0] }),

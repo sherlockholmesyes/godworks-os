@@ -103,6 +103,11 @@ fn validate_event_contract(event: &Value, line_no: usize, errors: &mut Vec<Strin
         require_u64(event, line_no, "component_registry_version", errors);
         require_partition_schema(event, line_no, errors);
     }
+    if let Some(summary) = event.get("op_summary") {
+        require_str(summary, line_no, "op", errors);
+        require_u64(summary, line_no, "wire_bytes", errors);
+        validate_op_summary_semantics(summary, line_no, errors);
+    }
     match kind {
         "broker_handoff" => {
             require_str(event, line_no, "path", errors);
@@ -116,9 +121,6 @@ fn validate_event_contract(event: &Value, line_no: usize, errors: &mut Vec<Strin
                 errors.push(format!("line {line_no}: missing op_summary"));
                 return;
             };
-            require_str(summary, line_no, "op", errors);
-            require_u64(summary, line_no, "wire_bytes", errors);
-            validate_op_summary_semantics(summary, line_no, errors);
             if event.get("outcome").and_then(Value::as_str) == Some("rejected")
                 && event.get("reason").and_then(Value::as_str) == Some("role_policy_error")
                 && summary
@@ -323,6 +325,23 @@ mod tests {
             .errors
             .iter()
             .any(|err| err.contains("op_summary.category for CommandRequest must be command_rpc")));
+    }
+
+    #[test]
+    fn wrong_mesh_operation_semantic_tag_fails() {
+        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d","boundary_count":1},"path":"mesh","entity":"ship","authority_epoch":7,"durable_gen":11,"op_summary":{"op":"MeshHandoff","wire_bytes":160,"persistence":"transient","category":"interest_projection","response_op":"MeshGhost"}}"#;
+        let report = validate_tape(tape);
+        assert!(report.errors.iter().any(|err| {
+            err.contains("op_summary.persistence for MeshHandoff must be persistent")
+        }));
+        assert!(report
+            .errors
+            .iter()
+            .any(|err| err.contains("op_summary.category for MeshHandoff must be mesh_handoff")));
+        assert!(report
+            .errors
+            .iter()
+            .any(|err| err.contains("op_summary.response_op for MeshHandoff must be MeshAck")));
     }
 
     #[test]
