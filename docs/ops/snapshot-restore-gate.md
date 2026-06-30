@@ -5,6 +5,26 @@ An admin peer sends `SnapshotMarker`; the broker appends a durable
 `snapshot_marker` record and replies with a `SnapshotManifest` containing the
 current `wal_offset`.
 
+`SnapshotManifest` is also the restore artifact contract. It carries enough
+schema metadata for future SDKs, tools, replay/eval jobs, and 3D-ready clients
+to interpret the cut without relying on out-of-band process state:
+
+- `snapshot_manifest_version`;
+- `snapshot_schema_version`;
+- `spatial_schema_version`;
+- `coordinate_codec_version`;
+- `component_registry_version`;
+- `partition_map_version`;
+- `spatial_schema.spatial_dim`;
+- `spatial_schema.coordinate_codec`;
+- `spatial_schema.partition_schema`.
+
+For the current product slice, `spatial_schema` still describes the 2D runtime:
+`D2`, `debug_f64_2`, and either `strip1d` or `grid2d`. The point is not to turn
+snapshot restore into a second persistence system. The point is that the cut
+names the same spatial/partition contract as replay and future protocol
+fixtures.
+
 To restore a broker to that point-in-time cut, restart it with the same WAL and:
 
 ```text
@@ -24,6 +44,7 @@ The task-relative regression gates are:
 
 ```text
 snapshot_marker_restore_offset_rolls_back_post_cut_entities
+snapshot_manifest_carries_spatial_schema_contract
 snapshot_vector_restores_in_flight_mesh_handoff_exactly_once
 ```
 
