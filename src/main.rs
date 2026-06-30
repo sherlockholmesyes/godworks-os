@@ -2218,6 +2218,7 @@ struct RecoverReport {
     decoded_record_count: u64,
     corrupt_tail_record_count: u64,
     truncated_tail_bytes: u64,
+    recoverable_prefix_bytes: u64,
     unknown_kind_count: u64,
     kind_counts: BTreeMap<String, u64>,
     unknown_kinds: BTreeMap<String, u64>,
@@ -2252,6 +2253,7 @@ impl From<WalReadReport> for RecoverReport {
             decoded_record_count: report.decoded_record_count,
             corrupt_tail_record_count: report.corrupt_tail_record_count,
             truncated_tail_bytes: report.truncated_tail_bytes,
+            recoverable_prefix_bytes: report.recoverable_prefix_bytes,
             unknown_kind_count: report.unknown_kind_count,
             kind_counts: report.kind_counts,
             unknown_kinds: report.unknown_kinds,
@@ -2326,6 +2328,39 @@ fn recover_from_wal_report(path: &str, up_to_offset: Option<u64>) -> RecoveredSt
         recovered_id_hwm,
         report,
     )
+}
+
+fn truncate_wal_tail_to_recoverable_prefix(
+    path: &str,
+    report: &RecoverReport,
+) -> Result<(), String> {
+    if report.truncated_tail_bytes == 0 {
+        return Ok(());
+    }
+    let current_len = std::fs::metadata(path)
+        .map_err(|e| format!("metadata failed for WAL tail truncate: {e}"))?
+        .len();
+    let prefix = report.recoverable_prefix_bytes;
+    if prefix > current_len {
+        return Err(format!(
+            "recoverable WAL prefix {prefix} exceeds on-disk length {current_len}"
+        ));
+    }
+    if prefix == current_len {
+        return Ok(());
+    }
+    let f = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("open failed for WAL tail truncate: {e}"))?;
+    f.set_len(prefix)
+        .map_err(|e| format!("set_len({prefix}) failed for WAL tail truncate: {e}"))?;
+    f.sync_data()
+        .map_err(|e| format!("sync_data failed after WAL tail truncate: {e}"))?;
+    println!(
+        "[rust-broker] #2 WAL: physically truncated corrupt tail to recoverable prefix {prefix} byte(s) (was {current_len})"
+    );
+    Ok(())
 }
 
 // Apply already-decoded (CRC-verified) WAL events to a fresh store. Split out of recover_from_wal_report so
@@ -4508,8 +4543,8 @@ fn maybe_split(state: &mut ServerState) {
                     .unwrap_or(true)
         })
         .filter_map(|(r, w)| state.worker_load.get(w).map(|&l| (r.clone(), l)))
-        .filter(|(_, l)| *l > SPLIT_HI)
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        .filter(|(_, l)| l.is_finite() && *l > SPLIT_HI)
+        .max_by(|a, b| a.1.total_cmp(&b.1));
     let region = match hot {
         Some((r, _)) => r,
         None => return,
@@ -4519,11 +4554,12 @@ fn maybe_split(state: &mut ServerState) {
         .values()
         .filter(|e| e.region == region)
         .map(|e| e.pos[0])
+        .filter(|x| x.is_finite())
         .collect();
     if xs.len() < 2 {
         return;
     }
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    xs.sort_by(|a, b| a.total_cmp(b));
     let median = xs[xs.len() / 2];
     state.splits.entry(region.clone()).or_default().push(median);
     wal_partition_config(state); // R0.2: persist the new split BEFORE the new sub-region routing is used
@@ -7869,6 +7905,7 @@ async fn main() {
                 "decoded_record_count": report.decoded_record_count,
                 "corrupt_tail_record_count": report.corrupt_tail_record_count,
                 "truncated_tail_bytes": report.truncated_tail_bytes,
+                "recoverable_prefix_bytes": report.recoverable_prefix_bytes,
                 "unknown_kind_count": report.unknown_kind_count,
                 "kind_counts": report.kind_counts,
                 "unknown_kinds": report.unknown_kinds,
@@ -7881,6 +7918,10 @@ async fn main() {
 
         // not a dry-run: a refuse (mid-corruption / unknown version) must NOT serve partial state -> fail closed.
         if let Some(err) = report.error {
+            eprintln!("[rust-broker] WAL recovery REFUSED — not serving: {}", err);
+            std::process::exit(2);
+        }
+        if let Err(err) = truncate_wal_tail_to_recoverable_prefix(&path, &report) {
             eprintln!("[rust-broker] WAL recovery REFUSED — not serving: {}", err);
             std::process::exit(2);
         }
@@ -8552,6 +8593,39 @@ mod tests {
             eids.push(eid);
         }
         eids
+    }
+
+    #[test]
+    fn maybe_split_ignores_non_finite_positions_without_panicking() {
+        let mut state = ServerState::new(30.0);
+        add_test_worker(&mut state, "hot", "W");
+        add_test_worker(&mut state, "standby", "SPARE");
+        state.region_worker.remove("SPARE");
+        state.standbys.push("standby".to_string());
+        state.worker_load.insert("hot".to_string(), 1.0);
+        state
+            .entities
+            .insert("nan".to_string(), test_entity([f64::NAN, 0.0], "W"));
+        state
+            .entities
+            .insert("left".to_string(), test_entity([-4.0, 0.0], "W"));
+        state
+            .entities
+            .insert("right".to_string(), test_entity([4.0, 0.0], "W"));
+
+        maybe_split(&mut state);
+
+        let splits = state.splits.get("W").expect("hot region should split");
+        assert_eq!(splits.len(), 1);
+        assert!(
+            splits[0].is_finite(),
+            "split boundary must come from finite entity positions"
+        );
+        assert_eq!(
+            state.rebalance_jobs.len(),
+            1,
+            "finite entities still produce the budgeted split migration"
+        );
     }
 
     #[test]
@@ -12329,6 +12403,77 @@ mod tests {
         let recovered = entities.get("foldy").unwrap();
         assert_eq!(recovered.region, "MARS");
         assert_eq!(recovered.pos, [100.0, 200.0]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_physically_truncates_corrupt_tail_before_append() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_wal_tail_truncate_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+        let header = wal_v1_header_line();
+        let register = wal_v1_envelope_line(&json!({
+            "kind":"register",
+            "entity":"ship",
+            "region":"W",
+            "pos":[1.0,0.0],
+            "vel":[0.0,0.0],
+            "components":{}
+        }));
+        let corrupt_tail = "{\"_c\":0,\"_d\":\"{\\\"kind\\\":\\\"write\\\"}\"}";
+        std::fs::write(
+            &wal_path,
+            format!("{header}\n{register}\n{corrupt_tail}").as_bytes(),
+        )
+        .unwrap();
+        let original_len = std::fs::metadata(&wal_path).unwrap().len();
+
+        let (store, _, _, _, _, _, report) = recover_from_wal_report(&wal_path, None);
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(store["ship"].pos, [1.0, 0.0]);
+        assert!(report.truncated_tail_bytes > 0);
+        assert!(report.recoverable_prefix_bytes < original_len);
+
+        truncate_wal_tail_to_recoverable_prefix(&wal_path, &report).unwrap();
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            report.recoverable_prefix_bytes,
+            "recovery must make the replay prefix physical before appending"
+        );
+
+        {
+            let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            writeln!(
+                f,
+                "{}",
+                wal_v1_envelope_line(&json!({
+                    "kind":"write",
+                    "entity":"ship",
+                    "comp":"pos",
+                    "value":[2.0,0.0],
+                    "version":2
+                }))
+            )
+            .unwrap();
+            f.sync_data().unwrap();
+        }
+
+        let (store2, _, _, _, _, _, report2) = recover_from_wal_report(&wal_path, None);
+        assert!(
+            report2.error.is_none(),
+            "a second restart after append must not reinterpret the old tail as mid-corruption: {:?}",
+            report2.error
+        );
+        assert_eq!(store2["ship"].pos, [2.0, 0.0]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -44,6 +44,7 @@ fn main() {
         "decoded_record_count": report.decoded_record_count,
         "corrupt_tail_record_count": report.corrupt_tail_record_count,
         "truncated_tail_bytes": report.truncated_tail_bytes,
+        "recoverable_prefix_bytes": report.recoverable_prefix_bytes,
         "unknown_kind_count": report.unknown_kind_count,
         "kind_counts": report.kind_counts,
         "unknown_kinds": report.unknown_kinds,
