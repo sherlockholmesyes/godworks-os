@@ -130,5 +130,7 @@ and runtime tests:
   covered by a regression test.
 - The broker-contact `component_authority` path should not mutate canonical RAM
   before its authority WAL record is known durable.
-- Add direct tests for dry-run report output, recovered `partition_config`, and
-  recovered pending `mesh_out` handoffs.
+- Add direct tests for dry-run report output and recovered `partition_config`.
+- Snapshot restore cuts and recovered pending `mesh_out` handoffs are covered
+  by broker replay tests in `src/main.rs`; keep those gates green before
+  changing WAL event semantics.
