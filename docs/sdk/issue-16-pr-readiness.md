@@ -95,13 +95,13 @@ Before pushing or opening a PR, run:
 ```powershell
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets -- --test-threads=1
 cargo build --workspace --release
 ```
 
-Known current warnings are existing dead-code/clippy warnings outside this
-slice.
+The clippy gate denies warnings; do not add local `allow` / `expect`
+suppression just to pass this slice.
 
 ## Guarded Failure Modes
 
