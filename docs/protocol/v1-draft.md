@@ -41,6 +41,19 @@ the matching `auth_token` string. A missing or mismatched token receives:
 
 The peer is not registered and does not claim region ownership.
 
+For private-alpha / production-style runs, prefer `GW_AUTH_CLAIMS` over the
+single shared token. `GW_AUTH_CLAIMS` maps each token to broker-owned
+connection claims:
+
+```text
+GW_AUTH_CLAIMS="w-secret:W:physics|sim,mesh-secret:MESH:mesh"
+```
+
+In this mode the peer may not self-assign a different region or extra
+attributes in `WorkerConnect`; the broker derives the registered region and
+attributes from the token claim and rejects mismatches with `AuthReject` before
+registration.
+
 ## Operation groups
 
 ### Connection and liveness

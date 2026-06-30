@@ -21,6 +21,8 @@ This document records the current environment-variable surface. It is intentiona
 | `GW_MESH_ADOPT_DROP` | Test hook: drop inbound mesh handoff adoption. |
 | `GW_G2D_OFF` | Test hook: disable resolver behavior for a recovery proof. |
 | `GW_REGISTRY` | Directory-based broker registry/service discovery. |
+| `GW_AUTH_TOKEN` | Legacy/dev shared token accepted by any `WorkerConnect` region claim. Prefer `GW_AUTH_CLAIMS` for private alpha. |
+| `GW_AUTH_CLAIMS` | Strict token-bound connection claims as `token:region:attr1\|attr2,token2:MESH:mesh`; broker registers region/attributes from the token and rejects mismatched peer claims. |
 
 ## Zone worker variables
 
