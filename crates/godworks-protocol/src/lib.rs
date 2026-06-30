@@ -6,6 +6,11 @@
 
 pub mod json;
 
+pub use godworks_core::{
+    ComponentId, ComponentKind, ComponentRegistry, ComponentSchema, ComponentVersion,
+    STANDARD_COMPONENT_REGISTRY_VERSION,
+};
+
 use godworks_core::{Aoi2, ComponentName, EntityId, PeerId, Position2, RegionId, Velocity2};
 use serde_json::{Map, Value};
 
@@ -83,6 +88,7 @@ pub enum Op {
     FlagUpdate(FlagUpdate),
     Metrics(Metrics),
     SnapshotMarker(SnapshotMarker),
+    SnapshotManifest(SnapshotManifest),
     MeshHandoff(MeshHandoff),
     MeshAck(MeshAck),
     MeshGhost(MeshGhost),
@@ -330,6 +336,11 @@ pub struct Metrics {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SnapshotMarker {
+    pub fields: JsonFields,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotManifest {
     pub fields: JsonFields,
 }
 

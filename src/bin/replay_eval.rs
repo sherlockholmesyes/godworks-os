@@ -99,6 +99,7 @@ fn validate_event_contract(event: &Value, line_no: usize, errors: &mut Vec<Strin
     if kind.starts_with("broker_") {
         require_str(event, line_no, "spatial_dim", errors);
         require_str(event, line_no, "coordinate_codec", errors);
+        require_u64(event, line_no, "component_registry_version", errors);
         require_partition_schema(event, line_no, errors);
     }
     match kind {
@@ -220,9 +221,9 @@ mod tests {
     #[test]
     fn valid_tape_accepts_role_policy_and_handoff() {
         let tape = r#"
-{"kind":"broker_ingress","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"strip1d","boundary_count":1},"outcome":"rejected","reason":"role_policy_error","op_summary":{"op":"CreateEntity","wire_bytes":64}}
-{"kind":"broker_outbound","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"strip1d","boundary_count":1},"op":"UpdateRejected","error":"role_policy_error","rejected_op":"CreateEntity","peer_role":"client"}
-{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"grid2d","cols":2,"rows":2},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}
+{"kind":"broker_ingress","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d","boundary_count":1},"outcome":"rejected","reason":"role_policy_error","op_summary":{"op":"CreateEntity","wire_bytes":64}}
+{"kind":"broker_outbound","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d","boundary_count":1},"op":"UpdateRejected","error":"role_policy_error","rejected_op":"CreateEntity","peer_role":"client"}
+{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"grid2d","cols":2,"rows":2},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}
 "#;
         let report = validate_tape(tape);
         assert_eq!(report.errors, Vec::<String>::new());
@@ -244,8 +245,18 @@ mod tests {
     }
 
     #[test]
+    fn broker_event_without_component_registry_version_fails() {
+        let tape = r#"{"kind":"broker_ingress","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"strip1d","boundary_count":1},"outcome":"dispatched","op_summary":{"op":"UpdateComponent","wire_bytes":64}}"#;
+        let report = validate_tape(tape);
+        assert!(report
+            .errors
+            .iter()
+            .any(|err| err.contains("missing u64 component_registry_version")));
+    }
+
+    #[test]
     fn redacted_key_anywhere_fails() {
-        let tape = r#"{"kind":"broker_ingress","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"strip1d","boundary_count":1},"outcome":"dispatched","op_summary":{"op":"UpdateComponent","wire_bytes":64,"value":"secret"}}"#;
+        let tape = r#"{"kind":"broker_ingress","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d","boundary_count":1},"outcome":"dispatched","op_summary":{"op":"UpdateComponent","wire_bytes":64,"value":"secret"}}"#;
         let report = validate_tape(tape);
         assert!(report
             .errors
@@ -255,7 +266,7 @@ mod tests {
 
     #[test]
     fn role_policy_outbound_without_rejected_op_fails() {
-        let tape = r#"{"kind":"broker_outbound","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"strip1d","boundary_count":1},"op":"UpdateRejected","error":"role_policy_error","peer_role":"client"}"#;
+        let tape = r#"{"kind":"broker_outbound","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d","boundary_count":1},"op":"UpdateRejected","error":"role_policy_error","peer_role":"client"}"#;
         let report = validate_tape(tape);
         assert!(report
             .errors
@@ -265,7 +276,7 @@ mod tests {
 
     #[test]
     fn grid2d_without_dimensions_fails() {
-        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"grid2d"},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
+        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"grid2d"},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
         let report = validate_tape(tape);
         assert!(report
             .errors
@@ -279,7 +290,7 @@ mod tests {
 
     #[test]
     fn strip1d_without_boundary_count_fails() {
-        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"strip1d"},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
+        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d"},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
         let report = validate_tape(tape);
         assert!(report
             .errors
@@ -289,7 +300,7 @@ mod tests {
 
     #[test]
     fn unknown_partition_schema_kind_fails() {
-        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","partition_schema":{"kind":"sector"},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
+        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"sector"},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
         let report = validate_tape(tape);
         assert!(report
             .errors

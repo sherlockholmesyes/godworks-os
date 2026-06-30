@@ -61,6 +61,24 @@ attributes in `WorkerConnect`; the broker derives the registered region and
 attributes from the token claim and rejects mismatches with `AuthReject` before
 registration.
 
+## Component identity
+
+The v1 JSON wire still uses component names such as `pos`, `vel`, and
+game-specific strings in component-bearing frames. Stable numeric component IDs
+live in the built-in registry described by
+`docs/protocol/component-registry.md`.
+
+For v1:
+
+```text
+JSON name = current debug/development codec.
+Component ID = compatibility anchor for snapshots, replay/eval, SDKs, and future binary codecs.
+```
+
+The broker does not reject unknown project-specific component names solely
+because they are absent from the built-in registry. Higher layers may extend the
+registry, but they must not reuse built-in IDs.
+
 ## Peer roles
 
 The wire keeps the current `WorkerConnect` shape, but the broker derives a
@@ -165,6 +183,7 @@ links.
 | `InspectorQuery` | inspector -> broker | no | Request full debug/ops state frame. |
 | `InspectorFrame` | broker -> inspector | no | Debug/ops state frame. |
 | `SnapshotMarker` | admin -> broker | yes | Mark coordinated snapshot/restore boundary. |
+| `SnapshotManifest` | broker -> admin | no | Return snapshot cut metadata and schema/version contract. |
 
 ## JSON codec coverage
 
@@ -181,7 +200,7 @@ Covered operation families:
 - components/authority: `AddComponent`, `RemoveComponent`, `UpdateComponent`, `BatchUpdate`, `SetComponentAuthority`, `SetComponentAuthorityResponse`, `AuthorityChange`, `UpdateRejected`
 - handoff/mesh: `Fold`, `ThresholdTx`, `ThresholdTxResponse`, `MeshHandoff`, `MeshAck`, `MeshGhost`, `MeshGhostRemove`
 - query/commands/events: `EntityQuery`, `EntityQueryResponse`, `CommandRequest`, `CommandResponse`, `EntityEvent`, `FlagUpdate`, `Metrics`, `LogMessage`
-- inspector/admin: `InspectorQuery`, `InspectorFrame`, `SnapshotMarker`
+- inspector/admin: `InspectorQuery`, `InspectorFrame`, `SnapshotMarker`, `SnapshotManifest`
 
 ## Persistent-operation rule
 
