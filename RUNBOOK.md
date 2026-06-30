@@ -128,6 +128,23 @@ and is the shared reconnect/resync contract for engine bindings. It keeps the
 Rust `ClientBridge` as the source of truth instead of letting the Godot probe
 grow a second cache with different semantics.
 
+The same fixture has a headless Godot-side contract runner:
+
+```powershell
+$env:GW_CLIENT_BRIDGE_FIXTURE=(Resolve-Path tests/fixtures/client_bridge/godot-resync-contract.json)
+godot --headless --path client_probes/godot --script res://client_bridge_contract_probe.gd
+```
+
+Expected result:
+
+```text
+GODOT CLIENT-BRIDGE CONTRACT: PASS
+```
+
+This runner is a fixture consumer, not the production bridge. Its job is to
+prove Godot-side adapter code follows the SDK snapshot/resync contract before
+the real TCP scene probe or a future binding grows more behavior.
+
 The Godot cross-broker probe drives the same TCP protocol from a real Godot
 runtime and checks that a scene entity crosses W -> E, the E-side write becomes
 public, and a stale W-side write is rejected.

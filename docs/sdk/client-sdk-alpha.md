@@ -86,3 +86,6 @@ contract before adding scene-node lifecycle:
 - the full checkout becomes the canonical live view;
 - ghost rows remain read-only projections with no local authority;
 - snapshot row ordering is deterministic for simple engine diffing.
+
+The Godot-side runner for the same fixture is
+`client_probes/godot/client_bridge_contract_probe.gd`.
