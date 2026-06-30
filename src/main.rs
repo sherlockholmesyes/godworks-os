@@ -29,7 +29,7 @@ use godworks_broker::wal::{
     crc32_ieee, read_wal_events, wal_v1_envelope_line, wal_v1_header_line, WalReadReport,
 };
 use godworks_core::STANDARD_COMPONENT_REGISTRY_VERSION;
-use godworks_protocol::DEFAULT_MAX_FRAME_BYTES;
+use godworks_protocol::{operation_semantics, DEFAULT_MAX_FRAME_BYTES};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -2591,6 +2591,16 @@ fn replay_tape_op_summary(f: &Value, byte_len: usize) -> Value {
     let op = f.get("op").and_then(|v| v.as_str()).unwrap_or("");
     summary.insert("op".to_string(), json!(op));
     summary.insert("wire_bytes".to_string(), json!(byte_len));
+    if let Some(semantics) = operation_semantics(op) {
+        summary.insert(
+            "persistence".to_string(),
+            json!(semantics.persistence.as_str()),
+        );
+        summary.insert("category".to_string(), json!(semantics.category.as_str()));
+        if let Some(response_op) = semantics.response_op {
+            summary.insert("response_op".to_string(), json!(response_op));
+        }
+    }
     for key in [
         "request_id",
         "entity",
@@ -8326,6 +8336,21 @@ mod tests {
                     .and_then(|summary| summary.get("op"))
                     .and_then(Value::as_str)
                     == Some("CreateEntity")
+                && event
+                    .get("op_summary")
+                    .and_then(|summary| summary.get("persistence"))
+                    .and_then(Value::as_str)
+                    == Some("persistent")
+                && event
+                    .get("op_summary")
+                    .and_then(|summary| summary.get("category"))
+                    .and_then(Value::as_str)
+                    == Some("entity_lifecycle")
+                && event
+                    .get("op_summary")
+                    .and_then(|summary| summary.get("response_op"))
+                    .and_then(Value::as_str)
+                    == Some("CreateEntityResponse")
         }));
         assert!(lines.iter().any(|event| {
             event.get("kind").and_then(Value::as_str) == Some("broker_outbound")

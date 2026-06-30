@@ -128,6 +128,9 @@ and runtime tests:
 - Keep the runtime fail-closed persistent-op gate aligned with the public
   protocol's persistent operations; `ReserveEntityIds` and `MeshAck` are now
   covered by a regression test.
+- Keep lifecycle persistence aligned with `godworks-protocol` operation
+  semantics: `CreateEntity`, `DeleteEntity`, and `ReserveEntityIds` are
+  persistent lifecycle requests; their response frames are transient.
 - The broker-contact `component_authority` path should not mutate canonical RAM
   before its authority WAL record is known durable.
 - Add direct tests for dry-run report output and recovered `partition_config`.

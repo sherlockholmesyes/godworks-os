@@ -176,6 +176,16 @@ links.
 | `Metrics` | worker -> broker | no | Worker load input for rebalancing. |
 | `LogMessage` | peer -> broker | no | Log/dev message accepted by broker and ignored. |
 
+Command and event semantics are defined in
+`docs/protocol/event-command-semantics.md`. In short: component updates are
+durable state; `EntityEvent` is transient interest-delivered signal; and
+`CommandRequest`/`CommandResponse` is routed RPC correlated by `request_id`.
+
+Entity lifecycle semantics are defined in
+`docs/protocol/entity-lifecycle-semantics.md`. In short: `CreateEntity`,
+`DeleteEntity`, and `ReserveEntityIds` are persistent lifecycle operations;
+their response frames are transient result frames.
+
 ### Inspector/admin
 
 | Op | Direction | Persistent | Purpose |

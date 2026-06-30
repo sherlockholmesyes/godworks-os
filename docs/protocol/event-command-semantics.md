@@ -1,0 +1,107 @@
+# Event and Command Semantics
+
+Godworks v1 distinguishes durable state, transient events, and routed commands.
+They may all use the same length-prefixed JSON frame transport, but they do not
+have the same persistence or replay meaning.
+
+The public protocol crate owns the current operation-semantics table for this
+rail. Replay tapes may include these semantic tags inside `op_summary`, and
+`replay_eval` rejects known operations when supplied tags contradict the table:
+
+```text
+CommandRequest   transient  command_rpc  -> CommandResponse
+CommandResponse  transient  command_rpc
+EntityEvent      transient  entity_event
+```
+
+## Component State
+
+`UpdateComponent`, `BatchUpdate`, `AddComponent`, and `RemoveComponent` mutate
+entity state. They are persistent operations and must pass authority, role,
+WAL, and recovery gates before observers rely on the result.
+
+## Entity Events
+
+`EntityEvent` is transient.
+
+Rules:
+
+- events ride the interest/visibility channel;
+- events are not component state;
+- events are not stored in entity components;
+- late joiners do not replay old one-shot events;
+- the current authoritative owner of the entity is the sender that may emit the
+  event;
+- event payloads can carry `sim_time` and `gen` so clients can order rendering
+  against the state stream;
+- event `class` defaults to `critical` when omitted;
+- non-critical events may use `coalesce_key` and `count` for storm-bounded
+  delivery.
+
+The protocol crate exposes semantic accessors for the current wire names:
+
+```text
+entity
+event
+payload
+sim_time
+gen
+class
+coalesce_key
+count
+```
+
+The accessors do not narrow the JSON payload. They only make the current
+semantic contract explicit for SDKs and tests.
+
+## Commands
+
+`CommandRequest` / `CommandResponse` is routed RPC over the entity authority
+model.
+
+Rules:
+
+- `CommandRequest` targets an entity;
+- the broker routes it to the current authority holder for that entity;
+- `request_id` is the correlation key used to route the response back to the
+  original caller;
+- `caller` is broker-written when forwarding the request to an authority holder;
+- `CommandResponse` is transient and not WAL-backed state;
+- omitted `CommandResponse.success` means success by current broker convention;
+- `idempotency_key` and `timeout_ms` are protocol-level semantic fields for SDK
+  and future policy work, even though the current broker does not enforce full
+  retry/timeout semantics yet.
+
+Semantic accessors in `godworks-protocol` cover:
+
+```text
+CommandRequest:
+  request_id
+  entity
+  command
+  payload
+  caller
+  idempotency_key
+  timeout_ms
+
+CommandResponse:
+  request_id
+  success
+  success_or_default
+  payload
+  reason
+```
+
+## Non-Goals In This Rail
+
+This rail does not add:
+
+- a new runtime command scheduler;
+- command timeout enforcement;
+- command retry storage;
+- binary protocol frames;
+- client SDK prediction or reconciliation;
+- persistence for transient events.
+
+Those can be built later on top of this semantic contract without changing the
+current wire shape.

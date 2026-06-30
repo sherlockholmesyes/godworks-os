@@ -1,0 +1,1 @@
+{"kind":"broker_ingress","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d","boundary_count":1},"outcome":"dispatched","durable_gen":1,"pending_gen":1,"op_summary":{"op":"CommandRequest","wire_bytes":96,"persistence":"persistent","category":"entity_lifecycle"}}
