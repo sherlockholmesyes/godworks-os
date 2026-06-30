@@ -16,9 +16,9 @@ fmt-check:
 check:
     cargo check --workspace --all-targets
 
-# Run clippy over all workspace targets.
+# Run clippy over all workspace targets with warnings denied, matching CI.
 lint:
-    cargo clippy --workspace --all-targets
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Run the workspace test suite.
 test:
