@@ -1,0 +1,1 @@
+{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d","boundary_count":1},"path":"mesh","entity":"ship","authority_epoch":7,"durable_gen":11,"op_summary":{"op":"MeshHandoff","wire_bytes":160,"persistence":"transient","category":"interest_projection","response_op":"MeshGhost"}}

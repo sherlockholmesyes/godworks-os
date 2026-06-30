@@ -20,6 +20,40 @@ EntityEvent      transient  entity_event
 entity state. They are persistent operations and must pass authority, role,
 WAL, and recovery gates before observers rely on the result.
 
+`ComponentUpdate` is the transient outbound projection of component state to a
+peer's view. It is not the durable mutation itself.
+
+Canonical component-state semantics:
+
+```text
+AddComponent      persistent  entity_update
+RemoveComponent   persistent  entity_update
+UpdateComponent   persistent  entity_update
+BatchUpdate       persistent  entity_update
+ComponentUpdate   transient   entity_update
+```
+
+## Authority, Handoff, Transactions, and Mesh
+
+The same operation-semantics table also covers authority and handoff rails:
+
+```text
+SetComponentAuthority          persistent  authority_control  -> SetComponentAuthorityResponse
+SetComponentAuthorityResponse  transient   authority_response
+AuthorityChange                transient   authority_event
+Fold                           persistent  handoff_control
+ThresholdTx                    persistent  transaction_control -> ThresholdTxResponse
+ThresholdTxResponse            transient   transaction_response
+SnapshotMarker                 persistent  durability_control
+MeshHandoff                    persistent  mesh_handoff        -> MeshAck
+MeshAck                        persistent  mesh_handoff
+MeshGhost                      transient   interest_projection
+MeshGhostRemove                transient   interest_projection
+```
+
+`MeshGhost` and `MeshGhostRemove` are visibility projections. They must not be
+treated as authority transfer or durable state.
+
 ## Entity Events
 
 `EntityEvent` is transient.

@@ -176,10 +176,12 @@ links.
 | `Metrics` | worker -> broker | no | Worker load input for rebalancing. |
 | `LogMessage` | peer -> broker | no | Log/dev message accepted by broker and ignored. |
 
-Command and event semantics are defined in
-`docs/protocol/event-command-semantics.md`. In short: component updates are
-durable state; `EntityEvent` is transient interest-delivered signal; and
-`CommandRequest`/`CommandResponse` is routed RPC correlated by `request_id`.
+Operation semantics for component updates, authority, handoff, mesh, commands,
+and events are defined in `docs/protocol/event-command-semantics.md`. In
+short: component writes and authority/handoff controls are durable state;
+visibility projections and result frames are transient; `EntityEvent` is
+transient interest-delivered signal; and `CommandRequest`/`CommandResponse` is
+routed RPC correlated by `request_id`.
 
 Entity lifecycle semantics are defined in
 `docs/protocol/entity-lifecycle-semantics.md`. In short: `CreateEntity`,
