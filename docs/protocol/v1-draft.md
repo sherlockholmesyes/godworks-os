@@ -65,6 +65,11 @@ attributes in `WorkerConnect`; the broker derives the registered region and
 attributes from the token claim and rejects mismatches with `AuthReject` before
 registration.
 
+When `GW_AUTH_CLAIMS` is non-empty, it is the exclusive connection-auth table:
+the legacy `GW_AUTH_TOKEN` fallback is not used, including for ordinary worker
+regions. Give W/E workers their own claim entries in strict mode instead of
+mixing a shared token with claim tokens.
+
 ## Component identity
 
 The v1 JSON wire still uses component names such as `pos`, `vel`, and

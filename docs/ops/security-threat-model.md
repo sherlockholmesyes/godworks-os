@@ -34,6 +34,8 @@ authority, WAL, and epoch fences define the recoverable truth.
   region/attribute claims. Peers cannot self-assign a different region or
   privileged attributes in strict mode, and control regions (`MESH`, `OBS`,
   `CLIENT`, `STANDBY`) require this claim provenance before registration.
+  When this table is configured, it supersedes the legacy shared-token fallback:
+  every peer must present a matching claim token, including ordinary workers.
 - Peer role policy: the broker derives an internal role (`worker`, `client`,
   `observer`, or `mesh`) from broker-owned claims / ordinary worker regions and rejects
   privileged op families before dispatch. Clients cannot lease worker regions,
