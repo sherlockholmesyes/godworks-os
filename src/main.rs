@@ -844,6 +844,28 @@ fn set_component_authority_epoch(e: &mut Entity, comp: &str, epoch: u64) {
     }
 }
 
+fn snapshot_authority_hash(entities: &HashMap<String, Entity>) -> u64 {
+    let mut ids: Vec<String> = entities.keys().cloned().collect();
+    ids.sort();
+    let mut authority_hash: u64 = 0xcbf29ce484222325;
+    for eid in &ids {
+        for b in eid.bytes() {
+            authority_hash = (authority_hash ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+        if let Some(e) = entities.get(eid) {
+            if let Some(ca) = e.authority.get("pos") {
+                authority_hash = authority_hash.wrapping_add(ca.epoch);
+                if let Some(o) = &ca.owner {
+                    for b in o.bytes() {
+                        authority_hash = (authority_hash ^ b as u64).wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
+        }
+    }
+    authority_hash
+}
+
 fn bump_component_authority_epoch(e: &mut Entity, comp: &str) -> u64 {
     ensure_component_authority(e, comp);
     let ca = e.authority.get_mut(comp).unwrap();
@@ -6463,26 +6485,8 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
             // rewrite the file and invalidate the offset). The disk-fill scenario uses no SnapshotMarker.
             state.snapshot_seen = true;
             let wal_offset = state.wal_bytes;
-            let mut ids: Vec<String> = state.entities.keys().cloned().collect();
-            ids.sort();
             // authority_hash (FNV-1a fold over (entity, pos-owner, pos-epoch)) -> a restore detects a divergent cut
-            let mut authority_hash: u64 = 0xcbf29ce484222325;
-            for eid in &ids {
-                for b in eid.bytes() {
-                    authority_hash = (authority_hash ^ b as u64).wrapping_mul(0x100000001b3);
-                }
-                if let Some(e) = state.entities.get(eid) {
-                    if let Some(ca) = e.authority.get("pos") {
-                        authority_hash = authority_hash.wrapping_add(ca.epoch);
-                        if let Some(o) = &ca.owner {
-                            for b in o.bytes() {
-                                authority_hash =
-                                    (authority_hash ^ b as u64).wrapping_mul(0x100000001b3);
-                            }
-                        }
-                    }
-                }
-            }
+            let authority_hash = snapshot_authority_hash(&state.entities);
             let in_flight: Vec<Value> = state
                 .pending_mesh
                 .iter()
@@ -8365,6 +8369,30 @@ mod tests {
             version: 1,
             last_broadcast_cell: Some(interest_cell_of(pos)),
         }
+    }
+
+    fn expected_snapshot_authority_hash_for_test(entities: &HashMap<String, Entity>) -> u64 {
+        let mut ids: Vec<String> = entities.keys().cloned().collect();
+        ids.sort();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for eid in &ids {
+            for b in eid.bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+            let Some(entity) = entities.get(eid) else {
+                continue;
+            };
+            let Some(ca) = entity.authority.get("pos") else {
+                continue;
+            };
+            h = h.wrapping_add(ca.epoch);
+            if let Some(owner) = &ca.owner {
+                for b in owner.bytes() {
+                    h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        h
     }
 
     fn test_physics_island_entity(pos: [f64; 2], region: &str) -> Entity {
@@ -11910,6 +11938,84 @@ mod tests {
                 cols: 3,
                 rows: 2
             }))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_manifest_authority_hash_matches_pos_owner_epoch_cut() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_snapshot_authority_hash_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        state.ensure_wal_header();
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+
+        assert!(spawn_in_region(
+            &mut state,
+            "zeta",
+            [-1.0, 0.0],
+            [0.0, 0.0],
+            Map::new(),
+            Some("W"),
+            SpawnAuthoritySeed::default(),
+        ));
+        assert!(spawn_in_region(
+            &mut state,
+            "alpha",
+            [1.0, 0.0],
+            [0.0, 0.0],
+            Map::new(),
+            Some("E"),
+            SpawnAuthoritySeed::default(),
+        ));
+        set_component_authority_epoch(state.entities.get_mut("zeta").unwrap(), "pos", 11);
+        set_component_authority_epoch(state.entities.get_mut("alpha").unwrap(), "pos", 4);
+        grant_authority(&mut state, "w1", "zeta", "pos");
+        grant_authority(&mut state, "w2", "alpha", "pos");
+
+        let expected = expected_snapshot_authority_hash_for_test(&state.entities);
+        let mut rx = add_test_worker_with_rx(&mut state, "snap", "OBS");
+        state
+            .workers
+            .get_mut("snap")
+            .unwrap()
+            .attributes
+            .insert("snapshot".to_string());
+
+        dispatch_test_frame(
+            &mut state,
+            "snap",
+            &json!({"op":"SnapshotMarker","request_id":"s1","snapshot_id":"hash-cut"}),
+        );
+
+        let manifest = decode_test_frame(&rx.try_recv().expect("snapshot manifest must emit"));
+        assert_eq!(manifest["op"], "SnapshotManifest");
+        assert_eq!(manifest["snapshot_id"], "hash-cut");
+        let expected = expected.to_string();
+        assert_eq!(
+            manifest["authority_hash"].as_str(),
+            Some(expected.as_str()),
+            "SnapshotManifest authority_hash must be an exact, stable hash over sorted entity id plus pos owner/epoch"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
