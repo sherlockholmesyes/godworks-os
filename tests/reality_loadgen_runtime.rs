@@ -149,6 +149,26 @@ fn run_cross_broker_reality_loadgen(auth_token: Option<&str>) {
         metric_u64(&metrics, "east_visible") > 0,
         "east broker never saw the crossed bodies: {metrics:?}"
     );
+    assert_eq!(
+        metric_u64(&metrics, "handoff_pos_ok"),
+        4,
+        "east owner did not publish a visible post-handoff pos write for every body: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "stale_pos_rejected_exact"),
+        4,
+        "old W owner was not rejected for the exact crossed body set: {metrics:?}"
+    );
+    assert_eq!(
+        metric_u64(&metrics, "stale_pos_overwrite_blocked"),
+        4,
+        "stale W writes changed visible post-handoff position: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.get("handoff_pos_query_error").map(String::as_str),
+        Some("none"),
+        "post-handoff query failed: {metrics:?}"
+    );
 }
 
 #[test]
