@@ -51,7 +51,8 @@ with compatibility tests rather than rebuilding a second protocol path.
 - Basic WorkerConnect auth.
 - Token-bound WorkerConnect region/attribute claims.
 - Global OBS visibility gated by observer/debug/inspector claims.
-- Stronger worker/client role and authorization policy.
+- Broker-side worker/client/observer/mesh role policy v0.
+- Broader deployment policy for role credentials and per-principal defaults.
 - Mesh auth beyond the current token-claim baseline.
 - Broader per-principal rate-limit policy for public hosted deployments.
 - Metrics exporter.

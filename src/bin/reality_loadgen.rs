@@ -333,7 +333,7 @@ async fn main() {
     .await
     .unwrap();
 
-    let caller = connect_endpoint(&host, port_w, "rlg-caller", "OBS", &["observer"])
+    let caller = connect_endpoint(&host, port_w, "rlg-caller", "CLIENT", &["role.client"])
         .await
         .unwrap_or_else(|e| panic!("connect caller {host}:{port_w}: {e}"));
     let caller_wr = caller.wr.clone();

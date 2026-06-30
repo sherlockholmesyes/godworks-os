@@ -42,6 +42,9 @@ full SpatialOS replacement
   class and large valid JSON payload size before dispatch.
 - WorkerConnect authentication with both legacy shared-token mode and strict
   token-bound region/attribute claims.
+- Broker-side peer roles for worker/client/observer/mesh op-family policy.
+  Clients cannot lease worker regions, observers cannot mutate entity state, and
+  mesh links cannot act as gameplay workers.
 - Global OBS visibility is claim-gated: an OBS peer needs `observer`, `debug`,
   or `inspector` to see the whole world without an AOI.
 - `godworks-protocol`, `godworks-core`, and `godworks-worker-sdk` alpha crates.
@@ -92,7 +95,7 @@ The runtime needs a repeatable operations story:
 
 The product needs a formal security layer:
 
-- broader worker/client role distinction and authorization policy;
+- broader deployment policy for worker/client/observer/mesh credentials;
 - stronger mesh authentication beyond the current token-claim baseline;
 - broader per-principal rate-limit policy;
 - TLS/mTLS option.
@@ -117,8 +120,9 @@ The 1.0 product target should be 2D. 3D should be handled as a separate feasibil
 6. Client SDK v0.
 7. Godot bridge v0.
 8. Top-down arena demo.
-9. Security v0 — max-frame, ingress frame-rate, shared-token auth, and
-   token-bound WorkerConnect claims exist; broader role/rate/TLS policy remains.
+9. Security v0 — max-frame, ingress frame-rate, shared-token auth,
+   token-bound WorkerConnect claims, and peer role policy exist; broader
+   deployment/rate/TLS policy remains.
 10. Ops/deployment layer.
 
 ## Definition of product beta

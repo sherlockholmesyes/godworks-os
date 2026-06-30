@@ -31,6 +31,11 @@ authority, WAL, and epoch fences define the recoverable truth.
 - Token-bound claims: `GW_AUTH_CLAIMS` maps tokens to broker-owned
   region/attribute claims. Peers cannot self-assign a different region or
   privileged attributes in strict mode.
+- Peer role policy: the broker derives an internal role (`worker`, `client`,
+  `observer`, or `mesh`) from broker-owned claims / legacy regions and rejects
+  privileged op families before dispatch. Clients cannot lease worker regions,
+  observers cannot write entity state, and mesh links can only use mesh-family
+  traffic plus liveness.
 - Global observer visibility: an `OBS` peer only gets whole-world visibility
   when its token claim grants `observer`, `debug`, or `inspector`.
 - Mesh links: mesh peers can use a `MESH` claim token; lease epochs still fence
@@ -51,8 +56,6 @@ authority, WAL, and epoch fences define the recoverable truth.
 
 ## Remaining Work
 
-- Split peer roles into explicit worker, observer, mesh, and client policies
-  rather than only region/attribute conventions.
 - Add per-principal deployment policy: token rotation, token storage guidance,
   and recommended defaults for private alpha versus public testnets.
 - Strengthen mesh auth beyond the first `MESH` claim token baseline.

@@ -53,13 +53,34 @@ single shared token. `GW_AUTH_CLAIMS` maps each token to broker-owned
 connection claims:
 
 ```text
-GW_AUTH_CLAIMS="w-secret:W:physics|sim,mesh-secret:MESH:mesh"
+GW_AUTH_CLAIMS="w-secret:W:physics|sim,client-secret:CLIENT:role.client,mesh-secret:MESH:role.mesh"
 ```
 
 In this mode the peer may not self-assign a different region or extra
 attributes in `WorkerConnect`; the broker derives the registered region and
 attributes from the token claim and rejects mismatches with `AuthReject` before
 registration.
+
+## Peer roles
+
+The wire keeps the current `WorkerConnect` shape, but the broker derives a
+broker-side role before a peer can mutate state:
+
+```text
+MESH or role.mesh      -> mesh
+OBS or role.observer   -> observer
+CLIENT or role.client  -> client
+otherwise              -> worker
+```
+
+Roles are an authorization boundary, not a replacement for component authority.
+A `client` may send `CommandRequest`, `Interest`, `EntityQuery`, and
+`UpdateComponent`, but the normal ACL/authority/epoch gates still decide whether
+the component write applies. A `mesh` peer is a cross-broker conduit and cannot
+create entities or write components. An `observer` can read according to AOI or
+observer claims but cannot mutate entity state. A `worker` keeps the existing
+simulation/lifecycle surface, except mesh-family frames remain reserved for mesh
+links.
 
 ## Operation groups
 
