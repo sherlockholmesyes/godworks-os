@@ -18,6 +18,7 @@ REQUIRED_PROBES = [
     "client_bridge_contract_probe.gd",
     "client_bridge_tcp_resync_probe.gd",
     "cross_broker_handoff_probe.gd",
+    "godot_2d_physics_probe.gd",
 ]
 
 

@@ -120,7 +120,9 @@ $godot = .\scripts\ensure_godot_4_3.ps1
 This is still a probe runner, not the final Godot bridge package. It proves the
 Godot runtime can consume the shared bridge contract, rebuild from a real broker
 checkout, and observe a cross-broker handoff without giving the engine a second
-state model.
+state model. The runner also includes `godot_2d_physics_probe.gd`, which uses a
+real Godot `CharacterBody2D` movement step as the source of a broker seam probe,
+then verifies E-side visibility and stale W-owner rejection.
 
 The first live game cache runner is
 `crates/godworks-client-sdk/examples/agar_live_cache_gate.rs`. It opens the
