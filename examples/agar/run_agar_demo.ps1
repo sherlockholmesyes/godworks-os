@@ -84,6 +84,8 @@ try {
     $env:GW_GATE_MIN_OWNERS = [Math]::Min(4, $regions.Count)
     node (Join-Path $PSScriptRoot "gw_agar_gate.js")
     if ($LASTEXITCODE -ne 0) { throw "agar reality gate failed with exit code $LASTEXITCODE" }
+    node (Join-Path $PSScriptRoot "gw_agar_pixel_gate.js")
+    if ($LASTEXITCODE -ne 0) { throw "agar pixel gate failed with exit code $LASTEXITCODE" }
   } else {
     Write-Host "Press Ctrl+C to stop. Logs: $LogDir"
     while ($true) { Start-Sleep -Seconds 1 }
