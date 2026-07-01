@@ -23,9 +23,18 @@ jobs:
       - name: Validate agent reality gate scaffold
         run: |
           python3 tools/agent_reality_gate_lint.py \
+            --laws docs/ops/system-laws.jsonl \
             --schema docs/ops/agent-trace.schema.json \
             --evals docs/ops/agent-eval-cases.jsonl \
             --trace docs/ops/examples/agent-trace.example.json
+          if python3 tools/agent_reality_gate_lint.py \
+            --laws docs/ops/system-laws.jsonl \
+            --schema docs/ops/agent-trace.schema.json \
+            --evals docs/ops/agent-eval-cases.jsonl \
+            --trace docs/ops/examples/agent-trace.invalid-missing-system-laws.json; then
+            echo "agent trace without system law binding unexpectedly passed"
+            exit 1
+          fi
 
       - name: Validate system laws gate scaffold
         run: |

@@ -1,0 +1,26 @@
+{
+  "trace_version": 2,
+  "task_id": "invalid-missing-system-laws",
+  "date": "2026-07-01",
+  "agent_role": "fixture",
+  "repo_ref": "fixture",
+  "intent": "Fixture that must fail because it omits system_laws.",
+  "invariant": "Fixture invariant.",
+  "inputs": {
+    "files": [
+      "docs/ops/agent-trace.schema.json"
+    ]
+  },
+  "actions": [
+    {
+      "type": "review",
+      "summary": "Invalid fixture."
+    }
+  ],
+  "verification": {
+    "commands": [
+      "fixture"
+    ]
+  },
+  "decision": "accept"
+}
