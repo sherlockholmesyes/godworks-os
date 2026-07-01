@@ -1510,6 +1510,41 @@ mod tests {
     }
 
     #[test]
+    fn agar_live_gate_builder_accepts_recorded_mit_clone_40_200_ladder_fixture() {
+        let output =
+            include_str!("../../tests/fixtures/agar_mit_clone/ladder_40_200_telemetry.json");
+        let blocks = build_agar_live_gate_feature_blocks(output, &cfg()).unwrap();
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].metrics["ladder_profiles"], 4.0);
+        assert_eq!(blocks[0].metrics["ladder_passed_profiles"], 4.0);
+        assert_eq!(blocks[0].metrics["ladder_max_bot_count_green"], 200.0);
+        assert_eq!(blocks[1].metrics["capacity_players_max"], 206.0);
+        assert_eq!(blocks[1].metrics["capacity_entities_max"], 1252.0);
+        assert_eq!(
+            blocks[2].metrics["capacity_process_cpu_seconds_delta_total"],
+            56.563
+        );
+        assert_eq!(
+            blocks[2].metrics["capacity_process_working_set_mib_max"],
+            471.184
+        );
+        assert_eq!(
+            blocks[3].metrics["broker_command_total_owner_matches"],
+            391.0
+        );
+        assert_eq!(blocks[3].metrics["broker_command_total_responses"], 391.0);
+        assert_eq!(blocks[3].metrics["broker_command_latency_ms_p95_max"], 12.0);
+        assert_eq!(
+            blocks[3].metrics["broker_command_completed_latency_ms_p95_max"],
+            18.0
+        );
+        for block in blocks {
+            assert_eq!(block.validate(), Ok(()));
+        }
+    }
+
+    #[test]
     fn agar_live_gate_builder_rejects_failed_mit_clone_ladder_row() {
         let output = r#"{
           "ok": true,

@@ -127,6 +127,11 @@ an observed local floor, not a maximum-player claim. Each ladder row records
 command ACK latency plus local process CPU/RSS snapshots so the model-plane and
 release notes can distinguish "green but expensive" from "green and cheap."
 Larger profiles must be rerun and recorded before they can be advertised.
+The sanitized fixture
+`tests/fixtures/agar_mit_clone/ladder_40_200_telemetry.json` records one local
+2026-07-01 floor run through `40,80,120,200` bot profiles, with the highest
+green row at 200 bots / 197-206 live players. It is evidence for that local
+machine and gate shape, not a general maximum CCU benchmark.
 
 Boundary: even the broker-command MIT clone gate is not yet a full
 Godworks-authoritative replacement for the MIT clone server. The stock clone
