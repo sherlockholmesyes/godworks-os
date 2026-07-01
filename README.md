@@ -8,9 +8,13 @@ load rebalancing, and a cross-broker mesh.
 ## Status
 
 Pre-1.0, source-available under the Business Source License 1.1 (see `LICENSE`; converts
-to Apache-2.0 on the Change Date). This repository includes the Rust Worker SDK alpha.
-The client SDK and the Godot-based client engine (Clockworks) are separate and not part
-of this repository.
+to Apache-2.0 on the Change Date). This repository includes the Rust Worker SDK alpha
+and `godworks-client-sdk` alpha: a headless, transport-free client cache plus
+`ClientBridge` facade for engine bindings.
+
+A reusable Godot/Clockworks-style client engine or production Godot binding is not part
+of this repository yet. Current Godot/client files are probes and fixtures for validating
+the SDK and wire behavior, not a full client engine.
 
 ## Build
 
