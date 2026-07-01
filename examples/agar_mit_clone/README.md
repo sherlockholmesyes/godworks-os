@@ -102,7 +102,9 @@ Use `-StopExisting` when an old local demo owns the same ports.
   The default starts 8 controlled stock-clone players and requires 4 completed
   seam proofs. Dead probes are recorded as failed players and do not count; this
   keeps normal Agar eating ecology live without letting one eaten probe hide the
-  broker-command seam signal.
+  broker-command seam signal. Each row also records command ACK latency
+  summaries plus process CPU and working-set snapshots for the local ports, so
+  the observed floor has capacity context instead of a bare player count.
 
 ## Honest Boundary
 
@@ -114,10 +116,11 @@ handoff success rate, and broker/client agreement under increasing bot/client
 counts.
 
 The stress ladder has the same boundary. It improves the evidence shape by
-recording multiple profiles with command ACKs and broker/client agreement, but
+recording multiple profiles with command ACKs, broker/client agreement,
+hardware context, process CPU/RSS snapshots, and command latency summaries, but
 the result is still local-machine evidence. Treat the highest green row as an
-observed floor until hardware, CPU/RSS, latency, and longer soak windows are
-recorded.
+observed floor until longer soak windows and larger hardware-annotated ladders
+are recorded.
 
 The playable seam gate is also not a broker-authoritative command claim. The MIT
 clone still receives the probe movement command directly through its normal

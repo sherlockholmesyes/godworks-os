@@ -70,7 +70,8 @@ targets or player identity traces. Those summaries can feed future per-project
 load/micro-balancer datasets as redacted facts such as entity density, worker
 load, shard-block changes, owner changes, post-seam movement, controlled-player
 completion count, command-response count, owner-match count, sustained
-player/entity floors, profile pass counts, and load peak/mean pressure.
+player/entity floors, profile pass counts, load peak/mean pressure, command ACK
+latency, and local process CPU/RSS pressure.
 
 The builder does not copy raw WAL paths, component bodies, payloads, command
 targets, or tokens into model-plane data. It rejects source replay artifacts that
