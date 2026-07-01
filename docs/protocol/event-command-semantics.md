@@ -99,9 +99,16 @@ Rules:
 - the broker routes it to the current authority holder for that entity;
 - `request_id` is the correlation key used to route the response back to the
   original caller;
+- the broker records the routed entity, owner, authority component, and
+  authority epoch for each pending command; a `CommandResponse` with the same
+  `request_id` is forwarded only when it comes from that routed owner, names the
+  same entity, and the authority has not moved to a different owner/epoch;
 - `caller` is broker-written when forwarding the request to an authority holder;
 - `CommandResponse` is transient and not WAL-backed state;
 - omitted `CommandResponse.success` means success by current broker convention;
+- responders should echo `entity` at top level; the broker also accepts the
+  legacy `payload.entity` echo while examples and SDKs converge on the explicit
+  field;
 - `idempotency_key` and `timeout_ms` are protocol-level semantic fields for SDK
   and future policy work, even though the current broker does not enforce full
   retry/timeout semantics yet.
@@ -120,6 +127,7 @@ CommandRequest:
 
 CommandResponse:
   request_id
+  entity
   success
   success_or_default
   payload

@@ -209,6 +209,7 @@ sock.on("data", d => {
         send(sock, {
           op: "CommandResponse",
           request_id: f.request_id,
+          entity: f.entity,
           success: true,
           payload: { accepted: true, entity: f.entity, owner: WID, region: REGION }
         });
@@ -216,6 +217,7 @@ sock.on("data", d => {
         send(sock, {
           op: "CommandResponse",
           request_id: f.request_id,
+          entity: f.entity,
           success: false,
           payload: { accepted: false, entity: f.entity, owner: WID, region: REGION, reason: "not_owned_or_bad_command" }
         });

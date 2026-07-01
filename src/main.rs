@@ -1587,6 +1587,15 @@ struct BufferedEvent {
     gen: Value,
 }
 
+#[derive(Clone, Debug)]
+struct PendingCommand {
+    caller: String,
+    entity: String,
+    owner: String,
+    authority_comp: String,
+    authority_epoch: Option<u64>,
+}
+
 type CoalescedEventsByWorker = HashMap<String, (Vec<Value>, HashMap<String, (Value, u64)>)>;
 
 struct ServerState {
@@ -1622,10 +1631,10 @@ struct ServerState {
     rejected: Vec<Value>,
     replay_tape: Option<ReplayTape>, // Model Plane v0: optional bounded/redacted JSONL observer, never runtime authority.
     // ── documented SpatialOS contract ops ──
-    pending_commands: HashMap<String, String>, // request_id -> caller wid (route the response back)
-    entity_id_reservations: u64,               // monotonic ReserveEntityIds counter
-    flags: Map<String, Value>,                 // runtime config flags (FlagUpdate)
-    worker_load: HashMap<String, f64>,         // wid -> last reported load (Metrics)
+    pending_commands: HashMap<String, PendingCommand>, // request_id -> typed routed-command contract
+    entity_id_reservations: u64,                       // monotonic ReserveEntityIds counter
+    flags: Map<String, Value>,                         // runtime config flags (FlagUpdate)
+    worker_load: HashMap<String, f64>,                 // wid -> last reported load (Metrics)
     boundary: f64, // DYNAMIC partition split (load balancing) -- the 1-boundary W|E line; == boundaries[0] when present
     boundaries: Vec<f64>, // N-ZONE 1D-strip cut points (sorted). 0/1 elems => W|E names; >=2 => Z<i> strips. Source of truth for region-assignment (the W|E `boundary` above is the 1-element special case rebalance() still shifts).
     grid2d: Option<(usize, usize, f64, f64)>, // D1: 2D-grid partition (cols, rows, cell_w, cell_h) from GW_GRID2D; Some => square "Z<col>_<row>" zones derived from (x,y); None => the 1D-strip path above (unchanged)
@@ -6143,27 +6152,59 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let owner = state.entities.get(&eid).and_then(|e| {
+            if req_id.is_empty() {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"CommandResponse","request_id":req_id,
+                    "success":false,"reason":"missing command request_id"}),
+                );
+                return;
+            }
+            if state.pending_commands.contains_key(&req_id) {
+                emit(
+                    state,
+                    wid,
+                    json!({"op":"CommandResponse","request_id":req_id,
+                    "success":false,"reason":"duplicate pending command request_id"}),
+                );
+                return;
+            }
+            let route = state.entities.get(&eid).and_then(|e| {
                 // Route to the entity's CURRENT pos-authority owner so a command follows the
                 // auto-handoff across zones (fixes a commanded player losing input after crossing a
                 // seam). Fall back to the region's worker when no pos-owner is set.
-                e.authority
-                    .get("pos")
-                    .and_then(|ca| ca.owner.clone())
-                    .or_else(|| state.region_worker.get(&e.region).cloned())
+                if let Some(ca) = e.authority.get("pos") {
+                    if let Some(owner) = ca.owner.clone() {
+                        return Some((owner, "pos".to_string(), Some(ca.epoch)));
+                    }
+                }
+                state
+                    .region_worker
+                    .get(&e.region)
+                    .cloned()
+                    .map(|owner| (owner, "pos".to_string(), None))
             });
-            match owner {
-                Some(ow) if state.workers.contains_key(&ow) => {
-                    state
-                        .pending_commands
-                        .insert(req_id.clone(), wid.to_string());
+            match route {
+                Some((ow, authority_comp, authority_epoch)) if state.workers.contains_key(&ow) => {
+                    state.pending_commands.insert(
+                        req_id.clone(),
+                        PendingCommand {
+                            caller: wid.to_string(),
+                            entity: eid.clone(),
+                            owner: ow.clone(),
+                            authority_comp: authority_comp.clone(),
+                            authority_epoch,
+                        },
+                    );
                     emit(
                         state,
                         &ow,
                         json!({"op":"CommandRequest","entity":eid,
                         "command":f.get("command").cloned().unwrap_or(Value::Null),
                         "payload":f.get("payload").cloned().unwrap_or(Value::Null),
-                        "request_id":req_id,"caller":wid}),
+                        "request_id":req_id,"caller":wid,
+                        "authority_comp":authority_comp,"authority_epoch":authority_epoch}),
                     );
                 }
                 _ => {
@@ -6182,12 +6223,55 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if let Some(requester) = state.pending_commands.remove(&req_id) {
-                if state.workers.contains_key(&requester) {
+            if let Some(pending) = state.pending_commands.get(&req_id).cloned() {
+                if pending.owner != wid {
+                    return;
+                }
+                let response_entity = f.get("entity").and_then(|v| v.as_str()).or_else(|| {
+                    f.get("payload")
+                        .and_then(|p| p.get("entity"))
+                        .and_then(|v| v.as_str())
+                });
+                if response_entity != Some(pending.entity.as_str()) {
+                    return;
+                }
+                let current_authority_ok = match state.entities.get(&pending.entity) {
+                    Some(e) => match pending.authority_epoch {
+                        Some(epoch) => e
+                            .authority
+                            .get(&pending.authority_comp)
+                            .map(|ca| {
+                                ca.owner.as_deref() == Some(pending.owner.as_str())
+                                    && ca.epoch == epoch
+                            })
+                            .unwrap_or(false),
+                        None => state
+                            .region_worker
+                            .get(&e.region)
+                            .map(|owner| owner == &pending.owner)
+                            .unwrap_or(false),
+                    },
+                    None => false,
+                };
+                if !current_authority_ok {
+                    state.pending_commands.remove(&req_id);
+                    if state.workers.contains_key(&pending.caller) {
+                        emit(
+                            state,
+                            &pending.caller,
+                            json!({"op":"CommandResponse","request_id":req_id,
+                            "success":false,"reason":"stale command authority"}),
+                        );
+                    }
+                    return;
+                }
+                state.pending_commands.remove(&req_id);
+                if state.workers.contains_key(&pending.caller) {
                     emit(
                         state,
-                        &requester,
+                        &pending.caller,
                         json!({"op":"CommandResponse","request_id":req_id,
+                        "entity":pending.entity,
                         "success":f.get("success").cloned().unwrap_or(Value::Bool(true)),
                         "payload":f.get("payload").cloned().unwrap_or(Value::Null)}),
                     );
@@ -9019,6 +9103,152 @@ mod tests {
     fn decode_test_frame(buf: &[u8]) -> Value {
         let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         serde_json::from_slice(&buf[4..4 + n]).unwrap()
+    }
+
+    #[test]
+    fn command_response_wrong_worker_does_not_satisfy_pending() {
+        let mut state = ServerState::new(30.0);
+        let mut caller_rx = add_test_peer_with_rx(&mut state, "client", "CLIENT", HashSet::new());
+        let mut owner_rx = add_test_worker_with_rx(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+        while owner_rx.try_recv().is_ok() {}
+
+        dispatch_test_frame(
+            &mut state,
+            "client",
+            &json!({"op":"CommandRequest","request_id":"cmd-1","entity":"ship","command":"move"}),
+        );
+        let forwarded =
+            decode_test_frame(&owner_rx.try_recv().expect("command must route to owner"));
+        assert_eq!(forwarded["op"], "CommandRequest");
+        assert_eq!(forwarded["entity"], "ship");
+        assert_eq!(forwarded["authority_comp"], "pos");
+        assert!(forwarded["authority_epoch"].as_u64().is_some());
+
+        dispatch_test_frame(
+            &mut state,
+            "w2",
+            &json!({"op":"CommandResponse","request_id":"cmd-1","entity":"ship",
+            "success":true,"payload":{"entity":"ship","handled_by":"w2"}}),
+        );
+        assert!(
+            caller_rx.try_recv().is_err(),
+            "wrong worker must not satisfy or consume the command"
+        );
+        assert!(state.pending_commands.contains_key("cmd-1"));
+
+        dispatch_test_frame(
+            &mut state,
+            "w1",
+            &json!({"op":"CommandResponse","request_id":"cmd-1","entity":"ship",
+            "success":true,"payload":{"entity":"ship","handled_by":"w1"}}),
+        );
+        let response =
+            decode_test_frame(&caller_rx.try_recv().expect("owner response must forward"));
+        assert_eq!(response["op"], "CommandResponse");
+        assert_eq!(response["entity"], "ship");
+        assert_eq!(response["success"], true);
+        assert!(!state.pending_commands.contains_key("cmd-1"));
+    }
+
+    #[test]
+    fn command_response_wrong_entity_does_not_satisfy_pending() {
+        let mut state = ServerState::new(30.0);
+        let mut caller_rx = add_test_peer_with_rx(&mut state, "client", "CLIENT", HashSet::new());
+        let mut owner_rx = add_test_worker_with_rx(&mut state, "w1", "W");
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+        while owner_rx.try_recv().is_ok() {}
+
+        dispatch_test_frame(
+            &mut state,
+            "client",
+            &json!({"op":"CommandRequest","request_id":"cmd-entity","entity":"ship","command":"move"}),
+        );
+        let _ = owner_rx.try_recv().expect("command must route to owner");
+
+        dispatch_test_frame(
+            &mut state,
+            "w1",
+            &json!({"op":"CommandResponse","request_id":"cmd-entity","entity":"other",
+            "success":true,"payload":{"entity":"other","handled_by":"w1"}}),
+        );
+        assert!(
+            caller_rx.try_recv().is_err(),
+            "wrong entity must not complete the pending command"
+        );
+        assert!(state.pending_commands.contains_key("cmd-entity"));
+
+        dispatch_test_frame(
+            &mut state,
+            "w1",
+            &json!({"op":"CommandResponse","request_id":"cmd-entity","payload":{"entity":"ship"},
+            "success":true}),
+        );
+        let response =
+            decode_test_frame(&caller_rx.try_recv().expect("matching entity must forward"));
+        assert_eq!(response["op"], "CommandResponse");
+        assert_eq!(response["entity"], "ship");
+        assert_eq!(response["success"], true);
+        assert!(!state.pending_commands.contains_key("cmd-entity"));
+    }
+
+    #[test]
+    fn command_response_stale_owner_after_handoff_fails() {
+        let mut state = ServerState::new(30.0);
+        let mut caller_rx = add_test_peer_with_rx(&mut state, "client", "CLIENT", HashSet::new());
+        let mut old_owner_rx = add_test_worker_with_rx(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+        while old_owner_rx.try_recv().is_ok() {}
+
+        dispatch_test_frame(
+            &mut state,
+            "client",
+            &json!({"op":"CommandRequest","request_id":"cmd-stale","entity":"ship","command":"move"}),
+        );
+        let _ = old_owner_rx
+            .try_recv()
+            .expect("command must route to the old owner before handoff");
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+        flush_pending_handoffs(&mut state);
+        assert_eq!(
+            component_authority_owner(&state.entities["ship"], "pos"),
+            Some("w2".to_string())
+        );
+
+        dispatch_test_frame(
+            &mut state,
+            "w1",
+            &json!({"op":"CommandResponse","request_id":"cmd-stale","entity":"ship",
+            "success":true,"payload":{"entity":"ship","handled_by":"w1"}}),
+        );
+        let response = decode_test_frame(
+            &caller_rx
+                .try_recv()
+                .expect("stale owner response must produce a caller-visible failure"),
+        );
+        assert_eq!(response["op"], "CommandResponse");
+        assert_eq!(response["request_id"], "cmd-stale");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["reason"], "stale command authority");
+        assert!(!state.pending_commands.contains_key("cmd-stale"));
     }
 
     #[test]

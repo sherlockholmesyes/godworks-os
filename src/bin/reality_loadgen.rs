@@ -276,6 +276,7 @@ fn spawn_reader(
                         &json!({
                             "op":"CommandResponse",
                             "request_id":req_id,
+                            "entity":entity,
                             "success":true,
                             "payload":{"handled_by":name,"entity":entity}
                         }),
