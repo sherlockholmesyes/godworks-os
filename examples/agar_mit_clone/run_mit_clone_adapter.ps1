@@ -56,6 +56,7 @@ function Test-PortListening([int]$Port) {
 }
 
 function Stop-KnownAgarMitStack {
+  $allProcesses = @(Get-CimInstance Win32_Process)
   $needles = @(
     "gw_agar_mirror_worker.js",
     "gw_agar_command_bridge.js",
@@ -66,21 +67,68 @@ function Stop-KnownAgarMitStack {
     "_gw_bots.js",
     "gw_agar_d2_worker.js"
   )
-  Get-CimInstance Win32_Process |
+  $targets = @()
+
+  $targets += $allProcesses |
     Where-Object {
       $cmd = $_.CommandLine
-      $_.ProcessId -ne $PID -and $cmd -and ($needles | Where-Object { $cmd -like "*$_*" })
-    } |
-    ForEach-Object {
-      Write-Host "stopping $($_.ProcessId) $($_.Name)"
-      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+      $_.ProcessId -ne $PID -and $cmd -and (
+        ($needles | Where-Object { $cmd -like "*$_*" }) -or
+        ($CloneRoot -and $cmd -like "*$CloneRoot*")
+      )
     }
 
-  Get-NetTCPConnection -LocalPort 3000,$PortBroker,$PortMonitor,$PortView,$PortCommandBridge -ErrorAction SilentlyContinue |
+  $listenerPids = @(Get-NetTCPConnection -LocalPort 3000,$PortBroker,$PortMonitor,$PortView,$PortCommandBridge -ErrorAction SilentlyContinue |
     Select-Object -ExpandProperty OwningProcess -Unique |
-    Where-Object { $_ -gt 0 } |
+    Where-Object { $_ -gt 0 })
+  foreach ($listenerPid in $listenerPids) {
+    $targets += $allProcesses | Where-Object { $_.ProcessId -eq $listenerPid }
+  }
+
+  # Start-LoggedPowerShell launches wrapper PowerShell/npm/gulp processes. Killing
+  # only the listening child leaves stale wrappers after stress-ladder runs, so
+  # walk both directions but keep the scope anchored to this adapter's ports,
+  # clone root, or known helper scripts.
+  $targetIds = @{}
+  foreach ($target in $targets) {
+    if ($target -and $target.ProcessId -ne $PID) {
+      $targetIds[[int]$target.ProcessId] = $true
+    }
+  }
+
+  $changed = $true
+  while ($changed) {
+    $changed = $false
+    foreach ($process in $allProcesses) {
+      if (-not $process -or $process.ProcessId -eq $PID) { continue }
+      $cmd = $process.CommandLine
+      $isKnownWrapper = $cmd -and (
+        $cmd -like "*$CloneRoot*" -or
+        $cmd -like "*npm-cli.js*start*" -or
+        $cmd -like "*npm.cmd*start*" -or
+        $cmd -like "*gulp.js*run*" -or
+        $cmd -like "*gulp run*" -or
+        ($needles | Where-Object { $cmd -like "*$_*" })
+      )
+      if (-not $isKnownWrapper) { continue }
+
+      $pidKnown = $targetIds.ContainsKey([int]$process.ProcessId)
+      $parentKnown = $process.ParentProcessId -and $targetIds.ContainsKey([int]$process.ParentProcessId)
+      $childKnown = [bool]($allProcesses | Where-Object {
+        $_.ParentProcessId -eq $process.ProcessId -and $targetIds.ContainsKey([int]$_.ProcessId)
+      } | Select-Object -First 1)
+
+      if (($parentKnown -or $childKnown) -and -not $pidKnown) {
+        $targetIds[[int]$process.ProcessId] = $true
+        $changed = $true
+      }
+    }
+  }
+
+  $targetIds.Keys |
+    Sort-Object -Descending |
     ForEach-Object {
-      Write-Host "stopping listener pid=$_"
+      Write-Host "stopping agar stack pid=$_"
       Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
     }
 }
