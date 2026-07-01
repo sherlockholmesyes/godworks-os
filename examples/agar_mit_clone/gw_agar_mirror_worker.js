@@ -158,6 +158,7 @@ function handleCommandRequest(msg) {
     send({
       op: "CommandResponse",
       request_id: requestId,
+      entity,
       success: false,
       reason: "worker received command for entity it does not own",
       payload: { handled_by: WID, entity, owner_current: false },
@@ -168,6 +169,7 @@ function handleCommandRequest(msg) {
     send({
       op: "CommandResponse",
       request_id: requestId,
+      entity,
       success: false,
       reason: "GW_AGAR_COMMAND_URL is not configured",
       payload: { handled_by: WID, entity, owner_current: true },
@@ -186,6 +188,7 @@ function handleCommandRequest(msg) {
     send({
       op: "CommandResponse",
       request_id: requestId,
+      entity,
       success: Boolean(ok),
       reason: ok ? null : (reply.body && (reply.body.reason || reply.body.error)) || `command bridge HTTP ${reply.status}`,
       payload: {
@@ -202,6 +205,7 @@ function handleCommandRequest(msg) {
     send({
       op: "CommandResponse",
       request_id: requestId,
+      entity,
       success: false,
       reason: err.message,
       payload: { handled_by: WID, entity, owner_current: true },
