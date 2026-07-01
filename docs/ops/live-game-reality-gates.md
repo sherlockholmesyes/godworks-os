@@ -142,10 +142,43 @@ ownership, and broker-routed command control for controlled players.
 
 Godot is the engine-facing proof path:
 
-- Godot 2D physics gate: a Godot scene consumes the SDK bridge, sends movement or
+Current command, when a Godot 4.x binary is available through `GODOT_BIN` or
+`godot` on `PATH`:
+
+```powershell
+.\scripts\run_godot_probes.ps1
+```
+
+This runner is narrower than a full game demo, but it is already an
+engine-facing gate:
+
+- `client_bridge_contract_probe.gd` replays the shared
+  `tests/fixtures/client_bridge/godot-resync-contract.json` transcript through
+  the Godot adapter and checks the same snapshot contract exported by the Rust
+  `ClientBridge`.
+- `client_bridge_tcp_resync_probe.gd` connects to a real broker socket,
+  disconnects a viewer, deletes stale state while offline, reconnects, performs
+  a full `EntityQuery` checkout, and verifies the Godot bridge rebuilt the
+  cache from broker output.
+- `cross_broker_handoff_probe.gd` is the first Godot-side cross-broker handoff
+  ruler.
+
+CI does not currently provision a Godot binary. The CI-safe inventory gate is:
+
+```bash
+python3 tools/godot_probe_inventory.py
+```
+
+That inventory gate is not a substitute for live Godot execution; it keeps the
+runner, fixture, probe scripts, docs, and expected snapshot shape from drifting
+while the live Godot gate remains environment-dependent.
+
+Remaining Godot work:
+
+- Godot 2D physics gate: a scene consumes the SDK bridge, sends movement or
   physics commands, crosses a seam, and agrees with broker state.
-- Godot 3D contract gate: a Godot scene or fixture exercises 3D-ready component
-  names and spatial metadata without requiring a full 3D runtime rewrite.
+- Godot 3D contract gate: a scene or fixture exercises 3D-ready component names
+  and spatial metadata without requiring a full 3D runtime rewrite.
 - Later Godot 3D physics gate: a real 3D physics worker/client path, after the
   typed spatial contracts are stable.
 
