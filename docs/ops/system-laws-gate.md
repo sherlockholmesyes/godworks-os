@@ -23,7 +23,8 @@ CI validates the machine-readable law index:
 python3 tools/system_laws_lint.py --laws docs/ops/system-laws.jsonl
 ```
 
-The Rust baseline also binds law rows to the current Rust test inventory:
+The Rust baseline also binds law rows to the current Rust test inventory and
+to local runtime/tool gate paths:
 
 ```bash
 python3 tools/system_laws_test_inventory.py --laws docs/ops/system-laws.jsonl
@@ -31,8 +32,10 @@ python3 tools/system_laws_test_inventory.py --laws docs/ops/system-laws.jsonl
 
 This runs `cargo test --workspace --all-targets -- --list` and fails if a
 `current_gates[].command` names a `cargo test` filter that no longer resolves
-to a real test. It does not replace running the tests; it prevents stale or
-invented law gates from surviving as documentation.
+to a real test. It also checks relative local gate paths such as
+`./examples/agar/run_agar_demo.ps1` or `./examples/agar_mit_clone/...` without
+running those heavier runtime gates in CI. It does not replace running the
+tests; it prevents stale or invented law gates from surviving as documentation.
 
 CI also runs a deliberately malformed fixture and expects it to fail:
 
@@ -77,8 +80,12 @@ test, fixture, or runtime ruler that would fail when the law is broken.
 - `docs/ops/examples/system-laws.valid-test-inventory.jsonl` and
   `docs/ops/examples/system-laws.invalid-missing-test.jsonl` prove the
   inventory checker accepts an existing cargo test gate and rejects a stale one.
+- `docs/ops/examples/system-laws.invalid-missing-local-gate.jsonl` proves the
+  inventory checker rejects a stale local runtime gate path.
 - `tools/system_laws_lint.py` validates the index without external
   dependencies.
 - `tools/system_laws_test_inventory.py` validates that law rows pointing at
-  Rust tests still point at tests in the current workspace inventory.
+  Rust tests still point at tests in the current workspace inventory, and that
+  law rows pointing at local gate scripts still point at files in the current
+  repository.
 

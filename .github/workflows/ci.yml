@@ -59,6 +59,11 @@ jobs:
             echo "system law row with missing cargo test gate unexpectedly passed"
             exit 1
           fi
+          if python3 tools/system_laws_test_inventory.py \
+            --laws docs/ops/examples/system-laws.invalid-missing-local-gate.jsonl; then
+            echo "system law row with missing local runtime gate unexpectedly passed"
+            exit 1
+          fi
 
       - name: Validate PR invariant body
         run: |
