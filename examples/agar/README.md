@@ -70,13 +70,16 @@ avoid duplicate entity ids in observed frames, and render a non-blank moving
 canvas sourced from `/client-state`. `-GateOnly` also runs the broker with
 `GW_REPLAY_TAPE` and validates the resulting live tape with `replay_eval`, so
 the gate fails if runtime breadcrumbs leak secrets, lose spatial contract
-metadata, or contradict protocol operation semantics.
+metadata, or contradict protocol operation semantics. After the live cluster is
+stopped, the same gate starts the broker in `GW_RESTORE_DRYRUN=1` against the
+demo WAL and fails if recovery reports an error, an empty store, no selected WAL
+events, or unknown WAL event kinds.
 
 This is the current Agar Reality Gate v1. It is now bound to the System Laws
 index as a runtime ruler, but it is not yet the full release gate. The remaining
 promotion work is tracked in `docs/ops/live-game-reality-gates.md`:
-`godworks-client-sdk` cache proof, WAL restore agreement, and longer soak
-coverage.
+`godworks-client-sdk` cache proof, restored-broker/client agreement, and longer
+soak coverage.
 
 The pixel gate launches Chrome/Edge through the Chrome DevTools Protocol without
 Playwright/Puppeteer. If the browser is not in a standard location, set:

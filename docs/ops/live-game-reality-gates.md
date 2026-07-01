@@ -31,6 +31,9 @@ dependency-free CDP pixel gate. It proves:
 - the broker emits a live `GW_REPLAY_TAPE` artifact and `replay_eval` accepts it
   without redaction leaks, malformed spatial metadata, or protocol semantic
   contradictions.
+- the demo WAL is accepted by `GW_RESTORE_DRYRUN=1` after the live cluster stops,
+  with a non-empty recovered store, selected WAL events, no recovery error, and
+  no unknown WAL event kinds.
 
 The gate is intentionally stronger than a synthetic protocol test because it
 uses the actual demo cluster and live state. It is still not the full release
@@ -54,8 +57,9 @@ checks:
 - SDK cache proof: route one client-facing check through
   `godworks-client-sdk::ClientBridge` instead of only the JavaScript gateway
   cache;
-- WAL restore proof: restart from `.local/agar/agar.wal` and verify the restored
-  state has no duplicate owner, missing player, or resurrected deleted entity;
+- restored-broker/client proof: restart from `.local/agar/agar.wal` and verify
+  the restored broker state agrees with the pre-restart client/broker truth, with
+  no duplicate owner, missing player, or resurrected deleted entity;
 - duration proof: run a longer multi-client soak and keep owner count,
   duplicate frames, rejects, and command acknowledgements inside expected
   bounds.
