@@ -7,6 +7,19 @@ a playable slice.
 
 ## Agar Reality Gate v2
 
+Substrate preflight from the AGI workspace:
+
+```powershell
+cd C:\Users\elean\Downloads\AGI
+python bridge\mcp_supervisor.py preflight
+cd C:\Users\elean\Downloads\godworks-os-agar-complete
+```
+
+The preflight is not a substitute for this gate. It only verifies that local
+tooling/upstreams such as Ollama and Obsidian are reachable and reports known
+MCP-process pressure before the live game run starts. It must not kill other
+agents' MCP processes.
+
 Current command:
 
 ```powershell
@@ -75,6 +88,14 @@ The public-clean MIT clone adapter lives under `examples/agar_mit_clone`. It
 reuses `owenashurst/agar.io-clone` locally instead of vendoring or rewriting the
 game.
 
+Run the same AGI MCP preflight before starting the MIT-clone live gates:
+
+```powershell
+cd C:\Users\elean\Downloads\AGI
+python bridge\mcp_supervisor.py preflight
+cd C:\Users\elean\Downloads\godworks-os-agar-complete
+```
+
 Commands:
 
 ```powershell
@@ -137,6 +158,22 @@ Boundary: even the broker-command MIT clone gate is not yet a full
 Godworks-authoritative replacement for the MIT clone server. The stock clone
 still owns its gameplay ecology and physics; Godworks proves live projection,
 ownership, and broker-routed command control for controlled players.
+
+Godworks-authoritative capacity gate:
+
+```powershell
+.\examples\agar_mit_clone\run_godworks_authoritative_stress_ladder.ps1 -BotCounts 20,50,100
+```
+
+This uses the MIT browser client and Socket.IO surface on `:3000`, but not the
+stock MIT game server. The authoritative server emits state from the Godworks
+broker path, and each zone worker owns entities through normal broker authority.
+Each ladder row must show sustained live players, player entities, all 16 owner
+slots, command-response growth, no command-reject growth by default, bounded
+transient retries, and then post-run cleanup with `players=0` and
+`playerEntities=0`. That cleanup check is part of the live gate: a row is not
+green if controlled players disconnect but their Godworks player entities remain
+orphaned after a stale-owner handoff window.
 
 ## Godot Gates
 

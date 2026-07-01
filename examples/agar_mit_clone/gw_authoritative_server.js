@@ -40,8 +40,11 @@ let requestSeq = 0;
 let commandResponses = 0;
 let commandRejects = 0;
 let commandTransientRejects = 0;
+let despawnFallbacks = 0;
+let despawnFailures = 0;
 const rejectedCommands = [];
 const transientRejectedCommands = [];
+const failedDespawns = [];
 const pendingCommands = new Map();
 
 app.use(express.static(clientRoot));
@@ -201,6 +204,18 @@ function recordCommandReject(list, msg, pending) {
   while (list.length > 16) list.shift();
 }
 
+function recordFailedDespawn(player, reason, region) {
+  despawnFailures++;
+  failedDespawns.push({
+    player: player.id,
+    entity: player.entity,
+    reason: String(reason || "unknown"),
+    region: region || null,
+    ts: Date.now(),
+  });
+  while (failedDespawns.length > 16) failedDespawns.shift();
+}
+
 function ensureEntity(id) {
   if (!entities.has(id)) {
     entities.set(id, { id, pos: [WIDTH / 2, HEIGHT / 2], vel: [0, 0], mass: 1, kind: "cell", name: "", hue: 100, owner: null, region: null });
@@ -327,15 +342,36 @@ async function spawnPlayer(player) {
 
 async function despawnPlayer(player) {
   const entity = entities.get(player.entity);
-  const region = regionForOwner(entity && entity.owner)
+  const primary = regionForOwner(entity && entity.owner)
     || regionFor((entity && entity.pos) || player.spawnPos || [WIDTH / 2, HEIGHT / 2]);
-  const url = `http://127.0.0.1:${CONTROL_BASE + region.index}/despawn`;
-  try {
-    const reply = await postJson(url, { entity: player.entity });
-    if (!reply.ok) console.error(`[auth-server] despawn ${player.entity} via ${region.region} failed: ${reply.reason || "unknown"}`);
-  } catch (e) {
-    console.error(`[auth-server] despawn ${player.entity} via ${region.region} error: ${e.message}`);
+  const tried = new Set();
+  const regions = [primary];
+  for (let row = 0; row < ROWS; row++) {
+    for (let col = 0; col < COLS; col++) {
+      regions.push({ col, row, region: `Z${col}_${row}`, index: row * COLS + col });
+    }
   }
+  let firstFailure = null;
+  for (const region of regions) {
+    if (!region || tried.has(region.index)) continue;
+    tried.add(region.index);
+    const url = `http://127.0.0.1:${CONTROL_BASE + region.index}/despawn`;
+    try {
+      const reply = await postJson(url, { entity: player.entity });
+      if (reply.ok) {
+        if (region.index !== primary.index) despawnFallbacks++;
+        return true;
+      }
+      firstFailure = firstFailure || { region: region.region, reason: reply.reason || "unknown" };
+    } catch (e) {
+      firstFailure = firstFailure || { region: region.region, reason: e.message };
+    }
+  }
+  recordFailedDespawn(player, firstFailure && firstFailure.reason, firstFailure && firstFailure.region);
+  console.error(
+    `[auth-server] despawn ${player.entity} failed after ${tried.size} workers; first=${(firstFailure && firstFailure.region) || "?"}: ${(firstFailure && firstFailure.reason) || "unknown"}`
+  );
+  return false;
 }
 
 function playerFrame(player) {
@@ -479,8 +515,11 @@ app.get("/state", (_req, res) => {
     commandResponses,
     commandRejects,
     commandTransientRejects,
+    despawnFallbacks,
+    despawnFailures,
     rejectedCommands,
     transientRejectedCommands,
+    failedDespawns,
     owners: Array.from(entities.values()).reduce((acc, entity) => {
       const key = entity.owner || entity.region || "?";
       acc[key] = (acc[key] || 0) + 1;

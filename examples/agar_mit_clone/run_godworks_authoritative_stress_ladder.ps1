@@ -117,6 +117,34 @@ function Stop-Bots([object]$BotRun) {
   }
 }
 
+function Get-JsonUrl([string]$Url, [int]$TimeoutSec = 3) {
+  $content = (Invoke-WebRequest -UseBasicParsing $Url -TimeoutSec $TimeoutSec).Content
+  return ($content | ConvertFrom-Json)
+}
+
+function Wait-AuthoritativePlayerCleanup([int]$Seconds = 10) {
+  $deadline = (Get-Date).AddSeconds($Seconds)
+  $latest = $null
+  while ((Get-Date) -lt $deadline) {
+    try {
+      $latest = Get-JsonUrl "http://127.0.0.1:$PortGame/state"
+      if ([int]$latest.players -eq 0 -and [int]$latest.playerEntities -eq 0) {
+        return [ordered]@{
+          ok = $true
+          state = $latest
+        }
+      }
+    } catch {
+      $latest = [pscustomobject]@{ ok = $false; error = $_.Exception.Message }
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  return [ordered]@{
+    ok = $false
+    state = $latest
+  }
+}
+
 function Extract-GateJson([string]$Text) {
   $match = [regex]::Match($Text, '(?s)\{\s*"ok"\s*:\s*(?:true|false).*?\}\s*$')
   if (-not $match.Success) {
@@ -236,6 +264,7 @@ foreach ($botCount in $BotCounts) {
   $runError = $null
   $resourceBefore = $null
   $resourceAfter = $null
+  $cleanup = $null
 
   try {
     if ($stackExit -ne 0) {
@@ -301,9 +330,13 @@ foreach ($botCount in $BotCounts) {
     $runError = $_.Exception.Message
   } finally {
     Stop-Bots $botRun
+    if ($botRun) {
+      $cleanup = Wait-AuthoritativePlayerCleanup
+    }
   }
 
-  $ok = ($stackExit -eq 0) -and ($gateExit -eq 0) -and $gate -and $gate.ok
+  $cleanupOk = (-not $botRun) -or ($cleanup -and $cleanup.ok)
+  $ok = ($stackExit -eq 0) -and ($gateExit -eq 0) -and $gate -and $gate.ok -and $cleanupOk
   $row = [ordered]@{
     ok = [bool]$ok
     botCount = $botCount
@@ -320,6 +353,7 @@ foreach ($botCount in $BotCounts) {
     runError = $runError
     resourceBefore = $resourceBefore
     resourceAfter = $resourceAfter
+    cleanup = $cleanup
   }
   if ($gate) {
     $row.thresholds = $gate.thresholds

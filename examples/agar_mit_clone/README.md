@@ -226,9 +226,12 @@ bot count it:
   slots, fresh broker command-response growth, zero fresh command-reject growth
   during the measured window by default, bounded transient stale/no-owner
   command retries, live bot frames, and live bots at the end of the window;
+- after stopping the bots, waits for authoritative cleanup and requires
+  `players=0` plus `playerEntities=0` so a stale owner during handoff cannot
+  leave an orphan player entity behind a green capacity row;
 - writes `.local/agar_authoritative_ladder/ladder_summary.json` with host,
   logs, thresholds, initial/latest server state, initial/latest bot state, raw
-  reject diagnostics, and process resource snapshots.
+  reject diagnostics, cleanup state, and process resource snapshots.
 
 This is the first step toward larger-map and 10k-player work. Treat the highest
 green row as an observed local floor under the current runner and hardware, not
