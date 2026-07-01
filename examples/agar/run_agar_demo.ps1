@@ -36,6 +36,7 @@ $old = @{
   GW_SPEED = $env:GW_SPEED
   GW_REPLAY_TAPE = $env:GW_REPLAY_TAPE
   GW_REPLAY_TAPE_CAPACITY = $env:GW_REPLAY_TAPE_CAPACITY
+  GW_RESTORE_DRYRUN = $env:GW_RESTORE_DRYRUN
 }
 
 $procs = @()
@@ -45,6 +46,13 @@ function Start-HiddenProc([string]$FilePath, [string[]]$ProcArgs, [string]$OutPa
   } else {
     Start-Process -FilePath $FilePath -WorkingDirectory $Repo -WindowStyle Hidden -PassThru -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath
   }
+}
+
+function Stop-AgarCluster {
+  foreach ($p in $script:procs) {
+    if ($p -and !$p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+  }
+  $script:procs = @()
 }
 
 try {
@@ -101,15 +109,26 @@ try {
     }
     & $replayEval $env:GW_REPLAY_TAPE
     if ($LASTEXITCODE -ne 0) { throw "agar replay_eval failed with exit code $LASTEXITCODE" }
+    Stop-AgarCluster
+    $env:GW_RESTORE_DRYRUN = "1"
+    $restoreRaw = & $broker 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "agar WAL restore dry-run failed with exit code $LASTEXITCODE`n$($restoreRaw -join "`n")" }
+    $restoreLine = $restoreRaw | Where-Object { "$_".TrimStart().StartsWith("{") } | Select-Object -Last 1
+    if (!$restoreLine) { throw "agar WAL restore dry-run did not emit JSON`n$($restoreRaw -join "`n")" }
+    $restore = $restoreLine | ConvertFrom-Json
+    if (!$restore.dry_run) { throw "agar WAL restore dry-run JSON missing dry_run=true" }
+    if ([int64]$restore.entity_count -le 0) { throw "agar WAL restore dry-run recovered no entities" }
+    if ([int64]$restore.selected_event_count -le 0) { throw "agar WAL restore dry-run selected no WAL events" }
+    if ([int64]$restore.unknown_kind_count -ne 0) { throw "agar WAL restore dry-run saw unknown WAL kinds: $($restore.unknown_kinds | ConvertTo-Json -Compress)" }
+    if ($null -ne $restore.error) { throw "agar WAL restore dry-run reported error: $($restore.error)" }
+    Write-Host ("agar WAL restore dry-run: " + ($restore | ConvertTo-Json -Compress -Depth 8))
   } else {
     Write-Host "Press Ctrl+C to stop. Logs: $LogDir"
     while ($true) { Start-Sleep -Seconds 1 }
   }
 }
 finally {
-  foreach ($p in $procs) {
-    if ($p -and !$p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-  }
+  Stop-AgarCluster
   foreach ($k in $old.Keys) {
     if ($null -eq $old[$k]) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue } else { Set-Item "Env:$k" $old[$k] }
   }
