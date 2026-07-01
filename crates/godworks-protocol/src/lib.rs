@@ -797,7 +797,14 @@ impl SnapshotManifest {
     }
 
     pub fn partition_map(&self) -> Option<VersionedPartitionMap> {
-        parse_partition_map_contract(self.fields.get("partition_map")?)
+        let map = parse_partition_map_contract(self.fields.get("partition_map")?)?;
+        if Some(map.version) != self.partition_map_version() {
+            return None;
+        }
+        if map.spec.partition_schema() != self.spatial_schema()?.partition_schema {
+            return None;
+        }
+        Some(map)
     }
 
     pub fn has_current_versions(&self) -> bool {

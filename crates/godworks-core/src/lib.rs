@@ -473,6 +473,18 @@ impl PartitionMapSpec {
             Self::Grid2D { .. } => "grid2d",
         }
     }
+
+    pub fn partition_schema(&self) -> PartitionSchema {
+        match self {
+            Self::Strip1D { boundaries, .. } => PartitionSchema::Strip1D {
+                boundary_count: boundaries.len() as u64,
+            },
+            Self::Grid2D { cols, rows, .. } => PartitionSchema::Grid2D {
+                cols: *cols,
+                rows: *rows,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -876,6 +888,25 @@ mod tests {
         assert_eq!(
             PartitionMapSpec::grid2d(2, 2, 10.0, 10.0, [f64::NAN, 0.0]),
             Err(PartitionMapSpecError::NonFiniteGridOrigin)
+        );
+    }
+
+    #[test]
+    fn partition_map_spec_projects_to_partition_schema() {
+        let strip = PartitionMapSpec::strip1d(
+            vec![-10.0, 0.0, 10.0],
+            vec![RegionSplitSpec::new("Z1", vec![3.0]).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            strip.partition_schema(),
+            PartitionSchema::Strip1D { boundary_count: 3 }
+        );
+
+        let grid = PartitionMapSpec::grid2d(3, 2, 10.0, 20.0, [0.0, 0.0]).unwrap();
+        assert_eq!(
+            grid.partition_schema(),
+            PartitionSchema::Grid2D { cols: 3, rows: 2 }
         );
     }
 }

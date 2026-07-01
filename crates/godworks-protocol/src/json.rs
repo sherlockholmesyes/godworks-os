@@ -1013,6 +1013,133 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_manifest_contract_rejects_partition_map_version_mismatch() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 42,
+            "wal_offset": 1,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            },
+            "partition_map": {
+                "version": 7,
+                "kind": "strip1d",
+                "boundaries": [0.0],
+                "splits": []
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.partition_map(), None);
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_rejects_partition_schema_kind_mismatch() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "grid2d", "cols": 2, "rows": 2 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "strip1d",
+                "boundaries": [0.0],
+                "splits": []
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.partition_map(), None);
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_rejects_grid_dimension_mismatch() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "grid2d", "cols": 3, "rows": 2 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "grid2d",
+                "cols": 4,
+                "rows": 2,
+                "cell_w": 10.0,
+                "cell_h": 20.0,
+                "origin": [0.0, 0.0]
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.partition_map(), None);
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_rejects_strip_boundary_count_mismatch() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 3 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "strip1d",
+                "boundaries": [-10.0, 0.0],
+                "splits": []
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.partition_map(), None);
+    }
+
+    #[test]
     fn snapshot_manifest_contract_rejects_future_versions() {
         let decoded = decode_json_value(&json!({
             "op": "SnapshotManifest",
