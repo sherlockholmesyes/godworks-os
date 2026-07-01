@@ -50,6 +50,12 @@ Run the capacity floor gate:
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunCapacityGate -BotCount 40 -StopExisting
 ```
 
+Run a broker-command stress ladder:
+
+```powershell
+.\examples\agar_mit_clone\run_mit_clone_stress_ladder.ps1 -BotCounts 40,80,120,200 -CommandPlayers 8 -CommandCapacityMinCompleted 4
+```
+
 Use `-StopExisting` when an old local demo owns the same ports.
 
 ## What This Proves
@@ -89,6 +95,14 @@ Use `-StopExisting` when an old local demo owns the same ports.
   at least 30 players, 800 live entities, 16 worker load slots, 8 good samples,
   and observed dynamic zone geometry. This is a reproducible capacity floor,
   not a maximum-player benchmark.
+- `run_mit_clone_stress_ladder.ps1` restarts the same real stack across several
+  bot-count profiles, runs `-RunBrokerCommandCapacityGate` for each profile,
+  writes raw per-profile logs, and emits `.local/agar_mit_clone_ladder/ladder_summary.json`.
+  It is a measured floor/first-failure profile, not a maximum-player claim.
+  The default starts 8 controlled stock-clone players and requires 4 completed
+  seam proofs. Dead probes are recorded as failed players and do not count; this
+  keeps normal Agar eating ecology live without letting one eaten probe hide the
+  broker-command seam signal.
 
 ## Honest Boundary
 
@@ -98,6 +112,12 @@ and emits a redacted JSON summary for model-plane ingestion. A real maximum
 claim still needs a profile that records hardware, CPU/RSS, command ACK latency,
 handoff success rate, and broker/client agreement under increasing bot/client
 counts.
+
+The stress ladder has the same boundary. It improves the evidence shape by
+recording multiple profiles with command ACKs and broker/client agreement, but
+the result is still local-machine evidence. Treat the highest green row as an
+observed floor until hardware, CPU/RSS, latency, and longer soak windows are
+recorded.
 
 The playable seam gate is also not a broker-authoritative command claim. The MIT
 clone still receives the probe movement command directly through its normal

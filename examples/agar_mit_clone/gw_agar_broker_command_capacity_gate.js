@@ -257,6 +257,11 @@ function ackOwner(ack) {
   return payload.owner || payload.handled_by || null;
 }
 
+function ackRoutedOwner(ack) {
+  const payload = ackPayload(ack);
+  return (ack && ack.routed_owner) || payload.routed_owner || null;
+}
+
 function ackAccepted(ack) {
   const payload = ackPayload(ack);
   return ack && ack.success !== false && payload.accepted !== false;
@@ -392,21 +397,33 @@ function makeTracker(player, index) {
     lastCommandAt: 0,
     lastDirectionAt: 0,
     completed: false,
+    failed: false,
+    failure: null,
   };
 }
 
 async function validateSelectedPlayerAlive(tracker) {
   const state = await fetchJson("command bridge selected player", `${BRIDGE_URL.replace(/\/$/, "")}/state?entity=${encodeURIComponent(tracker.entity)}`);
-  assertOk(state.ok, "selected controlled player is no longer ready", {
-    entity: tracker.entity,
-    state,
-  });
-  assertOk(Number(state.ripCount) === tracker.initialRipCount, "selected controlled player died before seam proof completed", {
-    entity: tracker.entity,
-    initialRipCount: tracker.initialRipCount,
-    currentRipCount: state.ripCount,
-  });
+  if (!state.ok) {
+    tracker.failed = true;
+    tracker.failure = {
+      reason: "selected controlled player is no longer ready",
+      state,
+    };
+    return false;
+  }
+  if (Number(state.ripCount) !== tracker.initialRipCount) {
+    tracker.failed = true;
+    tracker.failure = {
+      reason: "selected controlled player died before seam proof completed",
+      initialRipCount: tracker.initialRipCount,
+      currentRipCount: state.ripCount,
+      state,
+    };
+    return false;
+  }
   tracker.bridgeCommandCount = Number(state.commandCount) || 0;
+  return true;
 }
 
 function trackerComplete(tracker) {
@@ -418,7 +435,8 @@ function trackerComplete(tracker) {
 }
 
 async function updateTracker(tracker, monitor, view, broker, seqRef, startedAt) {
-  await validateSelectedPlayerAlive(tracker);
+  if (tracker.failed) return;
+  if (!(await validateSelectedPlayerAlive(tracker))) return;
   const probe = findMonitorProbe(monitor, tracker);
   const brokerProbe = findBrokerProbe(view, tracker.entity);
   if (!probe || !brokerProbe) return;
@@ -480,26 +498,39 @@ async function updateTracker(tracker, monitor, view, broker, seqRef, startedAt) 
       ack,
     });
     const ownerAfterAck = ackOwner(ack);
-    let acceptedOwner = ownerAfterAck === expectedOwner;
+    const routedOwner = ackRoutedOwner(ack);
+    let freshOwner = null;
+    let acceptedOwner = (!!routedOwner && ownerAfterAck === routedOwner) || ownerAfterAck === expectedOwner;
     if (!acceptedOwner && ownerAfterAck) {
       const freshView = await fetchJson("broker view", BROKER_VIEW_URL);
       const freshProbe = findBrokerProbe(freshView, tracker.entity);
-      const freshOwner = freshProbe && (freshProbe.o || freshProbe.owner || null);
+      freshOwner = freshProbe && (freshProbe.o || freshProbe.owner || null);
       acceptedOwner = ownerAfterAck === freshOwner;
-      if (acceptedOwner && tracker.currentOwner && freshOwner !== tracker.currentOwner) {
-        tracker.ownerChanges++;
-        tracker.currentOwner = freshOwner;
-        tracker.owners.add(freshOwner);
-        if (!tracker.firstSeamAt) {
-          tracker.firstSeamAt = Date.now();
-          tracker.postSeamPath = 0;
-        }
+    }
+    if (ownerAfterAck && routedOwner) {
+      assertOk(ownerAfterAck === routedOwner, "broker routed owner and worker response owner diverged", {
+        entity: tracker.entity,
+        routedOwner,
+        ownerAfterAck,
+        ack,
+      });
+    }
+    const acceptedCurrentOwner = routedOwner || freshOwner;
+    if (acceptedOwner && acceptedCurrentOwner && tracker.currentOwner && acceptedCurrentOwner !== tracker.currentOwner) {
+      tracker.ownerChanges++;
+      tracker.currentOwner = acceptedCurrentOwner;
+      tracker.owners.add(acceptedCurrentOwner);
+      if (!tracker.firstSeamAt) {
+        tracker.firstSeamAt = Date.now();
+        tracker.postSeamPath = 0;
       }
     }
     assertOk(acceptedOwner, "broker command was handled by a stale or wrong owner", {
       entity: tracker.entity,
       expectedOwner,
       ownerAfterAck,
+      routedOwner,
+      freshOwner,
       ack,
     });
     tracker.commandOwnerMatches++;
@@ -538,6 +569,8 @@ function trackerSummary(tracker) {
     commandOwnerMatches: tracker.commandOwnerMatches,
     bridgeCommandCount: tracker.bridgeCommandCount,
     completed: tracker.completed,
+    failed: tracker.failed,
+    failure: tracker.failure,
   };
 }
 
@@ -587,12 +620,15 @@ async function main() {
       brokerSamples.push(sampleBrokerView(view));
 
       for (const tracker of trackers) {
-        if (!tracker.completed) {
+        if (!tracker.completed && !tracker.failed) {
           await updateTracker(tracker, monitor, view, broker, seqRef, startedAt);
         }
       }
 
       if (trackers.filter(tracker => tracker.completed).length >= MIN_COMPLETED && monitorSamples.length >= MIN_SAMPLES) {
+        break;
+      }
+      if (trackers.filter(tracker => tracker.completed || !tracker.failed).length < MIN_COMPLETED) {
         break;
       }
       await delay(POLL_MS);
@@ -634,16 +670,17 @@ async function main() {
       brokerCommandCapacity: {
         controlledPlayers: CONTROLLED_PLAYERS,
         completedPlayers: completed.length,
-        minCommandResponses: Math.min(...trackers.map(tracker => tracker.commandResponses)),
+        failedPlayers: trackers.filter(tracker => tracker.failed).length,
+        minCommandResponses: Math.min(...completed.map(tracker => tracker.commandResponses)),
         totalCommandResponses: trackers.reduce((acc, tracker) => acc + tracker.commandResponses, 0),
         totalCommandOwnerMatches: trackers.reduce((acc, tracker) => acc + tracker.commandOwnerMatches, 0),
-        minOwnerChanges: Math.min(...trackers.map(tracker => tracker.ownerChanges)),
+        minOwnerChanges: Math.min(...completed.map(tracker => tracker.ownerChanges)),
         maxOwnerChanges: Math.max(...trackers.map(tracker => tracker.ownerChanges)),
-        minBlockChanges: Math.min(...trackers.map(tracker => tracker.blockChanges)),
+        minBlockChanges: Math.min(...completed.map(tracker => tracker.blockChanges)),
         maxBlockChanges: Math.max(...trackers.map(tracker => tracker.blockChanges)),
-        minPath: Math.min(...trackers.map(tracker => tracker.path)),
-        minPostSeamPath: Math.min(...trackers.map(tracker => tracker.postSeamPath)),
-        allPostSeamCommandOk: trackers.every(tracker => tracker.postSeamCommandOk),
+        minPath: Math.min(...completed.map(tracker => tracker.path)),
+        minPostSeamPath: Math.min(...completed.map(tracker => tracker.postSeamPath)),
+        allPostSeamCommandOk: completed.every(tracker => tracker.postSeamCommandOk),
         players: playerSummaries,
       },
     }, null, 2));

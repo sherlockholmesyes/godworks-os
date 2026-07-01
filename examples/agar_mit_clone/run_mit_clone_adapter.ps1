@@ -5,6 +5,7 @@ param(
   [switch]$RunPlayableSeamGate,
   [switch]$RunBrokerCommandGate,
   [switch]$RunBrokerCommandCapacityGate,
+  [switch]$StartCommandBridge,
   [switch]$RunCapacityGate,
   [switch]$SkipGame,
   [switch]$StopExisting,
@@ -56,13 +57,14 @@ function Test-PortListening([int]$Port) {
 
 function Stop-KnownAgarMitStack {
   $needles = @(
-    "agar_mit_clone",
     "gw_agar_mirror_worker.js",
     "gw_agar_command_bridge.js",
     "gw_agar_broker_command_gate.js",
+    "gw_agar_broker_command_capacity_gate.js",
     "gw_shard_monitor.js",
     "gw_broker_view.js",
-    "_gw_bots.js"
+    "_gw_bots.js",
+    "gw_agar_d2_worker.js"
   )
   Get-CimInstance Win32_Process |
     Where-Object {
@@ -242,7 +244,7 @@ if ($MirrorBroker) {
     Write-Host "Godworks broker already listening on :$PortBroker"
   }
 
-  $NeedsCommandBridge = $RunBrokerCommandGate -or $RunBrokerCommandCapacityGate
+  $NeedsCommandBridge = $StartCommandBridge -or $RunBrokerCommandGate -or $RunBrokerCommandCapacityGate
 
   if ($RunBrokerCommandCapacityGate -and (Test-PortListening $PortCommandBridge)) {
     Write-Host "broker-command capacity gate needs a fresh multi-player command bridge; restarting :$PortCommandBridge"
@@ -302,7 +304,7 @@ Write-Host "  monitor: http://localhost:$PortMonitor/"
 if ($MirrorBroker) {
   Write-Host "  broker:  127.0.0.1:$PortBroker"
   Write-Host "  view:    http://localhost:$PortView/"
-  if ($RunBrokerCommandGate) {
+  if ($StartCommandBridge -or $RunBrokerCommandGate) {
     Write-Host "  command: http://localhost:$PortCommandBridge/"
   } elseif ($RunBrokerCommandCapacityGate) {
     Write-Host "  command: http://localhost:$PortCommandBridge/ ($CommandPlayers controlled players)"

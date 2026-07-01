@@ -103,6 +103,9 @@ Rules:
   authority epoch for each pending command; a `CommandResponse` with the same
   `request_id` is forwarded only when it comes from that routed owner, names the
   same entity, and the authority has not moved to a different owner/epoch;
+- forwarded `CommandResponse` frames include broker-written `routed_owner`,
+  `authority_comp`, and `authority_epoch` so live gates and SDKs can verify the
+  routed authority proof without racing a separate observer view;
 - `caller` is broker-written when forwarding the request to an authority holder;
 - `CommandResponse` is transient and not WAL-backed state;
 - omitted `CommandResponse.success` means success by current broker convention;
@@ -128,10 +131,13 @@ CommandRequest:
 CommandResponse:
   request_id
   entity
+  routed_owner
+  authority_comp
+  authority_epoch
   success
   success_or_default
-  payload
   reason
+  payload
 ```
 
 ## Non-Goals In This Rail
