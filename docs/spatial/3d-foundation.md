@@ -129,6 +129,7 @@ spatial metadata before they become long-lived product surfaces:
 - `coordinate_codec_version`
 - `component_registry_version`
 - `partition_schema`
+- `partition_map`
 - physics-island schema/version
 
 Replay and telemetry events should avoid training future evaluation tools on
@@ -139,7 +140,8 @@ Replay and telemetry events should avoid training future evaluation tools on
   "kind": "broker_handoff",
   "spatial_dim": "D2",
   "coordinate_codec": "debug_f64_2",
-  "partition_schema": "grid2d"
+  "partition_schema": { "kind": "grid2d", "cols": 4, "rows": 4 },
+  "partition_map": { "version": 7, "kind": "grid2d", "cols": 4, "rows": 4, "cell_w": 30.0, "cell_h": 30.0, "origin": [0.0, 0.0] }
 }
 ```
 

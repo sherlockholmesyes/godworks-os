@@ -910,6 +910,15 @@ mod tests {
                 "spatial_dim": "D2",
                 "coordinate_codec": "debug_f64_2",
                 "partition_schema": { "kind": "grid2d", "cols": 3, "rows": 2 }
+            },
+            "partition_map": {
+                "version": 7,
+                "kind": "grid2d",
+                "cols": 3,
+                "rows": 2,
+                "cell_w": 10.0,
+                "cell_h": 20.0,
+                "origin": [0.0, 0.0]
             }
         }))
         .unwrap();
@@ -932,6 +941,13 @@ mod tests {
                 cols: 3,
                 rows: 2
             }))
+        );
+        assert_eq!(
+            manifest.partition_map(),
+            Some(crate::VersionedPartitionMap::new(
+                7,
+                crate::PartitionMapSpec::grid2d(3, 2, 10.0, 20.0, [0.0, 0.0]).unwrap()
+            ))
         );
     }
 
@@ -958,6 +974,41 @@ mod tests {
         };
 
         assert_eq!(manifest.spatial_schema(), None);
+        assert!(manifest.has_current_versions());
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_rejects_invalid_partition_map() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "grid2d", "cols": 2, "rows": 2 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "grid2d",
+                "cols": 2,
+                "rows": 2,
+                "cell_w": 0.0,
+                "cell_h": 20.0,
+                "origin": [0.0, 0.0]
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.partition_map(), None);
         assert!(manifest.has_current_versions());
     }
 
