@@ -103,3 +103,11 @@ wire protocol, disconnects a viewer, deletes stale broker state while the viewer
 is offline, reconnects, and rebuilds the adapter from a live
 `EntityQueryResponse`. That keeps the next bridge step grounded in real broker
 output without turning the SDK into a transport or prediction layer.
+
+The first live game cache runner is
+`crates/godworks-client-sdk/examples/agar_live_cache_gate.rs`. It opens the
+current broker TCP wire as a non-privileged `CLIENT`, decodes typed protocol
+ops, applies them through `ClientBridge`, and asserts that the Agar reality demo
+produces a non-empty positional cache with no rejected updates. The Agar
+`-GateOnly` runner executes this example as part of the live game gate, so the
+SDK cache is checked against the same runtime path as the browser/client stream.
