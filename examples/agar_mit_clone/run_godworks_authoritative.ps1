@@ -1,6 +1,7 @@
 param(
   [switch]$BuildBroker,
   [switch]$RunGate,
+  [switch]$RunOneShotHandoffGate,
   [switch]$StopExisting,
   [switch]$SkipNpmInstall,
   [string]$CloneUrl = "https://github.com/owenashurst/agar.io-clone.git",
@@ -74,6 +75,7 @@ function Stop-GodworksAuthoritativeAgar {
     "gw_authoritative_zone_worker.js",
     "gw_authoritative_server.js",
     "gw_authoritative_gate.js",
+    "gw_authoritative_one_shot_handoff_gate.js",
     "gw_authoritative_bots.js",
     "gw_authoritative_capacity_gate.js",
     "gw_authoritative_monitor.js",
@@ -144,7 +146,7 @@ function Ensure-ClientBuild {
 }
 
 function Copy-Tools {
-  foreach ($name in @("gw_authoritative_zone_worker.js", "gw_authoritative_server.js", "gw_authoritative_gate.js", "gw_authoritative_bots.js", "gw_authoritative_capacity_gate.js", "gw_authoritative_monitor.js")) {
+  foreach ($name in @("gw_authoritative_zone_worker.js", "gw_authoritative_server.js", "gw_authoritative_gate.js", "gw_authoritative_one_shot_handoff_gate.js", "gw_authoritative_bots.js", "gw_authoritative_capacity_gate.js", "gw_authoritative_monitor.js")) {
     Copy-Item -LiteralPath (Join-Path $ToolsDir $name) -Destination (Join-Path $CloneRoot $name) -Force
   }
 }
@@ -236,6 +238,19 @@ if ($RunGate) {
   Push-Location $CloneRoot
   try {
     & $NodeExe "gw_authoritative_gate.js"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  } finally {
+    Pop-Location
+  }
+}
+
+if ($RunOneShotHandoffGate) {
+  Start-Sleep -Seconds 3
+  $env:GW_AGAR_GAME_URL = "http://127.0.0.1:$PortGame"
+  $env:GW_AGAR_STATE_URL = "http://127.0.0.1:$PortGame/state?entities=1"
+  Push-Location $CloneRoot
+  try {
+    & $NodeExe "gw_authoritative_one_shot_handoff_gate.js"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   } finally {
     Pop-Location

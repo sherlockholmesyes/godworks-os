@@ -113,7 +113,15 @@ function Start-Bots([string]$Profile, [int]$Count) {
 
 function Stop-Bots([object]$BotRun) {
   if ($BotRun -and $BotRun.process) {
-    Stop-Process -Id $BotRun.process.Id -Force -ErrorAction SilentlyContinue
+    try {
+      Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$BotPort/shutdown" -Method Post -TimeoutSec 2 | Out-Null
+      Wait-Process -Id $BotRun.process.Id -Timeout 5 -ErrorAction SilentlyContinue
+    } catch {
+      # Fall through to the hard stop below; the shutdown endpoint is a cleanup aid, not a blocker.
+    }
+    if (-not $BotRun.process.HasExited) {
+      Stop-Process -Id $BotRun.process.Id -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 
@@ -285,6 +293,8 @@ foreach ($botCount in $BotCounts) {
       GW_AUTH_CAPACITY_MIN_COMMAND_DELTA = $env:GW_AUTH_CAPACITY_MIN_COMMAND_DELTA
       GW_AUTH_CAPACITY_MAX_REJECT_DELTA = $env:GW_AUTH_CAPACITY_MAX_REJECT_DELTA
       GW_AUTH_CAPACITY_MAX_TRANSIENT_REJECT_DELTA = $env:GW_AUTH_CAPACITY_MAX_TRANSIENT_REJECT_DELTA
+      GW_AUTH_CAPACITY_MAX_TIMEOUT_DELTA = $env:GW_AUTH_CAPACITY_MAX_TIMEOUT_DELTA
+      GW_AUTH_CAPACITY_MAX_STUCK_IN_FLIGHT_PLAYERS = $env:GW_AUTH_CAPACITY_MAX_STUCK_IN_FLIGHT_PLAYERS
       GW_AUTH_CAPACITY_MIN_BOT_ALIVE = $env:GW_AUTH_CAPACITY_MIN_BOT_ALIVE
       GW_AUTH_CAPACITY_MIN_BOT_FRAME_DELTA = $env:GW_AUTH_CAPACITY_MIN_BOT_FRAME_DELTA
     }
@@ -299,6 +309,8 @@ foreach ($botCount in $BotCounts) {
       $env:GW_AUTH_CAPACITY_MIN_COMMAND_DELTA = "$minAlive"
       $env:GW_AUTH_CAPACITY_MAX_REJECT_DELTA = "0"
       $env:GW_AUTH_CAPACITY_MAX_TRANSIENT_REJECT_DELTA = "$([Math]::Max($minAlive * 2, 50))"
+      $env:GW_AUTH_CAPACITY_MAX_TIMEOUT_DELTA = "0"
+      $env:GW_AUTH_CAPACITY_MAX_STUCK_IN_FLIGHT_PLAYERS = "0"
       $env:GW_AUTH_CAPACITY_MIN_BOT_ALIVE = "$minAlive"
       $env:GW_AUTH_CAPACITY_MIN_BOT_FRAME_DELTA = "$minAlive"
 
@@ -359,6 +371,7 @@ foreach ($botCount in $BotCounts) {
     $row.thresholds = $gate.thresholds
     $row.samples = $gate.samples
     $row.deltas = $gate.deltas
+    $row.commandHealth = $gate.commandHealth
     $row.initialState = $gate.initialState
     $row.initialBots = $gate.initialBots
     $row.latestState = $gate.latestState

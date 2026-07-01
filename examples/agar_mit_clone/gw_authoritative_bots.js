@@ -12,6 +12,7 @@ const HERD = process.env.GW_AUTH_BOT_HERD === "1";
 
 const bots = [];
 let startedAt = Date.now();
+let shuttingDown = false;
 
 for (let i = 0; i < COUNT; i++) {
   bots.push(spawnBot(i));
@@ -87,7 +88,7 @@ function spawnBot(index) {
   });
 
   setInterval(() => {
-    if (!socket.connected || !bot.alive) return;
+    if (shuttingDown || !socket.connected || !bot.alive) return;
     const now = Date.now();
     if (HERD) {
       bot.target = {
@@ -135,11 +136,30 @@ function sendJson(res, code, body) {
   res.end(JSON.stringify(body));
 }
 
+function shutdownBots() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const bot of bots) {
+    try {
+      if (bot.socket && bot.socket.connected) bot.socket.close();
+    } catch (_) {}
+  }
+  setTimeout(() => process.exit(0), 500);
+}
+
 http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/state") {
     return sendJson(res, 200, summarize());
+  }
+  if ((req.method === "POST" || req.method === "GET") && req.url === "/shutdown") {
+    sendJson(res, 200, { ok: true, shuttingDown: true, state: summarize() });
+    shutdownBots();
+    return;
   }
   sendJson(res, 404, { ok: false, reason: "not found" });
 }).listen(CONTROL_PORT, "127.0.0.1", () => {
   console.error(`[auth-bots] state http://127.0.0.1:${CONTROL_PORT}/state count=${COUNT}`);
 });
+
+process.on("SIGINT", shutdownBots);
+process.on("SIGTERM", shutdownBots);
