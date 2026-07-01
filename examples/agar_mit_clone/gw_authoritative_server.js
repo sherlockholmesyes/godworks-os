@@ -22,6 +22,8 @@ const WIDTH = parseFloat(process.env.GW_WIDTH || "5000");
 const HEIGHT = parseFloat(process.env.GW_HEIGHT || "5000");
 const UPDATE_HZ = parseFloat(process.env.GW_UPDATE_HZ || "25");
 const STATE_ENTITY_LIMIT = parseInt(process.env.GW_AUTH_STATE_ENTITY_LIMIT || "20000", 10);
+const COMMAND_ACK_TIMEOUT_MS = parseInt(process.env.GW_AUTH_COMMAND_ACK_TIMEOUT_MS || "1000", 10);
+const COMMAND_MAX_ATTEMPTS = parseInt(process.env.GW_AUTH_COMMAND_MAX_ATTEMPTS || "4", 10);
 
 const app = express();
 const httpServer = http.Server(app);
@@ -41,10 +43,15 @@ let requestSeq = 0;
 let commandResponses = 0;
 let commandRejects = 0;
 let commandTransientRejects = 0;
+let commandTimeouts = 0;
+let commandTimeoutRetries = 0;
+let ownerChangeResends = 0;
 let despawnFallbacks = 0;
 let despawnFailures = 0;
 const rejectedCommands = [];
 const transientRejectedCommands = [];
+const timedOutCommands = [];
+const ownerChangeResendEvents = [];
 const failedDespawns = [];
 const pendingCommands = new Map();
 
@@ -144,8 +151,10 @@ function handleObsFrame(msg) {
     for (const row of msg.entities || []) {
       const entity = ensureEntity(row.entity);
       if (Array.isArray(row.pos)) entity.pos = row.pos.slice();
+      const oldOwner = entity.owner || entity.region || null;
       entity.region = row.region || entity.region;
       entity.owner = (((row.authority || {}).pos || {}).owner) || entity.owner || entity.region;
+      maybeResendTargetAfterOwnerChange(row.entity, oldOwner, entity.owner);
     }
   }
 }
@@ -203,6 +212,55 @@ function recordCommandReject(list, msg, pending) {
     age_ms: pending ? Math.max(0, Date.now() - pending.sentAt) : null,
   });
   while (list.length > 16) list.shift();
+}
+
+function recordCommandTimeout(pending, player, retried) {
+  timedOutCommands.push({
+    request_id: pending.request_id || null,
+    entity: pending.entity || null,
+    player: pending.player || null,
+    target: pending.target || null,
+    attempt: pending.attempt || 0,
+    age_ms: Math.max(0, Date.now() - pending.sentAt),
+    retried: !!retried,
+    player_connected: !!(player && player.socket && player.socket.connected),
+  });
+  while (timedOutCommands.length > 16) timedOutCommands.shift();
+}
+
+function playerForEntity(entityId) {
+  for (const player of players.values()) {
+    if (player.entity === entityId) return player;
+  }
+  return null;
+}
+
+function recordOwnerChangeResend(player, oldOwner, newOwner, target) {
+  ownerChangeResendEvents.push({
+    entity: player.entity,
+    player: player.id,
+    old_owner: oldOwner || null,
+    new_owner: newOwner || null,
+    target,
+    queued: !!player.commandInFlight,
+    at: Date.now(),
+  });
+  while (ownerChangeResendEvents.length > 16) ownerChangeResendEvents.shift();
+}
+
+function maybeResendTargetAfterOwnerChange(entityId, oldOwner, newOwner) {
+  if (!oldOwner || !newOwner || oldOwner === newOwner) return;
+  const player = playerForEntity(entityId);
+  if (!player || !player.spawned || !player.socket.connected) return;
+  const target = player.lastWorldTarget || (player.lastTarget ? worldTargetFor(player, player.lastTarget) : null);
+  if (!target) return;
+  ownerChangeResends++;
+  recordOwnerChangeResend(player, oldOwner, newOwner, target);
+  if (player.commandInFlight) {
+    player.queuedTarget = target;
+    return;
+  }
+  setTimeout(() => sendTargetCommand(player, target, 0), 0);
 }
 
 function recordFailedDespawn(player, reason, region) {
@@ -276,6 +334,7 @@ function flushQueuedTarget(player, attempt) {
 
 function sendTargetCommand(player, worldTarget, attempt) {
   if (!player.spawned || !entities.has(player.entity)) return;
+  player.lastWorldTarget = worldTarget;
   if (player.commandInFlight) {
     player.queuedTarget = worldTarget;
     return;
@@ -283,6 +342,7 @@ function sendTargetCommand(player, worldTarget, attempt) {
   const requestId = `auth-cmd-${requestSeq++}`;
   player.commandInFlight = requestId;
   pendingCommands.set(requestId, {
+    request_id: requestId,
     entity: player.entity,
     player: player.id,
     target: worldTarget,
@@ -296,6 +356,60 @@ function sendTargetCommand(player, worldTarget, attempt) {
     command: "set_target",
     payload: { target: worldTarget },
   });
+}
+
+function reapCommandTimeouts() {
+  const now = Date.now();
+  for (const [requestId, pending] of Array.from(pendingCommands.entries())) {
+    const age = now - pending.sentAt;
+    if (age < COMMAND_ACK_TIMEOUT_MS) continue;
+
+    pendingCommands.delete(requestId);
+    const player = players.get(pending.player);
+    if (player && player.commandInFlight === requestId) {
+      player.commandInFlight = null;
+    }
+
+    const retryable = player
+      && player.socket
+      && player.socket.connected
+      && player.spawned
+      && entities.has(player.entity)
+      && (pending.attempt || 0) + 1 < COMMAND_MAX_ATTEMPTS;
+
+    if (retryable) {
+      commandTimeoutRetries++;
+      recordCommandTimeout(pending, player, true);
+      player.queuedTarget = player.queuedTarget || pending.target;
+      setTimeout(() => flushQueuedTarget(player, (pending.attempt || 0) + 1), 0);
+    } else {
+      commandTimeouts++;
+      recordCommandTimeout(pending, player, false);
+    }
+  }
+}
+
+function commandHealthSnapshot() {
+  const now = Date.now();
+  let inFlightPlayers = 0;
+  let stuckPlayers = 0;
+  let maxAge = 0;
+  for (const player of players.values()) {
+    if (!player.commandInFlight) continue;
+    inFlightPlayers++;
+    const pending = pendingCommands.get(player.commandInFlight);
+    const age = pending ? Math.max(0, now - pending.sentAt) : COMMAND_ACK_TIMEOUT_MS;
+    maxAge = Math.max(maxAge, age);
+    if (age >= COMMAND_ACK_TIMEOUT_MS) stuckPlayers++;
+  }
+  return {
+    pending: pendingCommands.size,
+    inFlightPlayers,
+    stuckPlayers,
+    maxInFlightAgeMs: Math.round(maxAge),
+    ackTimeoutMs: COMMAND_ACK_TIMEOUT_MS,
+    maxAttempts: COMMAND_MAX_ATTEMPTS,
+  };
 }
 
 function postJson(url, body) {
@@ -453,6 +567,7 @@ io.on("connection", socket => {
     spawned: false,
     commandInFlight: null,
     queuedTarget: null,
+    lastWorldTarget: null,
   };
   players.set(socket.id, player);
 
@@ -505,8 +620,11 @@ setInterval(() => {
   }
 }, 1000 / UPDATE_HZ);
 
+setInterval(reapCommandTimeouts, Math.max(50, Math.min(250, Math.floor(COMMAND_ACK_TIMEOUT_MS / 2))));
+
 app.get("/state", (req, res) => {
   const includeEntities = req.query.entities === "1" || req.query.entities === "true";
+  const commandHealth = commandHealthSnapshot();
   const body = {
     ok: true,
     godworksAuthoritative: true,
@@ -521,10 +639,16 @@ app.get("/state", (req, res) => {
     commandResponses,
     commandRejects,
     commandTransientRejects,
+    commandTimeouts,
+    commandTimeoutRetries,
+    ownerChangeResends,
+    commandHealth,
     despawnFallbacks,
     despawnFailures,
     rejectedCommands,
     transientRejectedCommands,
+    timedOutCommands,
+    ownerChangeResendEvents,
     failedDespawns,
     owners: Array.from(entities.values()).reduce((acc, entity) => {
       const key = entity.owner || entity.region || "?";

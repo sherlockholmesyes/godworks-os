@@ -64,6 +64,19 @@ This document records the current environment-variable surface. It is intentiona
 | `GW_SLOW_VIEWER` | Enable slow viewer socket scenario. |
 | `GW_REQUIRE_MESH` | Require mesh-specific success conditions. |
 
+## Agar authoritative demo variables
+
+| Variable | Purpose |
+|---|---|
+| `GW_AUTH_COMMAND_ACK_TIMEOUT_MS` | Server-side deadline for a Godworks authoritative Agar command response before the gateway retries or records a timeout. Default `1000`. |
+| `GW_AUTH_COMMAND_MAX_ATTEMPTS` | Maximum send attempts for one authoritative Agar command before it becomes a timeout diagnostic. Default `4`. |
+| `GW_AUTH_CAPACITY_MAX_TIMEOUT_DELTA` | Capacity-gate cap for new command ACK timeouts during the measured window. Default `0`. |
+| `GW_AUTH_CAPACITY_MAX_STUCK_IN_FLIGHT_PLAYERS` | Capacity-gate cap for players with command requests older than the server ACK deadline. Default `0`. |
+| `GW_AGAR_ONE_SHOT_TIMEOUT_MS` | One-shot authoritative handoff gate deadline. Default `30000`. |
+| `GW_AGAR_ONE_SHOT_TARGET_X` | One-shot gate movement target x-offset in the MIT client command frame. Default `4500`. |
+| `GW_AGAR_ONE_SHOT_TARGET_Y` | One-shot gate movement target y-offset in the MIT client command frame. Default `4500`. |
+| `GW_AGAR_ONE_SHOT_MIN_POST_HANDOFF_DISTANCE` | Minimum motion required after the observed owner change in the one-shot gate. Default `40`. |
+
 ## Hardening backlog
 
 - [ ] Replace production env-var sprawl with `godworks.toml` config files.

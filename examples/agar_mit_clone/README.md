@@ -82,6 +82,17 @@ Run the Godworks-authoritative stress ladder:
 
 Use `-StopExisting` when an old local demo owns the same ports.
 
+Run the one-shot seam handoff gate:
+
+```powershell
+.\examples\agar_mit_clone\run_godworks_authoritative.ps1 -StopExisting -SkipNpmInstall -RunOneShotHandoffGate
+```
+
+This gate sends one movement command, then stops sending client input. It passes
+only if the gateway observes a Godworks owner change, re-delivers the latest
+target to the new owner, receives a fresh command ACK, and the player continues
+moving after the seam without stuck in-flight commands.
+
 ## Promoted Artifact Map
 
 This directory is the public-clean promotion of the local MIT-clone prototype.
@@ -223,7 +234,11 @@ Instead:
   `:8091` monitor so the gate cannot pass with a dead visual/debug surface. The
   browser layer is also expected to show the normal MIT `Open Agar` client on
   `:3000`; pressing Play should enter a live canvas backed by this
-  Godworks-authoritative server.
+  authoritative path;
+- `gw_authoritative_one_shot_handoff_gate.js` proves command intent survives a
+  seam without repeated client input. It sends exactly one movement command and
+  requires an owner-change resend plus post-handoff motion, so worker-local
+  target loss at `AuthorityChange` cannot hide behind spammed client commands.
 
 This is an authority-path milestone, not the whole final game. Current non-scope
 for v0: split, mass eject, viruses, multi-cell merge timing, production
@@ -244,13 +259,16 @@ bot count it:
 - requires sustained players, player entities, total entities, all worker-owner
   slots, fresh broker command-response growth, zero fresh command-reject growth
   during the measured window by default, bounded transient stale/no-owner
-  command retries, live bot frames, and live bots at the end of the window;
+  command retries, zero command ACK timeouts by default, no command stuck past
+  the server ACK deadline, live bot frames, and live bots at the end of the
+  window;
 - after stopping the bots, waits for authoritative cleanup and requires
   `players=0` plus `playerEntities=0` so a stale owner during handoff cannot
   leave an orphan player entity behind a green capacity row;
 - writes `.local/agar_authoritative_ladder/ladder_summary.json` with host,
-  logs, thresholds, initial/latest server state, initial/latest bot state, raw
-  reject diagnostics, cleanup state, and process resource snapshots.
+  logs, thresholds, initial/latest server state, command health, initial/latest
+  bot state, raw reject/timeout diagnostics, cleanup state, and process
+  resource snapshots.
 
 This is the first step toward larger-map and 10k-player work. Treat the highest
 green row as an observed local floor under the current runner and hardware, not

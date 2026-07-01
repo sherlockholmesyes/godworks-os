@@ -170,7 +170,8 @@ stock MIT game server. The authoritative server emits state from the Godworks
 broker path, and each zone worker owns entities through normal broker authority.
 Each ladder row must show sustained live players, player entities, all 16 owner
 slots, command-response growth, no command-reject growth by default, bounded
-transient retries, and then post-run cleanup with `players=0` and
+transient retries, no command ACK timeout growth by default, no command stuck
+past the server ACK deadline, and then post-run cleanup with `players=0` and
 `playerEntities=0`. That cleanup check is part of the live gate: a row is not
 green if controlled players disconnect but their Godworks player entities remain
 orphaned after a stale-owner handoff window.
@@ -188,6 +189,19 @@ as the gate, draws actual broker owner load, draws the fixed broker grid, and
 adds a dynamic load-balanced diagnostic view. The diagnostic view must not be
 described as dynamic broker rebalance until a future PartitionMap activation
 contract makes broker region movement real.
+
+Godworks-authoritative one-shot handoff gate:
+
+```powershell
+python C:\Users\elean\Downloads\AGI\bridge\mcp_supervisor.py preflight
+.\examples\agar_mit_clone\run_godworks_authoritative.ps1 -StopExisting -SkipNpmInstall -RunOneShotHandoffGate
+```
+
+This is the stronger command-intent proof. It sends one movement command through
+the MIT client, then stops sending client input. The gate requires a broker owner
+change, a gateway owner-change resend of the latest target, a fresh command ACK
+from the current owner path, continued post-handoff motion, and zero stuck
+in-flight commands.
 
 ## Godot Gates
 

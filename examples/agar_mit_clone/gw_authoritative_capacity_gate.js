@@ -14,6 +14,8 @@ const MIN_WORKERS = parseInt(process.env.GW_AUTH_CAPACITY_MIN_WORKERS || "16", 1
 const MIN_COMMAND_DELTA = parseInt(process.env.GW_AUTH_CAPACITY_MIN_COMMAND_DELTA || `${MIN_PLAYERS}`, 10);
 const MAX_REJECT_DELTA = parseInt(process.env.GW_AUTH_CAPACITY_MAX_REJECT_DELTA || "0", 10);
 const MAX_TRANSIENT_REJECT_DELTA = parseInt(process.env.GW_AUTH_CAPACITY_MAX_TRANSIENT_REJECT_DELTA || `${Math.max(MIN_PLAYERS * 2, 50)}`, 10);
+const MAX_TIMEOUT_DELTA = parseInt(process.env.GW_AUTH_CAPACITY_MAX_TIMEOUT_DELTA || "0", 10);
+const MAX_STUCK_IN_FLIGHT_PLAYERS = parseInt(process.env.GW_AUTH_CAPACITY_MAX_STUCK_IN_FLIGHT_PLAYERS || "0", 10);
 const MIN_BOT_ALIVE = parseInt(process.env.GW_AUTH_CAPACITY_MIN_BOT_ALIVE || `${MIN_PLAYERS}`, 10);
 const MIN_BOT_FRAME_DELTA = parseInt(process.env.GW_AUTH_CAPACITY_MIN_BOT_FRAME_DELTA || `${MIN_PLAYERS}`, 10);
 
@@ -81,6 +83,7 @@ async function main() {
   const initialCommands = numeric(initialState.commandResponses);
   const initialRejects = numeric(initialState.commandRejects);
   const initialTransientRejects = numeric(initialState.commandTransientRejects);
+  const initialTimeouts = numeric(initialState.commandTimeouts);
   const initialFrames = numeric(initialBots.frames);
 
   const started = Date.now();
@@ -127,7 +130,9 @@ async function main() {
   const commandDelta = numeric(latest.commandResponses) - initialCommands;
   const rejectDelta = numeric(latest.commandRejects) - initialRejects;
   const transientRejectDelta = numeric(latest.commandTransientRejects) - initialTransientRejects;
+  const timeoutDelta = numeric(latest.commandTimeouts) - initialTimeouts;
   const botFrameDelta = numeric(latestBots.frames) - initialFrames;
+  const commandHealth = latest.commandHealth || {};
 
   assertOk(okSamples.length >= MIN_OK_SAMPLES, "authoritative capacity floor was not sustained", {
     okSamples: okSamples.length,
@@ -147,6 +152,16 @@ async function main() {
   assertOk(transientRejectDelta <= MAX_TRANSIENT_REJECT_DELTA, "broker transient command retries exceeded configured cap", {
     transientRejectDelta,
     maxTransientRejectDelta: MAX_TRANSIENT_REJECT_DELTA,
+  });
+  assertOk(timeoutDelta <= MAX_TIMEOUT_DELTA, "broker command ACK timeouts exceeded configured cap", {
+    timeoutDelta,
+    maxTimeoutDelta: MAX_TIMEOUT_DELTA,
+    timedOutCommands: latest.timedOutCommands || [],
+  });
+  assertOk(numeric(commandHealth.stuckPlayers) <= MAX_STUCK_IN_FLIGHT_PLAYERS, "broker command in-flight requests are stuck past ACK deadline", {
+    stuckPlayers: commandHealth.stuckPlayers,
+    maxStuckInFlightPlayers: MAX_STUCK_IN_FLIGHT_PLAYERS,
+    commandHealth,
   });
   assertOk(numeric(latestBots.alive) >= MIN_BOT_ALIVE, "too few bots alive at capacity gate end", {
     alive: latestBots.alive,
@@ -179,6 +194,8 @@ async function main() {
       minCommandDelta: MIN_COMMAND_DELTA,
       maxRejectDelta: MAX_REJECT_DELTA,
       maxTransientRejectDelta: MAX_TRANSIENT_REJECT_DELTA,
+      maxTimeoutDelta: MAX_TIMEOUT_DELTA,
+      maxStuckInFlightPlayers: MAX_STUCK_IN_FLIGHT_PLAYERS,
       minBotAlive: MIN_BOT_ALIVE,
       minBotFrameDelta: MIN_BOT_FRAME_DELTA,
     },
@@ -196,8 +213,10 @@ async function main() {
       commandResponses: commandDelta,
       commandRejects: rejectDelta,
       transientCommandRejects: transientRejectDelta,
+      commandTimeouts: timeoutDelta,
       botFrames: botFrameDelta,
     },
+    commandHealth,
     initialState,
     initialBots,
     latestState: latest,

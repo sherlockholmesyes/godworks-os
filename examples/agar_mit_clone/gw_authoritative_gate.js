@@ -25,6 +25,7 @@ function getJson(url) {
 async function main() {
   const initialState = await getJson(STATE_URL).catch(() => null);
   const initialCommandResponses = Number((initialState || {}).commandResponses || 0);
+  const initialCommandTimeouts = Number((initialState || {}).commandTimeouts || 0);
   const socket = io(GAME_URL, { query: { type: "player" }, reconnection: false });
   let welcomed = false;
   let frames = 0;
@@ -90,6 +91,8 @@ async function main() {
       state.foods > 0 &&
       state.playerEntities > 0 &&
       Number(state.commandResponses || 0) > initialCommandResponses &&
+      Number(state.commandTimeouts || 0) <= initialCommandTimeouts &&
+      Number(((state.commandHealth || {}).stuckPlayers) || 0) === 0 &&
       monitorOk &&
       !rip &&
       !kicked
@@ -101,6 +104,7 @@ async function main() {
         frames,
         maxDistance,
         commandResponseDelta: Number(state.commandResponses || 0) - initialCommandResponses,
+        commandTimeoutDelta: Number(state.commandTimeouts || 0) - initialCommandTimeouts,
         state,
         monitorState,
       }, null, 2));
@@ -118,6 +122,7 @@ async function main() {
     kicked,
     latest,
     initialCommandResponses,
+    initialCommandTimeouts,
     state,
     monitorState,
   }, null, 2));

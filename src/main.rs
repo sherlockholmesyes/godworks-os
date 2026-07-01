@@ -4226,6 +4226,50 @@ fn queue_local_handoff(
     true
 }
 
+fn pending_command_authority_current(state: &ServerState, pending: &PendingCommand) -> bool {
+    match state.entities.get(&pending.entity) {
+        Some(e) => match pending.authority_epoch {
+            Some(epoch) => e
+                .authority
+                .get(&pending.authority_comp)
+                .map(|ca| ca.owner.as_deref() == Some(pending.owner.as_str()) && ca.epoch == epoch)
+                .unwrap_or(false),
+            None => state
+                .region_worker
+                .get(&e.region)
+                .map(|owner| owner == &pending.owner)
+                .unwrap_or(false),
+        },
+        None => false,
+    }
+}
+
+fn reject_stale_pending_commands_for_entity(state: &mut ServerState, eid: &str) {
+    let stale: Vec<(String, PendingCommand)> = state
+        .pending_commands
+        .iter()
+        .filter(|(_, pending)| {
+            pending.entity == eid && !pending_command_authority_current(state, pending)
+        })
+        .map(|(request_id, pending)| (request_id.clone(), pending.clone()))
+        .collect();
+    for (request_id, pending) in stale {
+        state.pending_commands.remove(&request_id);
+        if state.workers.contains_key(&pending.caller) {
+            emit(
+                state,
+                &pending.caller,
+                json!({"op":"CommandResponse","request_id":request_id,
+                "entity":pending.entity,
+                "routed_owner":pending.owner,
+                "authority_comp":pending.authority_comp,
+                "authority_epoch":pending.authority_epoch,
+                "success":false,"reason":"stale command authority"}),
+            );
+        }
+    }
+}
+
 fn apply_prepared_handoff(state: &mut ServerState, h: &PreparedHandoff) {
     if let Some(e) = state.entities.get_mut(&h.eid) {
         e.pos = h.pos;
@@ -4243,6 +4287,7 @@ fn apply_prepared_handoff(state: &mut ServerState, h: &PreparedHandoff) {
         }));
         return;
     }
+    reject_stale_pending_commands_for_entity(state, &h.eid);
     state.metrics.handoffs += 1;
     record_replay_tape_handoff(
         state,
@@ -6245,24 +6290,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                 if response_entity != Some(pending.entity.as_str()) {
                     return;
                 }
-                let current_authority_ok = match state.entities.get(&pending.entity) {
-                    Some(e) => match pending.authority_epoch {
-                        Some(epoch) => e
-                            .authority
-                            .get(&pending.authority_comp)
-                            .map(|ca| {
-                                ca.owner.as_deref() == Some(pending.owner.as_str())
-                                    && ca.epoch == epoch
-                            })
-                            .unwrap_or(false),
-                        None => state
-                            .region_worker
-                            .get(&e.region)
-                            .map(|owner| owner == &pending.owner)
-                            .unwrap_or(false),
-                    },
-                    None => false,
-                };
+                let current_authority_ok = pending_command_authority_current(state, &pending);
                 if !current_authority_ok {
                     state.pending_commands.remove(&req_id);
                     if state.workers.contains_key(&pending.caller) {
@@ -9320,6 +9348,51 @@ mod tests {
         assert_eq!(response["success"], false);
         assert_eq!(response["reason"], "stale command authority");
         assert!(!state.pending_commands.contains_key("cmd-stale"));
+    }
+
+    #[test]
+    fn handoff_invalidates_pending_command_without_owner_response() {
+        let mut state = ServerState::new(30.0);
+        let mut caller_rx = add_test_peer_with_rx(&mut state, "client", "CLIENT", HashSet::new());
+        let mut old_owner_rx = add_test_worker_with_rx(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        state
+            .entities
+            .insert("ship".to_string(), test_entity([-1.0, 0.0], "W"));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+        while old_owner_rx.try_recv().is_ok() {}
+
+        dispatch_test_frame(
+            &mut state,
+            "client",
+            &json!({"op":"CommandRequest","request_id":"cmd-handoff","entity":"ship","command":"move"}),
+        );
+        let _ = old_owner_rx
+            .try_recv()
+            .expect("command must route to the pre-handoff owner");
+        assert!(state.pending_commands.contains_key("cmd-handoff"));
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+        flush_pending_handoffs(&mut state);
+
+        let response =
+            decode_test_frame(&caller_rx.try_recv().expect(
+                "handoff must fail the stale pending command without waiting for old owner",
+            ));
+        assert_eq!(response["op"], "CommandResponse");
+        assert_eq!(response["request_id"], "cmd-handoff");
+        assert_eq!(response["entity"], "ship");
+        assert_eq!(response["routed_owner"], "w1");
+        assert_eq!(response["authority_comp"], "pos");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["reason"], "stale command authority");
+        assert!(!state.pending_commands.contains_key("cmd-handoff"));
     }
 
     #[test]
