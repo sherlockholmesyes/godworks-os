@@ -826,6 +826,12 @@ pub struct ComponentAuthority {
 /// Current schema version for model-plane feature blocks.
 pub const MODEL_FEATURE_BLOCK_SCHEMA_VERSION: u64 = 1;
 
+/// Current schema version for project-local model dataset manifests.
+pub const MODEL_DATASET_MANIFEST_SCHEMA_VERSION: u64 = 1;
+
+/// Current schema version for model proposal promotion records.
+pub const MODEL_PROMOTION_RECORD_SCHEMA_VERSION: u64 = 1;
+
 /// Typed feature families the model plane may learn from.
 ///
 /// These are observations, not runtime commands. Runtime mutation remains under
@@ -1003,6 +1009,135 @@ impl ModelFeatureBlock {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelDatasetManifestValidationError {
+    EmptyProjectId,
+    EmptyDatasetId,
+    InvalidSchemaVersion,
+    InvalidFeatureSchemaVersion,
+    EmptyFeatureBlockSet,
+    EmptyTraceIdSet,
+    EmptySourceArtifactSet,
+    EmptyTraceId,
+    EmptySourceArtifact,
+    FeatureBlockInvalid(ModelFeatureBlockValidationError),
+    MixedProjectId { expected: String, found: String },
+    MixedDatasetId { expected: String, found: String },
+    MixedFeatureSchemaVersion { expected: u64, found: u64 },
+}
+
+/// Project-local manifest for a validated feature-block dataset cut.
+///
+/// This is not a training result and not a runtime control plane. It is the
+/// replayable bridge between redacted feature blocks and future model training
+/// or shadow/advisor evaluation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelDatasetManifest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub schema_version: u64,
+    pub feature_schema_version: u64,
+    pub feature_block_count: usize,
+    pub trace_ids: Vec<String>,
+    pub source_artifacts: Vec<String>,
+}
+
+impl ModelDatasetManifest {
+    pub fn from_feature_blocks(
+        blocks: &[ModelFeatureBlock],
+    ) -> Result<Self, ModelDatasetManifestValidationError> {
+        let first = blocks
+            .first()
+            .ok_or(ModelDatasetManifestValidationError::EmptyFeatureBlockSet)?;
+        first
+            .validate()
+            .map_err(ModelDatasetManifestValidationError::FeatureBlockInvalid)?;
+
+        let project_id = first.provenance.project_id.clone();
+        let dataset_id = first.provenance.dataset_id.clone();
+        let feature_schema_version = first.provenance.schema_version;
+        let mut trace_ids = BTreeSet::new();
+        let mut source_artifacts = BTreeSet::new();
+        trace_ids.insert(first.provenance.trace_id.clone());
+        source_artifacts.insert(first.provenance.source_artifact.clone());
+
+        for block in &blocks[1..] {
+            block
+                .validate()
+                .map_err(ModelDatasetManifestValidationError::FeatureBlockInvalid)?;
+            if block.provenance.project_id != project_id {
+                return Err(ModelDatasetManifestValidationError::MixedProjectId {
+                    expected: project_id,
+                    found: block.provenance.project_id.clone(),
+                });
+            }
+            if block.provenance.dataset_id != dataset_id {
+                return Err(ModelDatasetManifestValidationError::MixedDatasetId {
+                    expected: dataset_id,
+                    found: block.provenance.dataset_id.clone(),
+                });
+            }
+            if block.provenance.schema_version != feature_schema_version {
+                return Err(
+                    ModelDatasetManifestValidationError::MixedFeatureSchemaVersion {
+                        expected: feature_schema_version,
+                        found: block.provenance.schema_version,
+                    },
+                );
+            }
+            trace_ids.insert(block.provenance.trace_id.clone());
+            source_artifacts.insert(block.provenance.source_artifact.clone());
+        }
+
+        let manifest = Self {
+            project_id,
+            dataset_id,
+            schema_version: MODEL_DATASET_MANIFEST_SCHEMA_VERSION,
+            feature_schema_version,
+            feature_block_count: blocks.len(),
+            trace_ids: trace_ids.into_iter().collect(),
+            source_artifacts: source_artifacts.into_iter().collect(),
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<(), ModelDatasetManifestValidationError> {
+        if self.project_id.trim().is_empty() {
+            return Err(ModelDatasetManifestValidationError::EmptyProjectId);
+        }
+        if self.dataset_id.trim().is_empty() {
+            return Err(ModelDatasetManifestValidationError::EmptyDatasetId);
+        }
+        if self.schema_version == 0 {
+            return Err(ModelDatasetManifestValidationError::InvalidSchemaVersion);
+        }
+        if self.feature_schema_version == 0 {
+            return Err(ModelDatasetManifestValidationError::InvalidFeatureSchemaVersion);
+        }
+        if self.feature_block_count == 0 {
+            return Err(ModelDatasetManifestValidationError::EmptyFeatureBlockSet);
+        }
+        if self.trace_ids.is_empty() {
+            return Err(ModelDatasetManifestValidationError::EmptyTraceIdSet);
+        }
+        for trace_id in &self.trace_ids {
+            if trace_id.trim().is_empty() {
+                return Err(ModelDatasetManifestValidationError::EmptyTraceId);
+            }
+        }
+        if self.source_artifacts.is_empty() {
+            return Err(ModelDatasetManifestValidationError::EmptySourceArtifactSet);
+        }
+        for source_artifact in &self.source_artifacts {
+            if source_artifact.trim().is_empty() {
+                return Err(ModelDatasetManifestValidationError::EmptySourceArtifact);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn validate_feature_name(name: &str) -> Result<(), ModelFeatureBlockValidationError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -1026,6 +1161,29 @@ fn validate_feature_name(name: &str) -> Result<(), ModelFeatureBlockValidationEr
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelPromotionDecision {
+    Reject,
+    Accept,
+}
+
+impl ModelPromotionDecision {
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::Accept => "accept",
+        }
+    }
+
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        match value {
+            "reject" => Some(Self::Reject),
+            "accept" => Some(Self::Accept),
+            _ => None,
+        }
+    }
 }
 
 /// Promotion mode for a model-plane proposal.
@@ -1190,6 +1348,89 @@ impl ModelActionProposal {
                 .unwrap_or(true)
         {
             return Err(ModelActionValidationError::GuardedWithoutValidator);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelPromotionRecordValidationError {
+    InvalidSchemaVersion,
+    EmptyPromotionId,
+    EmptyReplayEvalArtifact,
+    DatasetInvalid(ModelDatasetManifestValidationError),
+    ProposalInvalid(ModelActionValidationError),
+    ProjectMismatch { dataset: String, proposal: String },
+    DatasetMismatch { dataset: String, proposal: String },
+}
+
+/// Auditable promotion decision for a model-plane proposal.
+///
+/// A promotion record binds a proposal back to a validated dataset manifest and
+/// to the replay/eval artifact that judged it. This keeps project-local
+/// micro-models on the advisor side of the wall: a proposal can be accepted or
+/// rejected for later validator consideration, but the record itself cannot
+/// mutate broker state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelPromotionRecord {
+    pub promotion_id: String,
+    pub schema_version: u64,
+    pub dataset: ModelDatasetManifest,
+    pub proposal: ModelActionProposal,
+    pub decision: ModelPromotionDecision,
+    pub replay_eval_artifact: String,
+}
+
+impl ModelPromotionRecord {
+    pub fn new(
+        promotion_id: impl Into<String>,
+        dataset: ModelDatasetManifest,
+        proposal: ModelActionProposal,
+        decision: ModelPromotionDecision,
+        replay_eval_artifact: impl Into<String>,
+    ) -> Self {
+        Self {
+            promotion_id: promotion_id.into(),
+            schema_version: MODEL_PROMOTION_RECORD_SCHEMA_VERSION,
+            dataset,
+            proposal,
+            decision,
+            replay_eval_artifact: replay_eval_artifact.into(),
+        }
+    }
+
+    pub const fn with_schema_version(mut self, schema_version: u64) -> Self {
+        self.schema_version = schema_version;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), ModelPromotionRecordValidationError> {
+        if self.schema_version == 0 {
+            return Err(ModelPromotionRecordValidationError::InvalidSchemaVersion);
+        }
+        if self.promotion_id.trim().is_empty() {
+            return Err(ModelPromotionRecordValidationError::EmptyPromotionId);
+        }
+        if self.replay_eval_artifact.trim().is_empty() {
+            return Err(ModelPromotionRecordValidationError::EmptyReplayEvalArtifact);
+        }
+        self.dataset
+            .validate()
+            .map_err(ModelPromotionRecordValidationError::DatasetInvalid)?;
+        self.proposal
+            .validate()
+            .map_err(ModelPromotionRecordValidationError::ProposalInvalid)?;
+        if self.dataset.project_id != self.proposal.provenance.project_id {
+            return Err(ModelPromotionRecordValidationError::ProjectMismatch {
+                dataset: self.dataset.project_id.clone(),
+                proposal: self.proposal.provenance.project_id.clone(),
+            });
+        }
+        if self.dataset.dataset_id != self.proposal.provenance.dataset_id {
+            return Err(ModelPromotionRecordValidationError::DatasetMismatch {
+                dataset: self.dataset.dataset_id.clone(),
+                proposal: self.proposal.provenance.dataset_id.clone(),
+            });
         }
         Ok(())
     }
@@ -1750,5 +1991,166 @@ mod tests {
             bad_version.validate(),
             Err(ModelFeatureBlockValidationError::InvalidSchemaVersion)
         );
+    }
+
+    #[test]
+    fn model_dataset_manifest_accepts_only_one_valid_project_dataset_cut() {
+        let block_a = ModelFeatureBlock::new(
+            ModelFeatureBlockKind::WorkerLoad,
+            ModelFeatureBlockProvenance::new(
+                "arena",
+                "load-dataset-v1",
+                "trace-1",
+                "agar-live-gate:profile-40",
+            ),
+        )
+        .with_metric("owned_entities", 80.0);
+        let block_b = ModelFeatureBlock::new(
+            ModelFeatureBlockKind::HandoffPressure,
+            ModelFeatureBlockProvenance::new(
+                "arena",
+                "load-dataset-v1",
+                "trace-2",
+                "reality_loadgen:cross-broker",
+            ),
+        )
+        .with_metric("handoff_events", 3.0);
+
+        let manifest =
+            ModelDatasetManifest::from_feature_blocks(&[block_a.clone(), block_b.clone()])
+                .expect("valid dataset manifest");
+        assert_eq!(manifest.project_id, "arena");
+        assert_eq!(manifest.dataset_id, "load-dataset-v1");
+        assert_eq!(
+            manifest.schema_version,
+            MODEL_DATASET_MANIFEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            manifest.feature_schema_version,
+            MODEL_FEATURE_BLOCK_SCHEMA_VERSION
+        );
+        assert_eq!(manifest.feature_block_count, 2);
+        assert_eq!(
+            manifest.trace_ids,
+            vec!["trace-1".to_string(), "trace-2".to_string()]
+        );
+        assert_eq!(
+            manifest.source_artifacts,
+            vec![
+                "agar-live-gate:profile-40".to_string(),
+                "reality_loadgen:cross-broker".to_string()
+            ]
+        );
+        assert_eq!(manifest.validate(), Ok(()));
+
+        assert_eq!(
+            ModelDatasetManifest::from_feature_blocks(&[]),
+            Err(ModelDatasetManifestValidationError::EmptyFeatureBlockSet)
+        );
+
+        let mixed_dataset = ModelFeatureBlock::new(
+            ModelFeatureBlockKind::WorkerLoad,
+            ModelFeatureBlockProvenance::new("arena", "other-dataset", "trace-3", "replay:other"),
+        )
+        .with_metric("owned_entities", 1.0);
+        assert!(matches!(
+            ModelDatasetManifest::from_feature_blocks(&[block_a.clone(), mixed_dataset]),
+            Err(ModelDatasetManifestValidationError::MixedDatasetId { .. })
+        ));
+
+        let unredacted = block_b.with_redacted(false);
+        assert!(matches!(
+            ModelDatasetManifest::from_feature_blocks(&[block_a, unredacted]),
+            Err(ModelDatasetManifestValidationError::FeatureBlockInvalid(
+                ModelFeatureBlockValidationError::UnredactedFeatureBlock
+            ))
+        ));
+    }
+
+    #[test]
+    fn model_promotion_record_requires_dataset_proposal_and_replay_eval_binding() {
+        let block = ModelFeatureBlock::new(
+            ModelFeatureBlockKind::WorkerLoad,
+            ModelFeatureBlockProvenance::new(
+                "arena",
+                "load-dataset-v1",
+                "trace-1",
+                "agar-live-gate:profile-40",
+            ),
+        )
+        .with_metric("owned_entities", 80.0);
+        let manifest = ModelDatasetManifest::from_feature_blocks(&[block]).unwrap();
+        let proposal = ModelActionProposal::new(
+            ModelActionKind::RecommendPartitionMap,
+            ModelActionMode::Guarded,
+            ModelActionProvenance::new("arena", "micro-load-v1", "load-dataset-v1", "trace-1"),
+        )
+        .with_validator("partition-map-shadow-validator");
+
+        let record = ModelPromotionRecord::new(
+            "promotion-1",
+            manifest.clone(),
+            proposal.clone(),
+            ModelPromotionDecision::Accept,
+            "replay_eval:partition-map-shadow-001.jsonl",
+        );
+        assert_eq!(record.validate(), Ok(()));
+        assert_eq!(
+            ModelPromotionDecision::from_wire_str(ModelPromotionDecision::Accept.as_wire_str()),
+            Some(ModelPromotionDecision::Accept)
+        );
+
+        assert_eq!(
+            record.clone().with_schema_version(0).validate(),
+            Err(ModelPromotionRecordValidationError::InvalidSchemaVersion)
+        );
+
+        let missing_replay = ModelPromotionRecord::new(
+            "promotion-1",
+            manifest.clone(),
+            proposal.clone(),
+            ModelPromotionDecision::Accept,
+            "",
+        );
+        assert_eq!(
+            missing_replay.validate(),
+            Err(ModelPromotionRecordValidationError::EmptyReplayEvalArtifact)
+        );
+
+        let wrong_dataset_proposal = ModelActionProposal::new(
+            ModelActionKind::RecommendPartitionMap,
+            ModelActionMode::Advisor,
+            ModelActionProvenance::new("arena", "micro-load-v1", "other-dataset", "trace-1"),
+        );
+        assert!(matches!(
+            ModelPromotionRecord::new(
+                "promotion-2",
+                manifest.clone(),
+                wrong_dataset_proposal,
+                ModelPromotionDecision::Reject,
+                "replay_eval:reject.jsonl"
+            )
+            .validate(),
+            Err(ModelPromotionRecordValidationError::DatasetMismatch { .. })
+        ));
+
+        let unguarded = ModelActionProposal::new(
+            ModelActionKind::RecommendPartitionMap,
+            ModelActionMode::Guarded,
+            ModelActionProvenance::new("arena", "micro-load-v1", "load-dataset-v1", "trace-1"),
+        );
+        assert!(matches!(
+            ModelPromotionRecord::new(
+                "promotion-3",
+                manifest,
+                unguarded,
+                ModelPromotionDecision::Accept,
+                "replay_eval:guarded.jsonl"
+            )
+            .validate(),
+            Err(ModelPromotionRecordValidationError::ProposalInvalid(
+                ModelActionValidationError::GuardedWithoutValidator
+            ))
+        ));
     }
 }

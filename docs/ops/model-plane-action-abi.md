@@ -31,6 +31,12 @@ Feature blocks must be redacted, replayable summaries. Metrics must be finite
 numbers. Dimension/metric names must not encode raw auth tokens, secrets,
 component bodies, payloads, or update bodies.
 
+`ModelDatasetManifest` is the typed cut over validated feature blocks. It is
+constructed only from a non-empty set of redacted `ModelFeatureBlock`s that
+share one `project_id`, one `dataset_id`, and one feature schema version. The
+manifest records the feature block count, trace ids, and source artifacts. It
+does not copy raw source artifacts into the dataset.
+
 ## Feature Block Builder
 
 `model_feature_block` is the first executable bridge from current runtime
@@ -107,6 +113,13 @@ Every proposal must carry provenance:
 - `dataset_id`
 - `source_trace_id`
 
+`ModelPromotionRecord` binds a proposal to a validated dataset manifest and a
+replay/eval artifact. It can record an accept/reject decision for later
+validator consideration, but it is still not a runtime mutation or a training
+claim. Promotion validation rejects missing replay/eval evidence, invalid
+dataset manifests, dataset/proposal provenance mismatches, and guarded
+proposals without validator provenance.
+
 ## Forbidden Shape
 
 The model action vocabulary intentionally does not include direct runtime
@@ -132,11 +145,21 @@ cargo test --bin model_feature_block reality_loadgen_builder -- --test-threads=1
 cargo test --bin model_feature_block agar_live_gate_builder -- --test-threads=1
 cargo test -p godworks-core model_action_contract_rejects_direct_runtime_mutation
 cargo test -p godworks-core model_action_proposal_requires_provenance_and_guarded_validator
+cargo test -p godworks-core model_dataset_manifest_accepts_only_one_valid_project_dataset_cut
+cargo test -p godworks-core model_promotion_record_requires_dataset_proposal_and_replay_eval_binding
 ```
 
 These tests should fail if feature blocks accept unredacted/raw runtime bodies,
 non-finite metrics, missing project-local provenance, raw replay source keys, or
 unvalidated `reality_loadgen`/Agar live-gate metrics; if a failed live game gate
 or failed MIT ladder profile can enter the dataset as a success; if the public
-model action vocabulary starts accepting direct runtime mutations; or if
-guarded proposals can be emitted without validator provenance.
+model action vocabulary starts accepting direct runtime mutations; if guarded
+proposals can be emitted without validator provenance; if mixed project/dataset
+feature blocks can form one dataset manifest; or if promotion records can omit
+replay/eval evidence or mismatch dataset/proposal provenance.
+
+## Non-Scope
+
+This ABI does not yet provide a physical dataset store, model training loop,
+model registry, or runtime activation path. The current layer is only the typed
+contract that a future `model_dataset_store` or promotion runner must obey.
