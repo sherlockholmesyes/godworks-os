@@ -62,6 +62,18 @@ Run the first Godworks-authoritative server mode:
 .\examples\agar_mit_clone\run_godworks_authoritative.ps1 -BuildBroker -StopExisting -RunGate
 ```
 
+This mode serves:
+
+- `http://localhost:3000` - the MIT browser client backed by Godworks-owned
+  authoritative state.
+- `http://localhost:8091` - the Godworks-authoritative live monitor with actual
+  broker owner load, the fixed broker grid, and a dynamic load-balanced
+  diagnostic view over the same `/state` stream.
+- `http://localhost:3000/state` and `http://localhost:8091/state` - machine
+  readable gate surfaces. The game-state endpoint stays compact by default;
+  the monitor asks for `:3000/state?entities=1` so capacity artifacts do not
+  accidentally store full entity rows.
+
 Run the Godworks-authoritative stress ladder:
 
 ```powershell
@@ -91,6 +103,7 @@ clone source or `node_modules`.
 | Old D3 runner | Superseded by `run_mit_clone_adapter.ps1 -MirrorBroker ...` |
 | Stress evidence | `run_mit_clone_stress_ladder.ps1` plus `tests/fixtures/agar_mit_clone/ladder_40_200_telemetry.json` |
 | Godworks-authoritative v0 | `run_godworks_authoritative.ps1`, `gw_authoritative_server.js`, `gw_authoritative_zone_worker.js`, `gw_authoritative_gate.js` |
+| Godworks-authoritative live monitor | `gw_authoritative_monitor.js` on `:8091` |
 | Godworks-authoritative capacity floor | `gw_authoritative_bots.js`, `gw_authoritative_capacity_gate.js`, `run_godworks_authoritative_stress_ladder.ps1` |
 
 The older prototype shape tried to claim several regions through one
@@ -200,11 +213,17 @@ Instead:
   clone Socket.IO protocol, asks the correct region worker to spawn each player,
   sends movement as broker `CommandRequest`, and emits `serverTellPlayerMove`
   from Godworks broker state;
+- `gw_authoritative_monitor.js` serves `:8091` from the same authoritative
+  `/state` stream and shows actual broker owner load plus a diagnostic dynamic
+  load-balanced view; it is not a claim that the broker currently rebalances
+  authoritative regions dynamically;
 - `gw_authoritative_gate.js` proves a real Socket.IO player receives frames,
   moves through Godworks commands, sees food, and gets fresh command responses
-  from the broker path. The browser layer is also expected to show the normal
-  MIT `Open Agar` client on `:3000`; pressing Play should enter a live canvas
-  backed by this Godworks-authoritative server.
+  from the broker path. When launched through the runner, it also samples the
+  `:8091` monitor so the gate cannot pass with a dead visual/debug surface. The
+  browser layer is also expected to show the normal MIT `Open Agar` client on
+  `:3000`; pressing Play should enter a live canvas backed by this
+  Godworks-authoritative server.
 
 This is an authority-path milestone, not the whole final game. Current non-scope
 for v0: split, mass eject, viruses, multi-cell merge timing, production
