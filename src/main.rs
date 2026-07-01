@@ -11279,6 +11279,105 @@ mod tests {
     }
 
     #[test]
+    fn delete_tombstone_dominates_queued_handoff_after_recovery() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gw_delete_handoff_recovery_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let wal_path = dir.join("test.wal").to_string_lossy().to_string();
+
+        let mut state = ServerState::new(30.0);
+        state.wal_path = wal_path.clone();
+        state.wal = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)
+                .unwrap(),
+        );
+        add_test_worker(&mut state, "w1", "W");
+        add_test_worker(&mut state, "w2", "E");
+        assert!(spawn_in_region(
+            &mut state,
+            "ship",
+            [-1.0, 0.0],
+            [1.0, 0.0],
+            Map::new(),
+            Some("W"),
+            SpawnAuthoritySeed::default(),
+        ));
+        grant_region_physics_island_authority(&mut state, "w1", "ship");
+
+        assert!(handoff_with_position(
+            &mut state,
+            "ship",
+            "W",
+            "E",
+            Some([2.0, 0.0])
+        ));
+        assert_eq!(state.pending_handoffs.len(), 1);
+
+        dispatch_inner(
+            &mut state,
+            "w1",
+            &json!({"op":"DeleteEntity","entity":"ship"}),
+        );
+        assert!(state.deleted_entities.contains("ship"));
+        assert!(!state.entities.contains_key("ship"));
+        assert!(state.pending_handoffs.is_empty());
+        drop(state.wal.take());
+
+        let read = read_wal_events(&wal_path, None);
+        assert!(read.report.error.is_none(), "{:?}", read.report.error);
+        let transfer_idx = read
+            .events
+            .iter()
+            .position(|ev| ev.get("kind").and_then(|v| v.as_str()) == Some("transfer"))
+            .expect("queued handoff must be present in the WAL");
+        let delete_idx = read
+            .events
+            .iter()
+            .position(|ev| ev.get("kind").and_then(|v| v.as_str()) == Some("delete_tombstone"))
+            .expect("delete tombstone must be present in the WAL");
+        assert!(
+            transfer_idx < delete_idx,
+            "the tombstone must be the later durable transition and dominate replay"
+        );
+
+        let (entities, tombstones, _cfg, pending_mesh, forwarded, _id_hwm, report) =
+            recover_from_wal_report(&wal_path, None);
+        assert!(
+            report.error.is_none(),
+            "recovery must not error: {:?}",
+            report.error
+        );
+        assert!(
+            tombstones.contains("ship"),
+            "delete tombstone must survive replay"
+        );
+        assert!(
+            !entities.contains_key("ship"),
+            "recovery must not resurrect a queued handoff after a later delete"
+        );
+        assert!(
+            !pending_mesh.contains_key("ship"),
+            "local handoff/delete recovery must not produce cross-mesh resend state"
+        );
+        assert!(
+            !forwarded.contains_key("ship"),
+            "local handoff/delete recovery must not create a mesh-forward fence"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn prepared_handoff_missing_entity_records_rejection() {
         let mut state = ServerState::new(30.0);
         add_test_worker(&mut state, "w1", "W");
