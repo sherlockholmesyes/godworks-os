@@ -104,6 +104,24 @@ is offline, reconnects, and rebuilds the adapter from a live
 `EntityQueryResponse`. That keeps the next bridge step grounded in real broker
 output without turning the SDK into a transport or prediction layer.
 
+Run the Godot probes with an installed Godot 4.x binary:
+
+```powershell
+.\scripts\run_godot_probes.ps1
+```
+
+or bootstrap the pinned portable Godot 4.3 toolchain into `.local`:
+
+```powershell
+$godot = .\scripts\ensure_godot_4_3.ps1
+.\scripts\run_godot_probes.ps1 -Godot $godot
+```
+
+This is still a probe runner, not the final Godot bridge package. It proves the
+Godot runtime can consume the shared bridge contract, rebuild from a real broker
+checkout, and observe a cross-broker handoff without giving the engine a second
+state model.
+
 The first live game cache runner is
 `crates/godworks-client-sdk/examples/agar_live_cache_gate.rs`. It opens the
 current broker TCP wire as a non-privileged `CLIENT`, decodes typed protocol

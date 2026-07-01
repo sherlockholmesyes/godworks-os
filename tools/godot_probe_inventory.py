@@ -52,6 +52,7 @@ def main() -> None:
     probe_dir = root / "client_probes" / "godot"
     fixture = root / "tests" / "fixtures" / "client_bridge" / "godot-resync-contract.json"
     runner = root / "scripts" / "run_godot_probes.ps1"
+    bootstrap = root / "scripts" / "ensure_godot_4_3.ps1"
     docs = root / "docs" / "sdk" / "client-sdk-alpha.md"
     live_gate_docs = root / "docs" / "ops" / "live-game-reality-gates.md"
 
@@ -69,6 +70,10 @@ def main() -> None:
         require(method in adapter_text, f"Godot bridge adapter must expose {method}")
 
     runner_text = read_text(runner)
+    bootstrap_text = read_text(bootstrap)
+    require("4.3-stable" in bootstrap_text, "Godot bootstrap must pin the 4.3 stable release")
+    require("8F2C75B734BD956027AE3CA92C41F78B5D5A255DACC0F20E4E3C523C545AD410" in bootstrap_text,
+            "Godot bootstrap must pin the portable zip SHA256")
     for script in REQUIRED_PROBES:
         read_text(probe_dir / script)
         require(script in runner_text, f"run_godot_probes.ps1 must invoke {script}")
@@ -93,10 +98,12 @@ def main() -> None:
     sdk_docs = read_text(docs)
     require("client_bridge_contract_probe.gd" in sdk_docs, "client SDK docs must reference the Godot fixture probe")
     require("client_bridge_tcp_resync_probe.gd" in sdk_docs, "client SDK docs must reference the TCP resync probe")
+    require("ensure_godot_4_3.ps1" in sdk_docs, "client SDK docs must reference the portable Godot bootstrap")
 
     live_docs = read_text(live_gate_docs)
     require("scripts\\run_godot_probes.ps1" in live_docs or "scripts/run_godot_probes.ps1" in live_docs,
             "live-game docs must publish the Godot probe runner")
+    require("ensure_godot_4_3.ps1" in live_docs, "live-game docs must publish the portable Godot bootstrap")
 
     print(
         "godot_probe_inventory ok: "
