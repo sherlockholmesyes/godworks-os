@@ -3,6 +3,7 @@ param(
   [switch]$MirrorBroker,
   [switch]$RunGate,
   [switch]$RunPlayableSeamGate,
+  [switch]$RunBrokerCommandGate,
   [switch]$SkipGame,
   [switch]$StopExisting,
   [switch]$SkipNpmInstall,
@@ -12,7 +13,8 @@ param(
   [string]$CloneRoot = "",
   [int]$PortBroker = 7990,
   [int]$PortMonitor = 8091,
-  [int]$PortView = 8092
+  [int]$PortView = 8092,
+  [int]$PortCommandBridge = 8093
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,6 +49,8 @@ function Stop-KnownAgarMitStack {
   $needles = @(
     "agar_mit_clone",
     "gw_agar_mirror_worker.js",
+    "gw_agar_command_bridge.js",
+    "gw_agar_broker_command_gate.js",
     "gw_shard_monitor.js",
     "gw_broker_view.js",
     "_gw_bots.js"
@@ -54,14 +58,14 @@ function Stop-KnownAgarMitStack {
   Get-CimInstance Win32_Process |
     Where-Object {
       $cmd = $_.CommandLine
-      $cmd -and ($needles | Where-Object { $cmd -like "*$_*" })
+      $_.ProcessId -ne $PID -and $cmd -and ($needles | Where-Object { $cmd -like "*$_*" })
     } |
     ForEach-Object {
       Write-Host "stopping $($_.ProcessId) $($_.Name)"
       Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
 
-  Get-NetTCPConnection -LocalPort 3000,$PortBroker,$PortMonitor,$PortView -ErrorAction SilentlyContinue |
+  Get-NetTCPConnection -LocalPort 3000,$PortBroker,$PortMonitor,$PortView,$PortCommandBridge -ErrorAction SilentlyContinue |
     Select-Object -ExpandProperty OwningProcess -Unique |
     Where-Object { $_ -gt 0 } |
     ForEach-Object {
@@ -106,6 +110,22 @@ function Test-CommandProcessAll([string[]]$Needles) {
     Select-Object -First 1)
 }
 
+function Stop-CommandProcessAll([string[]]$Needles) {
+  Get-CimInstance Win32_Process |
+    Where-Object {
+      $cmd = $_.CommandLine
+      if (-not $cmd) { return $false }
+      foreach ($needle in $Needles) {
+        if ($cmd -notlike "*$needle*") { return $false }
+      }
+      return $true
+    } |
+    ForEach-Object {
+      Write-Host "stopping $($_.ProcessId) $($_.Name)"
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Wait-Port([int]$Port, [string]$Name, [int]$Seconds = 25) {
   $deadline = (Get-Date).AddSeconds($Seconds)
   while ((Get-Date) -lt $deadline) {
@@ -138,7 +158,7 @@ function Ensure-StockClone {
 
 function Copy-CloneTools {
   if (-not (Test-Path -LiteralPath $CloneRoot)) { return }
-  foreach ($name in @("_gw_spectator_tap.js", "_gw_bots.js", "gw_shard_monitor.js", "gw_agar_mirror_worker.js", "gw_agar_playable_seam_gate.js")) {
+  foreach ($name in @("_gw_spectator_tap.js", "_gw_bots.js", "gw_shard_monitor.js", "gw_agar_mirror_worker.js", "gw_agar_command_bridge.js", "gw_agar_playable_seam_gate.js", "gw_agar_broker_command_gate.js")) {
     Copy-Item -LiteralPath (Join-Path $ToolsDir $name) -Destination (Join-Path $CloneRoot $name) -Force
   }
 }
@@ -150,6 +170,10 @@ if ($StopExisting) {
 
 Ensure-StockClone
 Copy-CloneTools
+
+if ($RunBrokerCommandGate -and -not $MirrorBroker) {
+  throw "-RunBrokerCommandGate requires -MirrorBroker because it verifies broker-routed CommandRequest ownership"
+}
 
 if (-not $SkipGame -and -not (Test-PortListening 3000)) {
   $npm = (Get-Command npm.cmd).Source
@@ -187,7 +211,7 @@ if ($MirrorBroker) {
   }
   if (-not (Test-Path -LiteralPath $BrokerExe)) { throw "broker exe missing: $BrokerExe" }
 
-  $claims = @("obs-token:OBS:observer|inspector")
+  $claims = @("obs-token:OBS:observer|inspector", "client-token:CLIENT:role.client")
   for ($y = 0; $y -lt 4; $y++) {
     for ($x = 0; $x -lt 4; $x++) {
       $r = "Z${x}_${y}"
@@ -205,14 +229,37 @@ if ($MirrorBroker) {
     Write-Host "Godworks broker already listening on :$PortBroker"
   }
 
+  if ($RunBrokerCommandGate) {
+    if (-not (Test-PortListening $PortCommandBridge)) {
+      $cmd = "Set-Location '$CloneRoot'; `$env:GW_AGAR_GAME_URL='http://127.0.0.1:3000'; `$env:GW_AGAR_COMMAND_PORT='$PortCommandBridge'; & '$NodeExe' 'gw_agar_command_bridge.js'"
+      Start-LoggedPowerShell "agar_command_bridge_$PortCommandBridge" $cmd $CloneRoot | Out-Null
+      Wait-Port $PortCommandBridge "agar command bridge"
+    } else {
+      Write-Host "agar command bridge already listening on :$PortCommandBridge"
+    }
+  }
+
   for ($y = 0; $y -lt 4; $y++) {
     for ($x = 0; $x -lt 4; $x++) {
       $r = "Z${x}_${y}"
       $wid = "mit-$r"
-      if (Test-CommandProcessAll @($wid, "GW_PORT='$PortBroker'")) {
+      $workerNeedles = @($wid, "GW_PORT='$PortBroker'")
+      if ($RunBrokerCommandGate) {
+        $workerNeedles += "GW_AGAR_COMMAND_URL"
+      }
+      if (Test-CommandProcessAll $workerNeedles) {
         Write-Host "$wid mirror worker already running"
       } else {
-        $cmd = "Set-Location '$CloneRoot'; `$env:GW_PORT='$PortBroker'; `$env:GW_GRID2D='4x4'; `$env:GW_ARENA='5000'; `$env:GW_REGION='$r'; `$env:GW_WID='$wid'; `$env:GW_CONNECT_TOKEN='$r-token'; & '$NodeExe' 'gw_agar_mirror_worker.js'"
+        if ($RunBrokerCommandGate -and (Test-CommandProcessAll @($wid, "GW_PORT='$PortBroker'", "gw_agar_mirror_worker.js"))) {
+          Write-Host "$wid mirror worker is running without command bridge env; restarting it"
+          Stop-CommandProcessAll @($wid, "GW_PORT='$PortBroker'", "gw_agar_mirror_worker.js")
+          Start-Sleep -Milliseconds 300
+        }
+        $commandBridgeEnv = ""
+        if ($RunBrokerCommandGate) {
+          $commandBridgeEnv = "`$env:GW_AGAR_COMMAND_URL='http://127.0.0.1:$PortCommandBridge'; "
+        }
+        $cmd = "Set-Location '$CloneRoot'; `$env:GW_PORT='$PortBroker'; `$env:GW_GRID2D='4x4'; `$env:GW_ARENA='5000'; `$env:GW_REGION='$r'; `$env:GW_WID='$wid'; `$env:GW_CONNECT_TOKEN='$r-token'; $commandBridgeEnv& '$NodeExe' 'gw_agar_mirror_worker.js'"
         Start-LoggedPowerShell "mirror_$r" $cmd $CloneRoot | Out-Null
       }
     }
@@ -234,6 +281,9 @@ Write-Host "  monitor: http://localhost:$PortMonitor/"
 if ($MirrorBroker) {
   Write-Host "  broker:  127.0.0.1:$PortBroker"
   Write-Host "  view:    http://localhost:$PortView/"
+  if ($RunBrokerCommandGate) {
+    Write-Host "  command: http://localhost:$PortCommandBridge/"
+  }
   Write-Host "  wal:     $WalPath"
 }
 Write-Host "  clone:   $CloneRoot"
@@ -263,6 +313,23 @@ if ($RunPlayableSeamGate) {
   Push-Location $CloneRoot
   try {
     & $NodeExe "gw_agar_playable_seam_gate.js"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  } finally {
+    Pop-Location
+  }
+}
+
+if ($RunBrokerCommandGate) {
+  Start-Sleep -Seconds 3
+  $env:GW_HOST = "127.0.0.1"
+  $env:GW_PORT = "$PortBroker"
+  $env:GW_CLIENT_TOKEN = "client-token"
+  $env:GW_AGAR_COMMAND_BRIDGE_URL = "http://127.0.0.1:$PortCommandBridge"
+  $env:GW_AGAR_MONITOR_URL = "http://127.0.0.1:$PortMonitor/state"
+  $env:GW_AGAR_BROKER_VIEW_URL = "http://127.0.0.1:$PortView/state"
+  Push-Location $CloneRoot
+  try {
+    & $NodeExe "gw_agar_broker_command_gate.js"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   } finally {
     Pop-Location

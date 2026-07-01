@@ -5,6 +5,7 @@
 "use strict";
 
 const net = require("net");
+const http = require("http");
 const { connectSpectator } = require("./_gw_spectator_tap");
 
 const HOST = process.env.GW_HOST || "127.0.0.1";
@@ -17,6 +18,7 @@ const GRID = (process.env.GW_GRID2D || "2x2").split("x").map(x => parseInt(x, 10
 const COLS = GRID[0] || 2;
 const ROWS = GRID[1] || 2;
 const HZ = parseFloat(process.env.GW_HZ || "20");
+const COMMAND_URL = process.env.GW_AGAR_COMMAND_URL || "";
 
 const known = new Set();
 const pendingCreate = new Set();
@@ -36,6 +38,37 @@ function frame(obj) {
 
 function send(obj) {
   if (sock && !sock.destroyed) sock.write(frame(obj));
+}
+
+function postJson(url, body) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const text = JSON.stringify(body);
+    const req = http.request({
+      hostname: parsed.hostname,
+      port: parsed.port || 80,
+      path: parsed.pathname,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(text),
+      },
+      timeout: 3000,
+    }, res => {
+      let out = "";
+      res.setEncoding("utf8");
+      res.on("data", chunk => { out += chunk; });
+      res.on("end", () => {
+        let parsedBody = {};
+        try { parsedBody = out ? JSON.parse(out) : {}; } catch (_) {}
+        resolve({ status: res.statusCode, body: parsedBody });
+      });
+    });
+    req.on("timeout", () => req.destroy(new Error(`timeout POST ${url}`)));
+    req.on("error", reject);
+    req.write(text);
+    req.end();
+  });
 }
 
 connectSpectator({
@@ -113,7 +146,67 @@ function handleBroker(msg) {
       known.delete(msg.entity);
       console.error(`[${WID}] CREATE rejected ${msg.entity} reason=${msg.reason || "exists-or-unknown"}`);
     }
+  } else if (msg.op === "CommandRequest") {
+    handleCommandRequest(msg);
   }
+}
+
+function handleCommandRequest(msg) {
+  const requestId = msg.request_id || "";
+  const entity = msg.entity || "";
+  if (!owned.has(entity)) {
+    send({
+      op: "CommandResponse",
+      request_id: requestId,
+      success: false,
+      reason: "worker received command for entity it does not own",
+      payload: { handled_by: WID, entity, owner_current: false },
+    });
+    return;
+  }
+  if (!COMMAND_URL) {
+    send({
+      op: "CommandResponse",
+      request_id: requestId,
+      success: false,
+      reason: "GW_AGAR_COMMAND_URL is not configured",
+      payload: { handled_by: WID, entity, owner_current: true },
+    });
+    return;
+  }
+  postJson(`${COMMAND_URL.replace(/\/$/, "")}/input`, {
+    owner: WID,
+    region: REGION,
+    entity,
+    request_id: requestId,
+    command: msg.command,
+    payload: msg.payload,
+  }).then(reply => {
+    const ok = reply.status >= 200 && reply.status < 300 && reply.body && reply.body.ok;
+    send({
+      op: "CommandResponse",
+      request_id: requestId,
+      success: Boolean(ok),
+      reason: ok ? null : (reply.body && (reply.body.reason || reply.body.error)) || `command bridge HTTP ${reply.status}`,
+      payload: {
+        accepted: Boolean(ok),
+        handled_by: WID,
+        owner: WID,
+        region: REGION,
+        entity,
+        owner_current: true,
+        bridge: reply.body || null,
+      },
+    });
+  }).catch(err => {
+    send({
+      op: "CommandResponse",
+      request_id: requestId,
+      success: false,
+      reason: err.message,
+      payload: { handled_by: WID, entity, owner_current: true },
+    });
+  });
 }
 
 setInterval(() => {

@@ -431,7 +431,10 @@ fn parse_metric(fields: &BTreeMap<String, String>, key: &str) -> Result<f64, Str
 }
 
 fn agar_gate_family(artifact: &Value) -> &'static str {
-    if artifact.get("monitor").is_some() || artifact.get("playableSeam").is_some() {
+    if artifact.get("monitor").is_some()
+        || artifact.get("playableSeam").is_some()
+        || artifact.get("brokerCommand").is_some()
+    {
         "mit_clone_adapter"
     } else {
         "godworks_agar_v2"
@@ -516,6 +519,7 @@ fn agar_handoff_block(
     let has_handoff_metrics = artifact.get("observed_owner_changes").is_some()
         || artifact.get("player_owner_count").is_some()
         || artifact.get("playableSeam").is_some()
+        || artifact.get("brokerCommand").is_some()
         || artifact
             .get("brokerView")
             .and_then(Value::as_object)
@@ -546,6 +550,31 @@ fn agar_handoff_block(
             "probe_max_missing_streak",
         ),
         (
+            &["brokerCommand", "ownerChanges"][..],
+            "broker_command_owner_changes",
+        ),
+        (
+            &["brokerCommand", "blockChanges"][..],
+            "broker_command_block_changes",
+        ),
+        (&["brokerCommand", "path"][..], "broker_command_path"),
+        (
+            &["brokerCommand", "postSeamPath"][..],
+            "broker_command_post_seam_path",
+        ),
+        (
+            &["brokerCommand", "commandResponses"][..],
+            "broker_command_responses",
+        ),
+        (
+            &["brokerCommand", "commandOwnerMatches"][..],
+            "broker_command_owner_matches",
+        ),
+        (
+            &["brokerCommand", "bridgeCommandCount"][..],
+            "broker_command_bridge_count",
+        ),
+        (
             &["probe_max_missing_before_handoff_streak"][..],
             "probe_max_missing_before_handoff_streak",
         ),
@@ -572,6 +601,7 @@ fn agar_handoff_block(
     }
     if let Some(first_block) = artifact
         .get("playableSeam")
+        .or_else(|| artifact.get("brokerCommand"))
         .and_then(|seam| seam.get("firstBlock"))
         .and_then(Value::as_str)
     {
@@ -579,10 +609,25 @@ fn agar_handoff_block(
     }
     if let Some(final_block) = artifact
         .get("playableSeam")
+        .or_else(|| artifact.get("brokerCommand"))
         .and_then(|seam| seam.get("finalBlock"))
         .and_then(Value::as_str)
     {
         block = block.with_dimension("final_block", final_block);
+    }
+    if let Some(first_owner) = artifact
+        .get("brokerCommand")
+        .and_then(|seam| seam.get("firstOwner"))
+        .and_then(Value::as_str)
+    {
+        block = block.with_dimension("first_owner", first_owner);
+    }
+    if let Some(final_owner) = artifact
+        .get("brokerCommand")
+        .and_then(|seam| seam.get("finalOwner"))
+        .and_then(Value::as_str)
+    {
+        block = block.with_dimension("final_owner", final_owner);
     }
     if let Some(owners) = artifact
         .get("brokerView")
@@ -876,6 +921,51 @@ mod tests {
         assert_eq!(blocks[1].metrics["player_path"], 675.0);
         assert_eq!(blocks[1].metrics["post_seam_path"], 37.5);
         assert_eq!(blocks[1].metrics["broker_mirror_matched"], 1.0);
+        for block in blocks {
+            assert_eq!(block.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn agar_live_gate_builder_emits_valid_broker_command_blocks() {
+        let output = r#"{
+          "ok": true,
+          "bridgeUrl": "http://127.0.0.1:8093",
+          "monitor": {
+            "entities": 944,
+            "players": 36,
+            "rebalanceCount": 2,
+            "loads": [60,61,71,64]
+          },
+          "brokerCommand": {
+            "entity": "sock-1:0",
+            "socketId": "sock-1",
+            "firstOwner": "mit-Z1_1",
+            "finalOwner": "mit-Z2_1",
+            "ownerChanges": 1,
+            "firstBlock": "W1_1",
+            "finalBlock": "W2_1",
+            "blockChanges": 1,
+            "path": 284.5,
+            "postSeamPath": 32.25,
+            "commandResponses": 7,
+            "commandOwnerMatches": 7,
+            "bridgeCommandCount": 7
+          }
+        }"#;
+        let blocks = build_agar_live_gate_feature_blocks(output, &cfg()).unwrap();
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].kind, ModelFeatureBlockKind::Outcome);
+        assert_eq!(blocks[1].kind, ModelFeatureBlockKind::EntityDensity);
+        assert_eq!(blocks[2].kind, ModelFeatureBlockKind::WorkerLoad);
+        assert_eq!(blocks[3].kind, ModelFeatureBlockKind::HandoffPressure);
+        assert_eq!(blocks[0].dimensions["gate_family"], "mit_clone_adapter");
+        assert_eq!(blocks[3].dimensions["first_owner"], "mit-Z1_1");
+        assert_eq!(blocks[3].dimensions["final_owner"], "mit-Z2_1");
+        assert_eq!(blocks[3].metrics["broker_command_owner_changes"], 1.0);
+        assert_eq!(blocks[3].metrics["broker_command_responses"], 7.0);
+        assert_eq!(blocks[3].metrics["broker_command_post_seam_path"], 32.25);
         for block in blocks {
             assert_eq!(block.validate(), Ok(()));
         }
