@@ -73,13 +73,17 @@ the gate fails if runtime breadcrumbs leak secrets, lose spatial contract
 metadata, or contradict protocol operation semantics. After the live cluster is
 stopped, the same gate starts the broker in `GW_RESTORE_DRYRUN=1` against the
 demo WAL and fails if recovery reports an error, an empty store, no selected WAL
-events, or unknown WAL event kinds.
+events, or unknown WAL event kinds. It then starts a restored broker from the
+same WAL, queries it through `InspectorQuery`, and compares the restored
+entity IDs, positions, logical owners, and client-visible entities against the
+last live broker/client cut captured before shutdown. Worker IDs are normalized
+to their region names in this restore-only check because no zone workers are
+reconnected during the restored broker query.
 
 This is the current Agar Reality Gate v1. It is now bound to the System Laws
 index as a runtime ruler, but it is not yet the full release gate. The remaining
 promotion work is tracked in `docs/ops/live-game-reality-gates.md`:
-`godworks-client-sdk` cache proof, restored-broker/client agreement, and longer
-soak coverage.
+`godworks-client-sdk` cache proof and longer soak coverage.
 
 The pixel gate launches Chrome/Edge through the Chrome DevTools Protocol without
 Playwright/Puppeteer. If the browser is not in a standard location, set:
