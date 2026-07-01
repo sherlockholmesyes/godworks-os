@@ -46,6 +46,10 @@ path = "src/bin/reality_loadgen.rs"
 name = "replay_eval"
 path = "src/bin/replay_eval.rs"
 
+[[bin]]
+name = "model_feature_block"
+path = "src/bin/model_feature_block.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
