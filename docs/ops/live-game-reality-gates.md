@@ -28,6 +28,9 @@ dependency-free CDP pixel gate. It proves:
   privilege, or create platform authority components;
 - the visible canvas is non-blank, reports `source: CLIENT stream`, and moves a
   visible player through the product browser path.
+- the broker emits a live `GW_REPLAY_TAPE` artifact and `replay_eval` accepts it
+  without redaction leaks, malformed spatial metadata, or protocol semantic
+  contradictions.
 
 The gate is intentionally stronger than a synthetic protocol test because it
 uses the actual demo cluster and live state. It is still not the full release
@@ -51,8 +54,6 @@ checks:
 - SDK cache proof: route one client-facing check through
   `godworks-client-sdk::ClientBridge` instead of only the JavaScript gateway
   cache;
-- replay proof: run with `GW_REPLAY_TAPE`, validate it with `replay_eval`, and
-  confirm no secret or component-body leak;
 - WAL restore proof: restart from `.local/agar/agar.wal` and verify the restored
   state has no duplicate owner, missing player, or resurrected deleted entity;
 - duration proof: run a longer multi-client soak and keep owner count,
