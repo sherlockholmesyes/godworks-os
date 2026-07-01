@@ -169,6 +169,10 @@ engine-facing gate:
   cache from broker output.
 - `cross_broker_handoff_probe.gd` is the first Godot-side cross-broker handoff
   ruler.
+- `godot_2d_physics_probe.gd` adds the first Godot 2D physics seam ruler. It
+  moves a real `CharacterBody2D` through `move_and_collide()`, publishes that
+  runtime position through the broker, requires W->E handoff, verifies the E
+  write in broker query state, and requires the stale W owner to be fenced.
 
 CI does not currently provision a Godot binary. The CI-safe inventory gate is:
 

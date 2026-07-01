@@ -13,7 +13,8 @@ $Fixture = Join-Path $Repo "tests\fixtures\client_bridge\godot-resync-contract.j
 $RequiredProbeScripts = @(
   "client_bridge_contract_probe.gd",
   "client_bridge_tcp_resync_probe.gd",
-  "cross_broker_handoff_probe.gd"
+  "cross_broker_handoff_probe.gd",
+  "godot_2d_physics_probe.gd"
 )
 $EnvKeys = @(
   "GW_BIND",
@@ -34,7 +35,8 @@ $EnvKeys = @(
   "GW_GODOT_OBS_TOKEN",
   "GW_GODOT_W_TOKEN",
   "GW_GODOT_E_TOKEN",
-  "GW_CROSS_ENTITY"
+  "GW_CROSS_ENTITY",
+  "GW_GODOT_2D_ENTITY"
 )
 
 function Get-GodotExe {
@@ -209,6 +211,44 @@ try {
     GW_GODOT_E_TOKEN = $eToken
   }
   Invoke-GodotProbe "cross_broker_handoff_probe.gd"
+  Stop-Brokers $procs
+  $procs.Clear()
+
+  Write-Host "GODOT PROBES: 2D physics seam"
+  $physicsWToken = "godot-2d-w-token"
+  $physicsEToken = "godot-2d-e-token"
+  $physicsMeshToken = "godot-2d-mesh-token"
+  $physicsClaims = "${physicsWToken}:W:physics|server,${physicsEToken}:E:physics|server,${physicsMeshToken}:MESH:role.mesh"
+  $physicsEBroker = Start-Broker "godot-2d-e" 7822 @{
+    GW_BIND = "127.0.0.1"
+    GW_PORT = "7822"
+    GW_WAL = (Join-Path $LocalDir "godot-2d-e.wal")
+    GW_BOUNDARY = "0"
+    GW_ADVERTISE = "E=127.0.0.1:7822"
+    GW_DURABLE_FLUSH_MS = "5"
+    GW_AUTH_CLAIMS = $physicsClaims
+  }
+  [void]$procs.Add($physicsEBroker)
+  $physicsWBroker = Start-Broker "godot-2d-w" 7821 @{
+    GW_BIND = "127.0.0.1"
+    GW_PORT = "7821"
+    GW_WAL = (Join-Path $LocalDir "godot-2d-w.wal")
+    GW_BOUNDARY = "0"
+    GW_ADVERTISE = "W=127.0.0.1:7821"
+    GW_MESH = "E=127.0.0.1:7822"
+    GW_DURABLE_FLUSH_MS = "5"
+    GW_AUTH_CLAIMS = $physicsClaims
+  }
+  [void]$procs.Add($physicsWBroker)
+  Clear-GateEnv $EnvKeys
+  Set-GateEnv @{
+    GW_HOST = "127.0.0.1"
+    GW_PORT_W = "7821"
+    GW_PORT_E = "7822"
+    GW_GODOT_W_TOKEN = $physicsWToken
+    GW_GODOT_E_TOKEN = $physicsEToken
+  }
+  Invoke-GodotProbe "godot_2d_physics_probe.gd"
 
   Write-Host "GODOT PROBES: PASS"
 } finally {
