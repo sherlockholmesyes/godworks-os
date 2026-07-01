@@ -682,6 +682,173 @@ pub struct ComponentAuthority {
     pub mode: AuthorityMode,
 }
 
+/// Promotion mode for a model-plane proposal.
+///
+/// Model output may rank or recommend policy actions, but the deterministic
+/// broker kernel stays the only place where authority, WAL, and component state
+/// are mutated. `Guarded` means a validator may consider the proposal for a
+/// later runtime action; it is still not a direct mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelActionMode {
+    Observe,
+    Shadow,
+    Advisor,
+    Guarded,
+}
+
+impl ModelActionMode {
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Shadow => "shadow",
+            Self::Advisor => "advisor",
+            Self::Guarded => "guarded",
+        }
+    }
+
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        match value {
+            "observe" => Some(Self::Observe),
+            "shadow" => Some(Self::Shadow),
+            "advisor" => Some(Self::Advisor),
+            "guarded" => Some(Self::Guarded),
+            _ => None,
+        }
+    }
+}
+
+/// Public, validator-gated action vocabulary for the future model plane.
+///
+/// These are proposals. Runtime mutations such as authority grants, component
+/// writes, WAL bypasses, or direct partition activation are intentionally not
+/// representable here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelActionKind {
+    RecommendPartitionMap,
+    AdjustInterestFidelity,
+    RecommendWorkerScale,
+    MarkHandoffRisk,
+    AntiCheatFlag,
+    NpcIntent,
+    Noop,
+}
+
+impl ModelActionKind {
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::RecommendPartitionMap => "RecommendPartitionMap",
+            Self::AdjustInterestFidelity => "AdjustInterestFidelity",
+            Self::RecommendWorkerScale => "RecommendWorkerScale",
+            Self::MarkHandoffRisk => "MarkHandoffRisk",
+            Self::AntiCheatFlag => "AntiCheatFlag",
+            Self::NpcIntent => "NpcIntent",
+            Self::Noop => "Noop",
+        }
+    }
+
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        match value {
+            "RecommendPartitionMap" => Some(Self::RecommendPartitionMap),
+            "AdjustInterestFidelity" => Some(Self::AdjustInterestFidelity),
+            "RecommendWorkerScale" => Some(Self::RecommendWorkerScale),
+            "MarkHandoffRisk" => Some(Self::MarkHandoffRisk),
+            "AntiCheatFlag" => Some(Self::AntiCheatFlag),
+            "NpcIntent" => Some(Self::NpcIntent),
+            "Noop" => Some(Self::Noop),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelActionValidationError {
+    EmptyProjectId,
+    EmptyModelId,
+    EmptyDatasetId,
+    EmptySourceTraceId,
+    GuardedWithoutValidator,
+}
+
+/// Provenance required before model output can be considered by runtime policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelActionProvenance {
+    pub project_id: String,
+    pub model_id: String,
+    pub dataset_id: String,
+    pub source_trace_id: String,
+}
+
+impl ModelActionProvenance {
+    pub fn new(
+        project_id: impl Into<String>,
+        model_id: impl Into<String>,
+        dataset_id: impl Into<String>,
+        source_trace_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            model_id: model_id.into(),
+            dataset_id: dataset_id.into(),
+            source_trace_id: source_trace_id.into(),
+        }
+    }
+}
+
+/// A model-plane proposal with enough provenance for replay, rejection, and
+/// promotion auditing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelActionProposal {
+    pub kind: ModelActionKind,
+    pub mode: ModelActionMode,
+    pub provenance: ModelActionProvenance,
+    pub validator_id: Option<String>,
+}
+
+impl ModelActionProposal {
+    pub fn new(
+        kind: ModelActionKind,
+        mode: ModelActionMode,
+        provenance: ModelActionProvenance,
+    ) -> Self {
+        Self {
+            kind,
+            mode,
+            provenance,
+            validator_id: None,
+        }
+    }
+
+    pub fn with_validator(mut self, validator_id: impl Into<String>) -> Self {
+        self.validator_id = Some(validator_id.into());
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), ModelActionValidationError> {
+        if self.provenance.project_id.trim().is_empty() {
+            return Err(ModelActionValidationError::EmptyProjectId);
+        }
+        if self.provenance.model_id.trim().is_empty() {
+            return Err(ModelActionValidationError::EmptyModelId);
+        }
+        if self.provenance.dataset_id.trim().is_empty() {
+            return Err(ModelActionValidationError::EmptyDatasetId);
+        }
+        if self.provenance.source_trace_id.trim().is_empty() {
+            return Err(ModelActionValidationError::EmptySourceTraceId);
+        }
+        if self.mode == ModelActionMode::Guarded
+            && self
+                .validator_id
+                .as_ref()
+                .map(|id| id.trim().is_empty())
+                .unwrap_or(true)
+        {
+            return Err(ModelActionValidationError::GuardedWithoutValidator);
+        }
+        Ok(())
+    }
+}
+
 /// Current 2D area-of-interest shape set.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Aoi2 {
@@ -908,5 +1075,73 @@ mod tests {
             grid.partition_schema(),
             PartitionSchema::Grid2D { cols: 3, rows: 2 }
         );
+    }
+
+    #[test]
+    fn model_action_contract_rejects_direct_runtime_mutation() {
+        let allowed = [
+            ModelActionKind::RecommendPartitionMap,
+            ModelActionKind::AdjustInterestFidelity,
+            ModelActionKind::RecommendWorkerScale,
+            ModelActionKind::MarkHandoffRisk,
+            ModelActionKind::AntiCheatFlag,
+            ModelActionKind::NpcIntent,
+            ModelActionKind::Noop,
+        ];
+        for action in allowed {
+            assert_eq!(
+                ModelActionKind::from_wire_str(action.as_wire_str()),
+                Some(action)
+            );
+        }
+
+        for forbidden in [
+            "GrantAuthority",
+            "RevokeAuthority",
+            "SetComponentAuthority",
+            "UpdateComponent",
+            "BatchUpdate",
+            "MeshHandoff",
+            "ActivatePartitionMap",
+            "BypassWal",
+        ] {
+            assert_eq!(ModelActionKind::from_wire_str(forbidden), None);
+        }
+    }
+
+    #[test]
+    fn model_action_proposal_requires_provenance_and_guarded_validator() {
+        let provenance = ModelActionProvenance::new("arena", "load-v1", "trace-set-7", "trace-42");
+        let proposal = ModelActionProposal::new(
+            ModelActionKind::RecommendPartitionMap,
+            ModelActionMode::Advisor,
+            provenance.clone(),
+        );
+        assert_eq!(proposal.validate(), Ok(()));
+
+        let guarded = ModelActionProposal::new(
+            ModelActionKind::RecommendPartitionMap,
+            ModelActionMode::Guarded,
+            provenance.clone(),
+        );
+        assert_eq!(
+            guarded.validate(),
+            Err(ModelActionValidationError::GuardedWithoutValidator)
+        );
+        assert_eq!(
+            guarded.with_validator("partition-map-validator").validate(),
+            Ok(())
+        );
+
+        for bad in [
+            ModelActionProvenance::new("", "load-v1", "trace-set-7", "trace-42"),
+            ModelActionProvenance::new("arena", "", "trace-set-7", "trace-42"),
+            ModelActionProvenance::new("arena", "load-v1", "", "trace-42"),
+            ModelActionProvenance::new("arena", "load-v1", "trace-set-7", ""),
+        ] {
+            let proposal =
+                ModelActionProposal::new(ModelActionKind::Noop, ModelActionMode::Observe, bad);
+            assert!(proposal.validate().is_err());
+        }
     }
 }
