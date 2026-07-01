@@ -309,18 +309,21 @@ impl ComponentRegistry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpatialDim {
     D2,
+    D3,
 }
 
 impl SpatialDim {
     pub const fn as_wire_str(self) -> &'static str {
         match self {
             Self::D2 => "D2",
+            Self::D3 => "D3",
         }
     }
 
     pub fn from_wire_str(value: &str) -> Option<Self> {
         match value {
             "D2" => Some(Self::D2),
+            "D3" => Some(Self::D3),
             _ => None,
         }
     }
@@ -330,18 +333,21 @@ impl SpatialDim {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoordinateCodec {
     DebugF64_2,
+    DebugF64_3,
 }
 
 impl CoordinateCodec {
     pub const fn as_wire_str(self) -> &'static str {
         match self {
             Self::DebugF64_2 => "debug_f64_2",
+            Self::DebugF64_3 => "debug_f64_3",
         }
     }
 
     pub fn from_wire_str(value: &str) -> Option<Self> {
         match value {
             "debug_f64_2" => Some(Self::DebugF64_2),
+            "debug_f64_3" => Some(Self::DebugF64_3),
             _ => None,
         }
     }
@@ -358,6 +364,7 @@ pub enum PartitionSchemaError {
 pub enum PartitionSchema {
     Strip1D { boundary_count: u64 },
     Grid2D { cols: u64, rows: u64 },
+    Grid3D { cols: u64, rows: u64, layers: u64 },
 }
 
 impl PartitionSchema {
@@ -373,10 +380,19 @@ impl PartitionSchema {
         }
     }
 
+    pub const fn grid3d(cols: u64, rows: u64, layers: u64) -> Result<Self, PartitionSchemaError> {
+        if cols == 0 || rows == 0 || layers == 0 {
+            Err(PartitionSchemaError::ZeroGridDimension)
+        } else {
+            Ok(Self::Grid3D { cols, rows, layers })
+        }
+    }
+
     pub const fn kind(self) -> &'static str {
         match self {
             Self::Strip1D { .. } => "strip1d",
             Self::Grid2D { .. } => "grid2d",
+            Self::Grid3D { .. } => "grid3d",
         }
     }
 }
@@ -428,6 +444,15 @@ pub enum PartitionMapSpec {
         cell_h: f64,
         origin: [f64; 2],
     },
+    Grid3D {
+        cols: u64,
+        rows: u64,
+        layers: u64,
+        cell_w: f64,
+        cell_h: f64,
+        cell_d: f64,
+        origin: [f64; 3],
+    },
 }
 
 impl PartitionMapSpec {
@@ -467,10 +492,42 @@ impl PartitionMapSpec {
         })
     }
 
+    pub fn grid3d(
+        cols: u64,
+        rows: u64,
+        layers: u64,
+        cell_w: f64,
+        cell_h: f64,
+        cell_d: f64,
+        origin: [f64; 3],
+    ) -> Result<Self, PartitionMapSpecError> {
+        PartitionSchema::grid3d(cols, rows, layers)
+            .map_err(|_| PartitionMapSpecError::NonPositiveGridCell)?;
+        if !cell_w.is_finite() || !cell_h.is_finite() || !cell_d.is_finite() {
+            return Err(PartitionMapSpecError::NonFiniteGridCell);
+        }
+        if cell_w <= 0.0 || cell_h <= 0.0 || cell_d <= 0.0 {
+            return Err(PartitionMapSpecError::NonPositiveGridCell);
+        }
+        if !origin[0].is_finite() || !origin[1].is_finite() || !origin[2].is_finite() {
+            return Err(PartitionMapSpecError::NonFiniteGridOrigin);
+        }
+        Ok(Self::Grid3D {
+            cols,
+            rows,
+            layers,
+            cell_w,
+            cell_h,
+            cell_d,
+            origin,
+        })
+    }
+
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Strip1D { .. } => "strip1d",
             Self::Grid2D { .. } => "grid2d",
+            Self::Grid3D { .. } => "grid3d",
         }
     }
 
@@ -482,6 +539,13 @@ impl PartitionMapSpec {
             Self::Grid2D { cols, rows, .. } => PartitionSchema::Grid2D {
                 cols: *cols,
                 rows: *rows,
+            },
+            Self::Grid3D {
+                cols, rows, layers, ..
+            } => PartitionSchema::Grid3D {
+                cols: *cols,
+                rows: *rows,
+                layers: *layers,
             },
         }
     }
@@ -528,6 +592,14 @@ impl SpatialSchema {
         Self {
             spatial_dim: SpatialDim::D2,
             coordinate_codec: CoordinateCodec::DebugF64_2,
+            partition_schema,
+        }
+    }
+
+    pub const fn future_3d(partition_schema: PartitionSchema) -> Self {
+        Self {
+            spatial_dim: SpatialDim::D3,
+            coordinate_codec: CoordinateCodec::DebugF64_3,
             partition_schema,
         }
     }
@@ -1191,6 +1263,18 @@ mod tests {
             PartitionSchema::grid2d(2, 3),
             Ok(PartitionSchema::Grid2D { cols: 2, rows: 3 })
         );
+        assert_eq!(
+            PartitionSchema::grid3d(2, 3, 0),
+            Err(PartitionSchemaError::ZeroGridDimension)
+        );
+        assert_eq!(
+            PartitionSchema::grid3d(2, 3, 4),
+            Ok(PartitionSchema::Grid3D {
+                cols: 2,
+                rows: 3,
+                layers: 4
+            })
+        );
     }
 
     #[test]
@@ -1204,6 +1288,26 @@ mod tests {
         assert_eq!(
             schema.partition_schema,
             PartitionSchema::Strip1D { boundary_count: 1 }
+        );
+    }
+
+    #[test]
+    fn future_3d_spatial_schema_pins_d3_debug_f64_3_grid3d() {
+        let schema = SpatialSchema::future_3d(
+            PartitionSchema::grid3d(2, 3, 4).expect("valid 3D grid schema"),
+        );
+
+        assert_eq!(SPATIAL_SCHEMA_VERSION, 1);
+        assert_eq!(COORDINATE_CODEC_VERSION, 1);
+        assert_eq!(schema.spatial_dim.as_wire_str(), "D3");
+        assert_eq!(schema.coordinate_codec.as_wire_str(), "debug_f64_3");
+        assert_eq!(
+            schema.partition_schema,
+            PartitionSchema::Grid3D {
+                cols: 2,
+                rows: 3,
+                layers: 4
+            }
         );
     }
 
@@ -1261,6 +1365,22 @@ mod tests {
             PartitionMapSpec::grid2d(2, 2, 10.0, 10.0, [f64::NAN, 0.0]),
             Err(PartitionMapSpecError::NonFiniteGridOrigin)
         );
+        assert_eq!(
+            PartitionMapSpec::grid3d(2, 2, 0, 10.0, 10.0, 10.0, [0.0, 0.0, 0.0]),
+            Err(PartitionMapSpecError::NonPositiveGridCell)
+        );
+        assert_eq!(
+            PartitionMapSpec::grid3d(2, 2, 2, 10.0, f64::NAN, 10.0, [0.0, 0.0, 0.0]),
+            Err(PartitionMapSpecError::NonFiniteGridCell)
+        );
+        assert_eq!(
+            PartitionMapSpec::grid3d(2, 2, 2, 10.0, 10.0, -1.0, [0.0, 0.0, 0.0]),
+            Err(PartitionMapSpecError::NonPositiveGridCell)
+        );
+        assert_eq!(
+            PartitionMapSpec::grid3d(2, 2, 2, 10.0, 10.0, 10.0, [0.0, f64::NAN, 0.0]),
+            Err(PartitionMapSpecError::NonFiniteGridOrigin)
+        );
     }
 
     #[test]
@@ -1279,6 +1399,16 @@ mod tests {
         assert_eq!(
             grid.partition_schema(),
             PartitionSchema::Grid2D { cols: 3, rows: 2 }
+        );
+
+        let grid3 = PartitionMapSpec::grid3d(3, 2, 4, 10.0, 20.0, 30.0, [0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            grid3.partition_schema(),
+            PartitionSchema::Grid3D {
+                cols: 3,
+                rows: 2,
+                layers: 4
+            }
         );
     }
 

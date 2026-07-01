@@ -163,6 +163,11 @@ engine-facing gate:
   `tests/fixtures/client_bridge/godot-resync-contract.json` transcript through
   the Godot adapter and checks the same snapshot contract exported by the Rust
   `ClientBridge`.
+- `godot_3d_contract_probe.gd` replays
+  `tests/fixtures/client_bridge/godot-3d-contract.json`, requires D3 spatial
+  metadata (`debug_f64_3`, `grid3d`), and materializes the future 3D
+  physics-island component names into real Godot `CharacterBody3D` nodes without
+  claiming a full 3D runtime.
 - `client_bridge_tcp_resync_probe.gd` connects to a real broker socket,
   disconnects a viewer, deletes stale state while offline, reconnects, performs
   a full `EntityQuery` checkout, and verifies the Godot bridge rebuilt the
@@ -185,16 +190,13 @@ runner, fixture, probe scripts, docs, and expected snapshot shape from drifting
 while the live Godot gate remains environment-dependent.
 
 Local evidence from 2026-07-01: the portable Godot 4.3 runner passed the
-fixture contract probe, real broker reconnect/resync probe, and cross-broker
-handoff probe. The cross-broker probe verified W->E handoff, public E-side
-write, and stale W-owner fencing.
+fixture contract probe, Godot 3D contract probe, real broker reconnect/resync
+probe, cross-broker handoff probe, and Godot 2D physics seam probe. The
+cross-broker and 2D physics probes verified W->E handoff, public E-side write,
+and stale W-owner fencing.
 
 Remaining Godot work:
 
-- Godot 2D physics gate: a scene consumes the SDK bridge, sends movement or
-  physics commands, crosses a seam, and agrees with broker state.
-- Godot 3D contract gate: a scene or fixture exercises 3D-ready component names
-  and spatial metadata without requiring a full 3D runtime rewrite.
 - Later Godot 3D physics gate: a real 3D physics worker/client path, after the
   typed spatial contracts are stable.
 

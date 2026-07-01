@@ -96,6 +96,15 @@ fixture as its first behavior contract before adding scene-node lifecycle:
 The Godot-side runner for the same fixture is
 `client_probes/godot/client_bridge_contract_probe.gd`.
 
+The first Godot 3D contract runner is
+`client_probes/godot/godot_3d_contract_probe.gd`. It consumes
+`tests/fixtures/client_bridge/godot-3d-contract.json`, requires D3 spatial
+metadata (`debug_f64_3`, `grid3d`), and maps the future 3D physics-island
+component names (`core.pos3`, `core.vel3`, `core.rot3`, `core.lin3`,
+`core.ang3`, `core.physics_body`) into real Godot `CharacterBody3D` nodes.
+This is intentionally a contract gate, not a full 3D runtime or physics-worker
+rewrite.
+
 The first real socket runner is
 `client_probes/godot/client_bridge_tcp_resync_probe.gd`. It starts from the same
 Godot-side adapter, connects to a broker over the current length-prefixed JSON
@@ -119,10 +128,11 @@ $godot = .\scripts\ensure_godot_4_3.ps1
 
 This is still a probe runner, not the final Godot bridge package. It proves the
 Godot runtime can consume the shared bridge contract, rebuild from a real broker
-checkout, and observe a cross-broker handoff without giving the engine a second
-state model. The runner also includes `godot_2d_physics_probe.gd`, which uses a
-real Godot `CharacterBody2D` movement step as the source of a broker seam probe,
-then verifies E-side visibility and stale W-owner rejection.
+checkout, consume the 3D-ready contract rail, and observe a cross-broker handoff
+without giving the engine a second state model. The runner also includes
+`godot_2d_physics_probe.gd`, which uses a real Godot `CharacterBody2D` movement
+step as the source of a broker seam probe, then verifies E-side visibility and
+stale W-owner rejection.
 
 The first live game cache runner is
 `crates/godworks-client-sdk/examples/agar_live_cache_gate.rs`. It opens the

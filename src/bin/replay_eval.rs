@@ -219,6 +219,18 @@ fn require_partition_schema(event: &Value, line_no: usize, errors: &mut Vec<Stri
                 }
             }
         }
+        "grid3d" => {
+            let cols = require_positive_u64(schema, line_no, "cols", errors);
+            let rows = require_positive_u64(schema, line_no, "rows", errors);
+            let layers = require_positive_u64(schema, line_no, "layers", errors);
+            if let (Some(cols), Some(rows), Some(layers)) = (cols, rows, layers) {
+                if PartitionSchema::grid3d(cols, rows, layers).is_err() {
+                    errors.push(format!(
+                        "line {line_no}: partition_schema.grid3d dimensions must be positive"
+                    ));
+                }
+            }
+        }
         "strip1d" => {
             if let Some(boundary_count) = require_u64(schema, line_no, "boundary_count", errors) {
                 let _ = PartitionSchema::strip1d(boundary_count);
@@ -409,6 +421,23 @@ mod tests {
             .errors
             .iter()
             .any(|err| err.contains("missing positive u64 cols")));
+    }
+
+    #[test]
+    fn grid3d_contract_metadata_passes() {
+        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D3","coordinate_codec":"debug_f64_3","component_registry_version":1,"partition_schema":{"kind":"grid3d","cols":2,"rows":2,"layers":2},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
+        let report = validate_tape(tape);
+        assert_eq!(report.errors, Vec::<String>::new());
+    }
+
+    #[test]
+    fn grid3d_without_layers_fails() {
+        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D3","coordinate_codec":"debug_f64_3","component_registry_version":1,"partition_schema":{"kind":"grid3d","cols":2,"rows":2},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
+        let report = validate_tape(tape);
+        assert!(report
+            .errors
+            .iter()
+            .any(|err| err.contains("missing positive u64 layers")));
     }
 
     #[test]

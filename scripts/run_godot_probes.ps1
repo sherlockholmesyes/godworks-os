@@ -10,8 +10,10 @@ $ProbeDir = Join-Path $Repo "client_probes\godot"
 $LocalDir = Join-Path $Repo ".local\godot"
 $Broker = Join-Path $Repo "target\release\godworks_broker.exe"
 $Fixture = Join-Path $Repo "tests\fixtures\client_bridge\godot-resync-contract.json"
+$Fixture3D = Join-Path $Repo "tests\fixtures\client_bridge\godot-3d-contract.json"
 $RequiredProbeScripts = @(
   "client_bridge_contract_probe.gd",
+  "godot_3d_contract_probe.gd",
   "client_bridge_tcp_resync_probe.gd",
   "cross_broker_handoff_probe.gd",
   "godot_2d_physics_probe.gd"
@@ -29,6 +31,7 @@ $EnvKeys = @(
   "GW_DURABLE_FLUSH_MS",
   "GW_AUTH_CLAIMS",
   "GW_CLIENT_BRIDGE_FIXTURE",
+  "GW_GODOT_3D_FIXTURE",
   "GW_BRIDGE_STALE_ENTITY",
   "GW_BRIDGE_FRESH_ENTITY",
   "GW_GODOT_OWNER_TOKEN",
@@ -72,6 +75,7 @@ function Assert-FileExists([string]$Path, [string]$Label) {
 
 function Assert-GodotProbeInputs {
   Assert-FileExists $Fixture "client bridge fixture"
+  Assert-FileExists $Fixture3D "Godot 3D contract fixture"
   foreach ($script in $RequiredProbeScripts) {
     Assert-FileExists (Join-Path $ProbeDir $script) "Godot probe script"
   }
@@ -153,6 +157,12 @@ try {
     GW_CLIENT_BRIDGE_FIXTURE = (Resolve-Path $Fixture).Path
   }
   Invoke-GodotProbe "client_bridge_contract_probe.gd"
+
+  Write-Host "GODOT PROBES: 3D contract"
+  Set-GateEnv @{
+    GW_GODOT_3D_FIXTURE = (Resolve-Path $Fixture3D).Path
+  }
+  Invoke-GodotProbe "godot_3d_contract_probe.gd"
 
   Write-Host "GODOT PROBES: real broker reconnect/resync"
   $ownerToken = "godot-owner-token"

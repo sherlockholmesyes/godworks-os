@@ -930,6 +930,12 @@ pub fn parse_partition_schema_contract(value: &Value) -> Option<PartitionSchema>
             let rows = obj.get("rows").and_then(Value::as_u64)?;
             PartitionSchema::grid2d(cols, rows).ok()
         }
+        "grid3d" => {
+            let cols = obj.get("cols").and_then(Value::as_u64)?;
+            let rows = obj.get("rows").and_then(Value::as_u64)?;
+            let layers = obj.get("layers").and_then(Value::as_u64)?;
+            PartitionSchema::grid3d(cols, rows, layers).ok()
+        }
         "strip1d" => {
             let boundary_count = obj.get("boundary_count").and_then(Value::as_u64)?;
             Some(PartitionSchema::strip1d(boundary_count))
@@ -949,6 +955,16 @@ pub fn parse_partition_map_contract(value: &Value) -> Option<VersionedPartitionM
             let cell_h = obj.get("cell_h").and_then(Value::as_f64)?;
             let origin = parse_f64_pair(obj.get("origin")?)?;
             PartitionMapSpec::grid2d(cols, rows, cell_w, cell_h, origin).ok()?
+        }
+        "grid3d" => {
+            let cols = obj.get("cols").and_then(Value::as_u64)?;
+            let rows = obj.get("rows").and_then(Value::as_u64)?;
+            let layers = obj.get("layers").and_then(Value::as_u64)?;
+            let cell_w = obj.get("cell_w").and_then(Value::as_f64)?;
+            let cell_h = obj.get("cell_h").and_then(Value::as_f64)?;
+            let cell_d = obj.get("cell_d").and_then(Value::as_f64)?;
+            let origin = parse_f64_triple(obj.get("origin")?)?;
+            PartitionMapSpec::grid3d(cols, rows, layers, cell_w, cell_h, cell_d, origin).ok()?
         }
         "strip1d" => {
             let boundaries = parse_f64_array(obj.get("boundaries")?)?;
@@ -995,6 +1011,25 @@ pub fn partition_map_contract_value(map: &VersionedPartitionMap) -> Value {
             "cell_h": cell_h,
             "origin": origin,
         }),
+        PartitionMapSpec::Grid3D {
+            cols,
+            rows,
+            layers,
+            cell_w,
+            cell_h,
+            cell_d,
+            origin,
+        } => serde_json::json!({
+            "version": map.version,
+            "kind": "grid3d",
+            "cols": cols,
+            "rows": rows,
+            "layers": layers,
+            "cell_w": cell_w,
+            "cell_h": cell_h,
+            "cell_d": cell_d,
+            "origin": origin,
+        }),
     }
 }
 
@@ -1008,6 +1043,18 @@ fn parse_f64_pair(value: &Value) -> Option<[f64; 2]> {
         return None;
     }
     Some([values[0].as_f64()?, values[1].as_f64()?])
+}
+
+fn parse_f64_triple(value: &Value) -> Option<[f64; 3]> {
+    let values = value.as_array()?;
+    if values.len() != 3 {
+        return None;
+    }
+    Some([
+        values[0].as_f64()?,
+        values[1].as_f64()?,
+        values[2].as_f64()?,
+    ])
 }
 
 fn parse_region_splits(value: Option<&Value>) -> Option<Vec<RegionSplitSpec>> {
@@ -1182,6 +1229,31 @@ mod tests {
     }
 
     #[test]
+    fn partition_map_contract_roundtrips_grid3d_inputs() {
+        let original = VersionedPartitionMap::new(
+            9,
+            PartitionMapSpec::grid3d(3, 2, 4, 10.0, 20.0, 30.0, [0.0, 1.0, -2.0]).unwrap(),
+        );
+
+        let value = partition_map_contract_value(&original);
+
+        assert_eq!(parse_partition_map_contract(&value), Some(original));
+        assert_eq!(
+            parse_partition_schema_contract(&serde_json::json!({
+                "kind": "grid3d",
+                "cols": 3,
+                "rows": 2,
+                "layers": 4
+            })),
+            Some(PartitionSchema::Grid3D {
+                cols: 3,
+                rows: 2,
+                layers: 4
+            })
+        );
+    }
+
+    #[test]
     fn partition_map_contract_rejects_non_reproducible_strip_inputs() {
         let value = serde_json::json!({
             "version": 1,
@@ -1206,5 +1278,34 @@ mod tests {
         });
 
         assert_eq!(parse_partition_map_contract(&value), None);
+    }
+
+    #[test]
+    fn partition_map_contract_rejects_non_reproducible_grid3d_inputs() {
+        let zero_layer = serde_json::json!({
+            "version": 1,
+            "kind": "grid3d",
+            "cols": 2,
+            "rows": 2,
+            "layers": 0,
+            "cell_w": 10.0,
+            "cell_h": 20.0,
+            "cell_d": 30.0,
+            "origin": [0.0, 0.0, 0.0]
+        });
+        let bad_origin = serde_json::json!({
+            "version": 1,
+            "kind": "grid3d",
+            "cols": 2,
+            "rows": 2,
+            "layers": 2,
+            "cell_w": 10.0,
+            "cell_h": 20.0,
+            "cell_d": 30.0,
+            "origin": [0.0, 0.0]
+        });
+
+        assert_eq!(parse_partition_map_contract(&zero_layer), None);
+        assert_eq!(parse_partition_map_contract(&bad_origin), None);
     }
 }

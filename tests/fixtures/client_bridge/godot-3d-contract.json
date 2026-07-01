@@ -1,0 +1,76 @@
+{
+  "name": "godot_3d_contract_v1",
+  "description": "Godot 3D contract fixture for D3 spatial metadata and future 3D physics-island component names. This is a contract gate, not a full 3D runtime rewrite.",
+  "spatial_schema": {
+    "spatial_dim": "D3",
+    "coordinate_codec": "debug_f64_3",
+    "partition_schema": {
+      "kind": "grid3d",
+      "cols": 2,
+      "rows": 2,
+      "layers": 2
+    }
+  },
+  "component_registry_version": 1,
+  "physics_island_components": [
+    "core.pos3",
+    "core.vel3",
+    "core.rot3",
+    "core.lin3",
+    "core.ang3",
+    "core.physics_body"
+  ],
+  "entities": [
+    {
+      "entity": "ship-3d",
+      "components": {
+        "core.pos3": [1.5, 2.25, -3.75],
+        "core.vel3": [0.5, 0.0, 1.0],
+        "core.rot3": [0.0, 0.70710678, 0.0, 0.70710678],
+        "core.lin3": [0.5, 0.0, 1.0],
+        "core.ang3": [0.0, 0.25, 0.0],
+        "core.physics_body": {
+          "engine": "Godot",
+          "body": "CharacterBody3D",
+          "shape": "SphereShape3D"
+        }
+      },
+      "authority": {
+        "core.pos3": {
+          "owner": "godot-3d-worker",
+          "authority_epoch": 11,
+          "mode": "server_physics_island"
+        },
+        "core.vel3": {
+          "owner": "godot-3d-worker",
+          "authority_epoch": 11,
+          "mode": "server_physics_island"
+        },
+        "core.rot3": {
+          "owner": "godot-3d-worker",
+          "authority_epoch": 11,
+          "mode": "server_physics_island"
+        }
+      }
+    }
+  ],
+  "expected_scene": {
+    "node_count": 1,
+    "nodes": [
+      {
+        "entity": "ship-3d",
+        "position3": [1.5, 2.25, -3.75],
+        "velocity3": [0.5, 0.0, 1.0],
+        "rotation_quat": [0.0, 0.70710678, 0.0, 0.70710678],
+        "component_keys": [
+          "core.ang3",
+          "core.lin3",
+          "core.physics_body",
+          "core.pos3",
+          "core.rot3",
+          "core.vel3"
+        ]
+      }
+    ]
+  }
+}
