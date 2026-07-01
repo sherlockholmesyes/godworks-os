@@ -65,6 +65,9 @@ jobs:
             exit 1
           fi
 
+      - name: Validate Godot probe inventory
+        run: python3 tools/godot_probe_inventory.py
+
       - name: Validate PR invariant body
         run: |
           python3 tools/pr_invariant_gate.py
