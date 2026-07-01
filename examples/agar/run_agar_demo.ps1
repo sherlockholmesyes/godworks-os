@@ -16,6 +16,7 @@ if (!(Test-Path $broker)) {
   Push-Location $Repo
   try { cargo build --bin godworks_broker } finally { Pop-Location }
 }
+$replayEval = Join-Path $Repo "target\debug\replay_eval.exe"
 
 $cols, $rows = $Grid -split "x" | ForEach-Object { [int]$_ }
 $regions = for ($y = 0; $y -lt $rows; $y++) { for ($x = 0; $x -lt $cols; $x++) { "Z${x}_${y}" } }
@@ -33,6 +34,8 @@ $old = @{
   GW_AUTH_CLAIMS = $env:GW_AUTH_CLAIMS
   GW_HTTP = $env:GW_HTTP
   GW_SPEED = $env:GW_SPEED
+  GW_REPLAY_TAPE = $env:GW_REPLAY_TAPE
+  GW_REPLAY_TAPE_CAPACITY = $env:GW_REPLAY_TAPE_CAPACITY
 }
 
 $procs = @()
@@ -54,7 +57,10 @@ try {
   $env:GW_WORLD = "0,$Arena,0,$Arena"
   $env:GW_AUTH_CLAIMS = ($claims -join ",")
   $env:GW_SPEED = "18"
+  $env:GW_REPLAY_TAPE = (Join-Path $LogDir "agar.replay.jsonl")
+  $env:GW_REPLAY_TAPE_CAPACITY = "32768"
   Remove-Item $env:GW_WAL -ErrorAction SilentlyContinue
+  Remove-Item $env:GW_REPLAY_TAPE -ErrorAction SilentlyContinue
 
   $procs += Start-HiddenProc -FilePath $broker -ProcArgs @() -OutPath (Join-Path $LogDir "broker.out.log") -ErrPath (Join-Path $LogDir "broker.err.log")
   Start-Sleep -Milliseconds 800
@@ -80,12 +86,21 @@ try {
   Write-Host "Godworks agar.io demo: http://localhost:$HttpPort"
 
   if ($GateOnly) {
+    if (!(Test-Path $replayEval)) {
+      Push-Location $Repo
+      try { cargo build --bin replay_eval } finally { Pop-Location }
+    }
     $env:GW_AGAR_URL = "http://127.0.0.1:$HttpPort"
     $env:GW_GATE_MIN_OWNERS = [Math]::Min(4, $regions.Count)
     node (Join-Path $PSScriptRoot "gw_agar_gate.js")
     if ($LASTEXITCODE -ne 0) { throw "agar reality gate failed with exit code $LASTEXITCODE" }
     node (Join-Path $PSScriptRoot "gw_agar_pixel_gate.js")
     if ($LASTEXITCODE -ne 0) { throw "agar pixel gate failed with exit code $LASTEXITCODE" }
+    if (!(Test-Path $env:GW_REPLAY_TAPE) -or ((Get-Item $env:GW_REPLAY_TAPE).Length -le 0)) {
+      throw "agar replay tape was not written: $env:GW_REPLAY_TAPE"
+    }
+    & $replayEval $env:GW_REPLAY_TAPE
+    if ($LASTEXITCODE -ne 0) { throw "agar replay_eval failed with exit code $LASTEXITCODE" }
   } else {
     Write-Host "Press Ctrl+C to stop. Logs: $LogDir"
     while ($true) { Start-Sleep -Seconds 1 }

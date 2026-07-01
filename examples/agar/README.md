@@ -67,13 +67,16 @@ slice can join, send commands, receive command acknowledgements after handoff,
 move, cross partition seams, keep every entity owned by a real worker, reject
 privilege self-assignment, compare client-stream truth against inspector truth,
 avoid duplicate entity ids in observed frames, and render a non-blank moving
-canvas sourced from `/client-state`.
+canvas sourced from `/client-state`. `-GateOnly` also runs the broker with
+`GW_REPLAY_TAPE` and validates the resulting live tape with `replay_eval`, so
+the gate fails if runtime breadcrumbs leak secrets, lose spatial contract
+metadata, or contradict protocol operation semantics.
 
 This is the current Agar Reality Gate v1. It is now bound to the System Laws
 index as a runtime ruler, but it is not yet the full release gate. The remaining
 promotion work is tracked in `docs/ops/live-game-reality-gates.md`:
-`godworks-client-sdk` cache proof, replay tape validation, WAL restore agreement,
-and longer soak coverage.
+`godworks-client-sdk` cache proof, WAL restore agreement, and longer soak
+coverage.
 
 The pixel gate launches Chrome/Edge through the Chrome DevTools Protocol without
 Playwright/Puppeteer. If the browser is not in a standard location, set:
