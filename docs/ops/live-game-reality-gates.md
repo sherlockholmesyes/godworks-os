@@ -149,6 +149,13 @@ Current command, when a Godot 4.x binary is available through `GODOT_BIN` or
 .\scripts\run_godot_probes.ps1
 ```
 
+For a portable local Godot 4.3 toolchain without installing a system package:
+
+```powershell
+$godot = .\scripts\ensure_godot_4_3.ps1
+.\scripts\run_godot_probes.ps1 -Godot $godot
+```
+
 This runner is narrower than a full game demo, but it is already an
 engine-facing gate:
 
@@ -172,6 +179,11 @@ python3 tools/godot_probe_inventory.py
 That inventory gate is not a substitute for live Godot execution; it keeps the
 runner, fixture, probe scripts, docs, and expected snapshot shape from drifting
 while the live Godot gate remains environment-dependent.
+
+Local evidence from 2026-07-01: the portable Godot 4.3 runner passed the
+fixture contract probe, real broker reconnect/resync probe, and cross-broker
+handoff probe. The cross-broker probe verified W->E handoff, public E-side
+write, and stale W-owner fencing.
 
 Remaining Godot work:
 
