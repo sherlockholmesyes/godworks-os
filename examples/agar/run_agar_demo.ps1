@@ -37,6 +37,7 @@ $old = @{
   GW_REPLAY_TAPE = $env:GW_REPLAY_TAPE
   GW_REPLAY_TAPE_CAPACITY = $env:GW_REPLAY_TAPE_CAPACITY
   GW_RESTORE_DRYRUN = $env:GW_RESTORE_DRYRUN
+  GW_AGAR_RESTORE_EXPECT = $env:GW_AGAR_RESTORE_EXPECT
 }
 
 $procs = @()
@@ -109,7 +110,12 @@ try {
     }
     & $replayEval $env:GW_REPLAY_TAPE
     if ($LASTEXITCODE -ne 0) { throw "agar replay_eval failed with exit code $LASTEXITCODE" }
+    $restoreExpect = Join-Path $LogDir "agar.live-before-restore.json"
+    $env:GW_AGAR_RESTORE_EXPECT = $restoreExpect
+    node (Join-Path $PSScriptRoot "gw_agar_capture_cut.js")
+    if ($LASTEXITCODE -ne 0) { throw "agar live cut capture failed with exit code $LASTEXITCODE" }
     Stop-AgarCluster
+    Start-Sleep -Milliseconds 500
     $env:GW_RESTORE_DRYRUN = "1"
     $restoreRaw = & $broker 2>&1
     if ($LASTEXITCODE -ne 0) { throw "agar WAL restore dry-run failed with exit code $LASTEXITCODE`n$($restoreRaw -join "`n")" }
@@ -122,6 +128,12 @@ try {
     if ([int64]$restore.unknown_kind_count -ne 0) { throw "agar WAL restore dry-run saw unknown WAL kinds: $($restore.unknown_kinds | ConvertTo-Json -Compress)" }
     if ($null -ne $restore.error) { throw "agar WAL restore dry-run reported error: $($restore.error)" }
     Write-Host ("agar WAL restore dry-run: " + ($restore | ConvertTo-Json -Compress -Depth 8))
+    Remove-Item Env:GW_RESTORE_DRYRUN -ErrorAction SilentlyContinue
+    $procs += Start-HiddenProc -FilePath $broker -ProcArgs @() -OutPath (Join-Path $LogDir "restored-broker.out.log") -ErrPath (Join-Path $LogDir "restored-broker.err.log")
+    Start-Sleep -Milliseconds 900
+    $env:GW_AGAR_RESTORE_EXPECT = $restoreExpect
+    node (Join-Path $PSScriptRoot "gw_agar_restore_gate.js")
+    if ($LASTEXITCODE -ne 0) { throw "agar restored broker/client agreement failed with exit code $LASTEXITCODE" }
   } else {
     Write-Host "Press Ctrl+C to stop. Logs: $LogDir"
     while ($true) { Start-Sleep -Seconds 1 }
@@ -142,4 +154,5 @@ finally {
   Remove-Item Env:GW_BROWSER_TOKEN -ErrorAction SilentlyContinue
   Remove-Item Env:GW_AGAR_URL -ErrorAction SilentlyContinue
   Remove-Item Env:GW_GATE_MIN_OWNERS -ErrorAction SilentlyContinue
+  Remove-Item Env:GW_AGAR_RESTORE_EXPECT -ErrorAction SilentlyContinue
 }

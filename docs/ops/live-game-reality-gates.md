@@ -34,6 +34,11 @@ dependency-free CDP pixel gate. It proves:
 - the demo WAL is accepted by `GW_RESTORE_DRYRUN=1` after the live cluster stops,
   with a non-empty recovered store, selected WAL events, no recovery error, and
   no unknown WAL event kinds.
+- a restored broker booted from the same demo WAL returns an `InspectorFrame`
+  whose entity IDs, positions, and logical `pos` owners agree with the final
+  live broker/client cut captured before shutdown. This restore-only check
+  normalizes `agar-Zx_y` worker IDs to `Zx_y` regions because workers are not
+  reconnected for this query.
 
 The gate is intentionally stronger than a synthetic protocol test because it
 uses the actual demo cluster and live state. It is still not the full release
@@ -57,9 +62,6 @@ checks:
 - SDK cache proof: route one client-facing check through
   `godworks-client-sdk::ClientBridge` instead of only the JavaScript gateway
   cache;
-- restored-broker/client proof: restart from `.local/agar/agar.wal` and verify
-  the restored broker state agrees with the pre-restart client/broker truth, with
-  no duplicate owner, missing player, or resurrected deleted entity;
 - duration proof: run a longer multi-client soak and keep owner count,
   duplicate frames, rejects, and command acknowledgements inside expected
   bounds.
