@@ -45,6 +45,11 @@ jobs:
             echo "system laws row without fail-under-broken gate unexpectedly passed"
             exit 1
           fi
+          if python3 tools/system_laws_lint.py \
+            --laws docs/ops/examples/system-laws.invalid-unbound-fail-gate.jsonl; then
+            echo "system laws row with unbound fail-under-broken gate unexpectedly passed"
+            exit 1
+          fi
           python3 tools/system_laws_test_inventory.py \
             --laws docs/ops/examples/system-laws.valid-test-inventory.jsonl \
             --test-list-file docs/ops/examples/cargo-test-list.example.txt

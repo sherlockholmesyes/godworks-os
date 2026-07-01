@@ -41,6 +41,14 @@ python3 tools/system_laws_lint.py \
   --laws docs/ops/examples/system-laws.invalid-missing-fail-gate.jsonl
 ```
 
+CI also rejects a law row whose `fail_under_broken[].gate` does not point back
+to one of the row's `current_gates`:
+
+```bash
+python3 tools/system_laws_lint.py \
+  --laws docs/ops/examples/system-laws.invalid-unbound-fail-gate.jsonl
+```
+
 The linter does not prove the runtime by itself. It prevents a weaker failure:
 a PR claiming a law exists while omitting the exact boundary, current gates,
 known gaps, or fail-under-broken check that would catch a violation.
@@ -64,6 +72,8 @@ test, fixture, or runtime ruler that would fail when the law is broken.
 - `docs/ops/system-laws.jsonl` is the current law index.
 - `docs/ops/examples/system-laws.invalid-missing-fail-gate.jsonl` proves the
   linter rejects a row without a fail-under-broken gate.
+- `docs/ops/examples/system-laws.invalid-unbound-fail-gate.jsonl` proves the
+  linter rejects a fail-under-broken gate that is not bound to a current gate.
 - `docs/ops/examples/system-laws.valid-test-inventory.jsonl` and
   `docs/ops/examples/system-laws.invalid-missing-test.jsonl` prove the
   inventory checker accepts an existing cargo test gate and rejects a stale one.
