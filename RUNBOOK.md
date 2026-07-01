@@ -123,6 +123,20 @@ fixture:
 cargo test -p godworks-client-sdk bridge_replays_godot_resync_contract_fixture -- --nocapture
 ```
 
+The runnable Godot gate wrapper is:
+
+```powershell
+.\scripts\run_godot_probes.ps1 -Godot C:\path\to\godot.exe
+```
+
+If `godot` is on `PATH`, the `-Godot` argument can be omitted. The script builds
+the release broker, runs the Godot-side fixture contract probe, starts/stops the
+single-broker reconnect/resync probe, then starts/stops the W/E cross-broker
+handoff probe. It fails if Godot is missing unless `-AllowMissingGodot` is passed.
+`-AllowMissingGodot` is only a dependency-check convenience for machines without
+Godot installed; it still verifies the probe scripts and fixture exist, but it is
+not a green Godot gate.
+
 That fixture lives at `tests/fixtures/client_bridge/godot-resync-contract.json`
 and is the shared reconnect/resync contract for engine bindings. It keeps the
 Rust `ClientBridge` as the source of truth instead of letting the Godot probe
