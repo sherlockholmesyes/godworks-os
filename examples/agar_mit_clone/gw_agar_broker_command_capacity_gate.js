@@ -147,6 +147,21 @@ function summarizeNumbers(values) {
   };
 }
 
+function summarizeOptionalNumbers(values) {
+  const finite = values.map(value => Number(value)).filter(Number.isFinite);
+  if (!finite.length) return null;
+  finite.sort((a, b) => a - b);
+  const sum = finite.reduce((acc, value) => acc + value, 0);
+  const p95Index = Math.min(finite.length - 1, Math.max(0, Math.ceil(finite.length * 0.95) - 1));
+  return {
+    count: finite.length,
+    min: finite[0],
+    max: finite[finite.length - 1],
+    mean: sum / finite.length,
+    p95: finite[p95Index],
+  };
+}
+
 function summarizeMonitorSamples(samples) {
   const entityStats = summarizeNumbers(samples.map(sample => sample.entities));
   const playerStats = summarizeNumbers(samples.map(sample => sample.players));
@@ -312,7 +327,7 @@ class BrokerClient {
         this.waiters.delete(requestId);
         reject(new Error(`CommandResponse timeout for ${requestId}`));
       }, RESPONSE_TIMEOUT_MS);
-      this.waiters.set(requestId, { resolve, reject, timer });
+      this.waiters.set(requestId, { resolve, reject, timer, sentAt: Date.now() });
     });
     this.send({
       op: "CommandRequest",
@@ -341,6 +356,7 @@ class BrokerClient {
         if (waiter) {
           clearTimeout(waiter.timer);
           this.waiters.delete(reqId);
+          msg.command_round_trip_ms = Date.now() - waiter.sentAt;
           waiter.resolve(msg);
         }
       }
@@ -391,6 +407,7 @@ function makeTracker(player, index) {
     postSeamCommandOk: false,
     commandResponses: 0,
     commandOwnerMatches: 0,
+    commandLatenciesMs: [],
     bridgeCommandCount: 0,
     directionAttempt: index % DIRECTIONS.length,
     direction: DIRECTIONS[index % DIRECTIONS.length],
@@ -482,6 +499,9 @@ async function updateTracker(tracker, monitor, view, broker, seqRef, startedAt) 
     const expectedOwner = owner;
     const ack = await broker.command(tracker.entity, tracker.direction.target, ++seqRef.value);
     tracker.commandResponses++;
+    if (Number.isFinite(Number(ack.command_round_trip_ms))) {
+      tracker.commandLatenciesMs.push(Number(ack.command_round_trip_ms));
+    }
     assertOk(ack.success !== false, "broker CommandRequest returned failure", {
       entity: tracker.entity,
       expectedOwner,
@@ -567,6 +587,7 @@ function trackerSummary(tracker) {
     postSeamPath: Number(tracker.postSeamPath.toFixed(3)),
     commandResponses: tracker.commandResponses,
     commandOwnerMatches: tracker.commandOwnerMatches,
+    commandLatencyMs: summarizeOptionalNumbers(tracker.commandLatenciesMs),
     bridgeCommandCount: tracker.bridgeCommandCount,
     completed: tracker.completed,
     failed: tracker.failed,
@@ -650,6 +671,8 @@ async function main() {
     });
 
     const playerSummaries = trackers.map(trackerSummary);
+    const allLatencies = trackers.flatMap(tracker => tracker.commandLatenciesMs);
+    const completedLatencies = completed.flatMap(tracker => tracker.commandLatenciesMs);
     console.log(JSON.stringify({
       ok: true,
       gate: "mit_clone_broker_command_capacity",
@@ -674,6 +697,8 @@ async function main() {
         minCommandResponses: Math.min(...completed.map(tracker => tracker.commandResponses)),
         totalCommandResponses: trackers.reduce((acc, tracker) => acc + tracker.commandResponses, 0),
         totalCommandOwnerMatches: trackers.reduce((acc, tracker) => acc + tracker.commandOwnerMatches, 0),
+        commandLatencyMs: summarizeOptionalNumbers(allLatencies),
+        completedCommandLatencyMs: summarizeOptionalNumbers(completedLatencies),
         minOwnerChanges: Math.min(...completed.map(tracker => tracker.ownerChanges)),
         maxOwnerChanges: Math.max(...trackers.map(tracker => tracker.ownerChanges)),
         minBlockChanges: Math.min(...completed.map(tracker => tracker.blockChanges)),

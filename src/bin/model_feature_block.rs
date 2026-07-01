@@ -527,31 +527,51 @@ fn build_mit_clone_stress_ladder_feature_blocks(
         .with_dimension("gate_family", "mit_clone_adapter")
         .with_dimension("gate", "mit_clone_broker_command_stress_ladder");
 
-    let worker_load = ModelFeatureBlock::new(ModelFeatureBlockKind::WorkerLoad, cfg.provenance())
-        .with_metric("capacity_workers_min", min_worker_slots)
-        .with_metric("capacity_workers_max", max_worker_slots)
-        .with_metric("capacity_load_peak_to_mean_max", max_peak_to_mean)
-        .with_metric(
-            "capacity_rebalance_delta",
-            sum_row_metric(rows, "rebalanceDelta")?,
-        )
-        .with_dimension("artifact_kind", "agar_live_gate")
-        .with_dimension("gate_family", "mit_clone_adapter")
-        .with_dimension("gate", "mit_clone_broker_command_stress_ladder");
+    let mut worker_load =
+        ModelFeatureBlock::new(ModelFeatureBlockKind::WorkerLoad, cfg.provenance())
+            .with_metric("capacity_workers_min", min_worker_slots)
+            .with_metric("capacity_workers_max", max_worker_slots)
+            .with_metric("capacity_load_peak_to_mean_max", max_peak_to_mean)
+            .with_metric(
+                "capacity_rebalance_delta",
+                sum_row_metric(rows, "rebalanceDelta")?,
+            )
+            .with_dimension("artifact_kind", "agar_live_gate")
+            .with_dimension("gate_family", "mit_clone_adapter")
+            .with_dimension("gate", "mit_clone_broker_command_stress_ladder");
+    if let Some(value) = max_optional_row_metric(rows, &["resourceAfter", "totalWorkingSetMiB"])? {
+        worker_load = worker_load.with_metric("capacity_process_working_set_mib_max", value);
+    }
+    if let Some(value) = sum_optional_row_metric(rows, &["resourceDelta", "cpuSecondsDelta"])? {
+        worker_load = worker_load.with_metric("capacity_process_cpu_seconds_delta_total", value);
+    }
+    if let Some(value) = max_optional_row_metric(rows, &["resourceDelta", "workingSetMiBMax"])? {
+        worker_load = worker_load.with_metric("capacity_process_working_set_mib_row_max", value);
+    }
 
-    let handoff = ModelFeatureBlock::new(ModelFeatureBlockKind::HandoffPressure, cfg.provenance())
-        .with_metric("broker_command_completed_players", total_completed)
-        .with_metric("broker_command_failed_players", total_failed)
-        .with_metric("broker_command_total_responses", total_responses)
-        .with_metric("broker_command_total_owner_matches", total_owner_matches)
-        .with_metric("broker_command_min_post_seam_path", min_post_seam_path)
-        .with_metric(
-            "broker_command_all_post_seam_ok",
-            if all_post_seam_ok { 1.0 } else { 0.0 },
-        )
-        .with_dimension("artifact_kind", "agar_live_gate")
-        .with_dimension("gate_family", "mit_clone_adapter")
-        .with_dimension("gate", "mit_clone_broker_command_stress_ladder");
+    let mut handoff =
+        ModelFeatureBlock::new(ModelFeatureBlockKind::HandoffPressure, cfg.provenance())
+            .with_metric("broker_command_completed_players", total_completed)
+            .with_metric("broker_command_failed_players", total_failed)
+            .with_metric("broker_command_total_responses", total_responses)
+            .with_metric("broker_command_total_owner_matches", total_owner_matches)
+            .with_metric("broker_command_min_post_seam_path", min_post_seam_path)
+            .with_metric(
+                "broker_command_all_post_seam_ok",
+                if all_post_seam_ok { 1.0 } else { 0.0 },
+            )
+            .with_dimension("artifact_kind", "agar_live_gate")
+            .with_dimension("gate_family", "mit_clone_adapter")
+            .with_dimension("gate", "mit_clone_broker_command_stress_ladder");
+    if let Some(value) = max_optional_row_metric(rows, &["commandLatencyMs", "p95"])? {
+        handoff = handoff.with_metric("broker_command_latency_ms_p95_max", value);
+    }
+    if let Some(value) = max_optional_row_metric(rows, &["commandLatencyMs", "max"])? {
+        handoff = handoff.with_metric("broker_command_latency_ms_max", value);
+    }
+    if let Some(value) = max_optional_row_metric(rows, &["completedCommandLatencyMs", "p95"])? {
+        handoff = handoff.with_metric("broker_command_completed_latency_ms_p95_max", value);
+    }
 
     validate_blocks(vec![outcome, density, worker_load, handoff])
 }
@@ -584,6 +604,51 @@ fn sum_row_metric(rows: &[Value], key: &str) -> Result<f64, String> {
         sum += row_metric(row, key)?;
     }
     Ok(sum)
+}
+
+fn optional_row_metric(row: &Value, path: &[&str]) -> Result<Option<f64>, String> {
+    let mut cursor = row;
+    for key in path {
+        let Some(next) = cursor.get(*key) else {
+            return Ok(None);
+        };
+        cursor = next;
+    }
+    let Some(value) = cursor.as_f64() else {
+        return Err(format!(
+            "MIT clone stress ladder row has non-numeric optional metric {}",
+            path.join(".")
+        ));
+    };
+    if !value.is_finite() {
+        return Err(format!(
+            "MIT clone stress ladder row has non-finite optional metric {}",
+            path.join(".")
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn max_optional_row_metric(rows: &[Value], path: &[&str]) -> Result<Option<f64>, String> {
+    let mut max = None;
+    for row in rows {
+        if let Some(value) = optional_row_metric(row, path)? {
+            max = Some(max.map_or(value, |current: f64| current.max(value)));
+        }
+    }
+    Ok(max)
+}
+
+fn sum_optional_row_metric(rows: &[Value], path: &[&str]) -> Result<Option<f64>, String> {
+    let mut found = false;
+    let mut sum = 0.0;
+    for row in rows {
+        if let Some(value) = optional_row_metric(row, path)? {
+            found = true;
+            sum += value;
+        }
+    }
+    Ok(found.then_some(sum))
 }
 
 fn agar_entity_density_block(
@@ -1360,6 +1425,7 @@ mod tests {
         let output = r#"{
           "ok": true,
           "gate": "mit_clone_broker_command_stress_ladder",
+          "schemaVersion": 2,
           "generatedAt": "2026-07-01T12:07:57.6795128-03:00",
           "rows": [
             {
@@ -1388,6 +1454,10 @@ mod tests {
               "failedPlayers": 0,
               "totalCommandResponses": 84,
               "totalCommandOwnerMatches": 84,
+              "commandLatencyMs": {"count": 84, "min": 4, "max": 39, "mean": 12.5, "p95": 31},
+              "completedCommandLatencyMs": {"count": 80, "min": 4, "max": 34, "mean": 11.5, "p95": 29},
+              "resourceAfter": {"processCount": 6, "totalCpuSeconds": 123.5, "totalWorkingSetMiB": 812.25},
+              "resourceDelta": {"cpuSecondsDelta": 18.25, "workingSetMiBDelta": 42.5, "workingSetMiBMax": 812.25},
               "minPostSeamPath": 28.57172610222915,
               "allPostSeamCommandOk": true
             }
@@ -1409,6 +1479,14 @@ mod tests {
         assert_eq!(blocks[1].metrics["capacity_entities_min"], 1085.0);
         assert_eq!(blocks[1].metrics["capacity_players_max"], 48.0);
         assert_eq!(blocks[2].metrics["capacity_workers_min"], 16.0);
+        assert_eq!(
+            blocks[2].metrics["capacity_process_working_set_mib_max"],
+            812.25
+        );
+        assert_eq!(
+            blocks[2].metrics["capacity_process_cpu_seconds_delta_total"],
+            18.25
+        );
         assert!(
             (blocks[2].metrics["capacity_load_peak_to_mean_max"] - 1.2578616352201257).abs()
                 < 0.00000000000001
@@ -1419,6 +1497,11 @@ mod tests {
         assert_eq!(
             blocks[3].metrics["broker_command_total_owner_matches"],
             84.0
+        );
+        assert_eq!(blocks[3].metrics["broker_command_latency_ms_p95_max"], 31.0);
+        assert_eq!(
+            blocks[3].metrics["broker_command_completed_latency_ms_p95_max"],
+            29.0
         );
         assert_eq!(blocks[3].metrics["broker_command_all_post_seam_ok"], 1.0);
         for block in blocks {

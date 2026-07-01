@@ -123,8 +123,10 @@ is not a maximum CCU benchmark; it is the live-game ruler that prevents
 `run_mit_clone_stress_ladder.ps1` is the executable ladder form of that ruler.
 The System Laws gate binds the local path for the observed floor profile:
 `-BotCounts 40 -CommandPlayers 8 -CommandCapacityMinCompleted 4`. This is still
-an observed local floor, not a maximum-player claim; larger profiles must be
-rerun and recorded before they can be advertised.
+an observed local floor, not a maximum-player claim. Each ladder row records
+command ACK latency plus local process CPU/RSS snapshots so the model-plane and
+release notes can distinguish "green but expensive" from "green and cheap."
+Larger profiles must be rerun and recorded before they can be advertised.
 
 Boundary: even the broker-command MIT clone gate is not yet a full
 Godworks-authoritative replacement for the MIT clone server. The stock clone

@@ -98,12 +98,100 @@ function Extract-GateJson([string]$Text) {
 
 function Save-Summary([string]$Path, [object[]]$Rows) {
   $payload = [ordered]@{
+    schemaVersion = 2
     ok = -not [bool]($Rows | Where-Object { -not $_.ok } | Select-Object -First 1)
     gate = "mit_clone_broker_command_stress_ladder"
     generatedAt = (Get-Date).ToString("o")
+    host = $script:HostProfile
     rows = $Rows
   }
   $payload | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Get-HostProfile {
+  try {
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $computer = Get-CimInstance Win32_ComputerSystem | Select-Object -First 1
+    $os = Get-CimInstance Win32_OperatingSystem | Select-Object -First 1
+    return [ordered]@{
+      cpuName = $cpu.Name
+      logicalProcessors = [int]$cpu.NumberOfLogicalProcessors
+      totalMemoryGiB = [Math]::Round(([double]$computer.TotalPhysicalMemory / 1GB), 3)
+      osCaption = $os.Caption
+      osArchitecture = $os.OSArchitecture
+    }
+  } catch {
+    return [ordered]@{
+      unavailable = $true
+      error = $_.Exception.Message
+    }
+  }
+}
+
+function Get-PortProcessMetrics([int[]]$Ports) {
+  $connections = @()
+  try {
+    $connections = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+      Where-Object { $Ports -contains [int]$_.LocalPort })
+  } catch {
+    return [ordered]@{
+      unavailable = $true
+      error = $_.Exception.Message
+      ports = $Ports
+    }
+  }
+
+  $pids = @($connections | Select-Object -ExpandProperty OwningProcess -Unique |
+    Where-Object { $_ -and [int]$_ -gt 0 })
+  $items = @()
+  foreach ($processId in $pids) {
+    try {
+      $process = Get-Process -Id $processId -ErrorAction Stop
+      $cpuSeconds = 0.0
+      if ($null -ne $process.CPU) {
+        $cpuSeconds = [double]$process.CPU
+      }
+      $items += [pscustomobject]@{
+        pid = [int]$process.Id
+        name = $process.ProcessName
+        cpuSeconds = [Math]::Round($cpuSeconds, 3)
+        workingSetMiB = [Math]::Round(([double]$process.WorkingSet64 / 1MB), 3)
+      }
+    } catch {
+      $items += [pscustomobject]@{
+        pid = [int]$processId
+        name = "unavailable"
+        cpuSeconds = 0
+        workingSetMiB = 0
+      }
+    }
+  }
+
+  $cpuTotal = 0.0
+  $rssTotal = 0.0
+  foreach ($item in $items) {
+    $cpuTotal += [double]$item.cpuSeconds
+    $rssTotal += [double]$item.workingSetMiB
+  }
+  return [ordered]@{
+    capturedAt = (Get-Date).ToString("o")
+    ports = $Ports
+    processCount = $items.Count
+    totalCpuSeconds = [Math]::Round($cpuTotal, 3)
+    totalWorkingSetMiB = [Math]::Round($rssTotal, 3)
+    processes = @($items)
+  }
+}
+
+function Get-ResourceDelta([object]$Before, [object]$After) {
+  if (-not $Before -or -not $After -or $Before.unavailable -or $After.unavailable) {
+    return $null
+  }
+  return [ordered]@{
+    cpuSecondsDelta = [Math]::Round(([double]$After.totalCpuSeconds - [double]$Before.totalCpuSeconds), 3)
+    workingSetMiBDelta = [Math]::Round(([double]$After.totalWorkingSetMiB - [double]$Before.totalWorkingSetMiB), 3)
+    workingSetMiBMax = [Math]::Round([Math]::Max([double]$Before.totalWorkingSetMiB, [double]$After.totalWorkingSetMiB), 3)
+  }
 }
 
 function Start-CommandBridge([string]$Profile, [int]$CommandPlayersForProfile) {
@@ -127,6 +215,7 @@ function Start-CommandBridge([string]$Profile, [int]$CommandPlayersForProfile) {
 }
 
 $summaryPath = Join-Path $OutputDir "ladder_summary.json"
+$script:HostProfile = Get-HostProfile
 $rows = @()
 $profileIndex = 0
 
@@ -175,6 +264,9 @@ foreach ($botCount in $BotCounts) {
   $gateExit = 1
   $parseError = $null
   $bridgeError = $null
+  $resourceBefore = $null
+  $resourceAfter = $null
+  $resourceDelta = $null
 
   if ($stackExit -eq 0) {
     try {
@@ -182,6 +274,7 @@ foreach ($botCount in $BotCounts) {
       Wait-Port $PortBroker "Godworks broker" 5
       Wait-Port $PortMonitor "dynamic shard monitor" 5
       Wait-Port $PortView "broker view" 5
+      $resourceBefore = Get-PortProcessMetrics -Ports @($PortBroker, $PortMonitor, $PortView, $PortCommandBridge, 3000)
 
       $oldEnv = @{
         GW_HOST = $env:GW_HOST
@@ -221,6 +314,8 @@ foreach ($botCount in $BotCounts) {
           -StdoutPath $gateOut `
           -StderrPath $gateErr `
           -TimeoutMs ($CommandTimeoutMs + 15000)
+        $resourceAfter = Get-PortProcessMetrics -Ports @($PortBroker, $PortMonitor, $PortView, $PortCommandBridge, 3000)
+        $resourceDelta = Get-ResourceDelta $resourceBefore $resourceAfter
       } finally {
         foreach ($key in $oldEnv.Keys) {
           Restore-Env $key $oldEnv[$key]
@@ -256,6 +351,9 @@ foreach ($botCount in $BotCounts) {
     gateErrLog = $gateErr
     parseError = $parseError
     bridgeError = $bridgeError
+    resourceBefore = $resourceBefore
+    resourceAfter = $resourceAfter
+    resourceDelta = $resourceDelta
   }
 
   if ($gate) {
@@ -275,6 +373,8 @@ foreach ($botCount in $BotCounts) {
     $row.failedPlayers = $gate.brokerCommandCapacity.failedPlayers
     $row.totalCommandResponses = $gate.brokerCommandCapacity.totalCommandResponses
     $row.totalCommandOwnerMatches = $gate.brokerCommandCapacity.totalCommandOwnerMatches
+    $row.commandLatencyMs = $gate.brokerCommandCapacity.commandLatencyMs
+    $row.completedCommandLatencyMs = $gate.brokerCommandCapacity.completedCommandLatencyMs
     $row.minPostSeamPath = $gate.brokerCommandCapacity.minPostSeamPath
     $row.allPostSeamCommandOk = $gate.brokerCommandCapacity.allPostSeamCommandOk
   }
