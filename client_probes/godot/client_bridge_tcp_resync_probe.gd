@@ -120,19 +120,19 @@ func _wait_until(ms: int, query_id: String, stale_id: String, fresh_id: String, 
 			return true
 	return predicate.call()
 
-func _connect_owner(host: String, port: int) -> bool:
+func _connect_owner(host: String, port: int, token: String) -> bool:
 	if not _connect_client(_owner_tcp, host, port, "owner"):
 		return false
-	_send_owner({"op":"WorkerConnect","worker_id":"godot-bridge-owner","region":"W","attributes":["physics","server"],"proto":1})
+	_send_owner({"op":"WorkerConnect","worker_id":"godot-bridge-owner","region":"W","attributes":["physics","server"],"auth_token":token,"proto":1})
 	_send_owner({"op":"Interest","center":[-2.0,0.0],"radius":200.0,"full_radius":200.0})
 	return true
 
-func _connect_viewer(host: String, port: int) -> bool:
+func _connect_viewer(host: String, port: int, token: String) -> bool:
 	_viewer_tcp = StreamPeerTCP.new()
 	_viewer_buf.clear()
 	if not _connect_client(_viewer_tcp, host, port, "viewer"):
 		return false
-	_send_viewer({"op":"WorkerConnect","worker_id":"godot-bridge-viewer","region":"OBS","attributes":["observer"],"proto":1})
+	_send_viewer({"op":"WorkerConnect","worker_id":"godot-bridge-viewer","region":"OBS","attributes":["observer"],"auth_token":token,"proto":1})
 	_send_viewer({"op":"Interest","center":[-2.0,0.0],"radius":200.0,"full_radius":200.0})
 	return true
 
@@ -179,13 +179,15 @@ func _init():
 	var port := int(_env("GW_PORT", "7811"))
 	var stale_id := _env("GW_BRIDGE_STALE_ENTITY", "godot-bridge-stale")
 	var fresh_id := _env("GW_BRIDGE_FRESH_ENTITY", "godot-bridge-fresh")
+	var owner_token := _env("GW_GODOT_OWNER_TOKEN", "godot-owner-token")
+	var obs_token := _env("GW_GODOT_OBS_TOKEN", "godot-observer-token")
 	var query_id := "godot-bridge-real-resync"
 
 	_bridge.on_transport_connecting()
-	if not _connect_owner(host, port):
+	if not _connect_owner(host, port, owner_token):
 		quit(2)
 		return
-	if not _connect_viewer(host, port):
+	if not _connect_viewer(host, port, obs_token):
 		quit(2)
 		return
 	_bridge.mark_live()
@@ -215,7 +217,7 @@ func _init():
 
 	_bridge.on_transport_connecting()
 	_bridge.begin_full_resync()
-	if not _connect_viewer(host, port):
+	if not _connect_viewer(host, port, obs_token):
 		_disconnect_all()
 		quit(2)
 		return
