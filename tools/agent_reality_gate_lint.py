@@ -35,6 +35,21 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def load_law_ids(path: Path | None) -> set[str]:
+    if path is None:
+        return set()
+    rows = load_jsonl(path)
+    ids: set[str] = set()
+    for i, row in enumerate(rows, start=1):
+        law_id = row.get("law_id")
+        if not isinstance(law_id, str) or not law_id:
+            raise SystemExit(f"{path}:{i}: law_id must be a non-empty string")
+        if law_id in ids:
+            raise SystemExit(f"{path}:{i}: duplicate law_id {law_id}")
+        ids.add(law_id)
+    return ids
+
+
 def require_keys(obj: dict[str, Any], keys: list[str], where: str) -> None:
     missing = [key for key in keys if key not in obj]
     if missing:
@@ -47,12 +62,26 @@ def require_nonempty_list(obj: dict[str, Any], key: str, where: str) -> None:
         raise SystemExit(f"{where}: {key} must be a non-empty list")
 
 
-def validate_eval_rows(rows: list[dict[str, Any]], where: str) -> None:
+def require_known_laws(obj: dict[str, Any], valid_laws: set[str], where: str) -> None:
+    require_nonempty_list(obj, "system_laws", where)
+    laws = obj["system_laws"]
+    unknown: list[str] = []
+    for law in laws:
+        if not isinstance(law, str) or not law:
+            raise SystemExit(f"{where}: system_laws entries must be non-empty strings")
+        if valid_laws and law not in valid_laws:
+            unknown.append(law)
+    if unknown:
+        raise SystemExit(f"{where}: unknown system_laws: {', '.join(unknown)}")
+
+
+def validate_eval_rows(rows: list[dict[str, Any]], valid_laws: set[str], where: str) -> None:
     seen: set[str] = set()
     required = [
         "id",
         "kind",
         "input_summary",
+        "system_laws",
         "expected_findings",
         "required_gates",
         "must_not_claim",
@@ -66,12 +95,13 @@ def validate_eval_rows(rows: list[dict[str, Any]], where: str) -> None:
         if row_id in seen:
             raise SystemExit(f"{label}: duplicate id {row_id}")
         seen.add(row_id)
+        require_known_laws(row, valid_laws, label)
         require_nonempty_list(row, "required_gates", label)
         if not isinstance(row.get("must_not_claim"), list):
             raise SystemExit(f"{label}: must_not_claim must be a list")
 
 
-def validate_trace(schema: dict[str, Any], trace: dict[str, Any], where: str) -> None:
+def validate_trace(schema: dict[str, Any], trace: dict[str, Any], valid_laws: set[str], where: str) -> None:
     required = schema.get("required")
     if not isinstance(required, list):
         raise SystemExit("schema: required must be a list")
@@ -85,6 +115,8 @@ def validate_trace(schema: dict[str, Any], trace: dict[str, Any], where: str) ->
 
     if trace.get("decision") not in {"accept", "revise", "reject", "park"}:
         raise SystemExit(f"{where}: decision must be accept, revise, reject, or park")
+
+    require_known_laws(trace, valid_laws, where)
 
     inputs = trace.get("inputs")
     if not isinstance(inputs, dict):
@@ -115,6 +147,7 @@ def validate_trace(schema: dict[str, Any], trace: dict[str, Any], where: str) ->
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--laws", type=Path)
     parser.add_argument("--schema", required=True, type=Path)
     parser.add_argument("--evals", required=True, type=Path)
     parser.add_argument("--trace", action="append", default=[], type=Path)
@@ -124,14 +157,16 @@ def main() -> None:
     if not isinstance(schema, dict):
         raise SystemExit("schema must be a JSON object")
 
+    valid_laws = load_law_ids(args.laws)
+
     eval_rows = load_jsonl(args.evals)
-    validate_eval_rows(eval_rows, str(args.evals))
+    validate_eval_rows(eval_rows, valid_laws, str(args.evals))
 
     for trace_path in args.trace:
         trace = load_json(trace_path)
         if not isinstance(trace, dict):
             raise SystemExit(f"{trace_path}: trace must be a JSON object")
-        validate_trace(schema, trace, str(trace_path))
+        validate_trace(schema, trace, valid_laws, str(trace_path))
 
     print(
         f"agent_reality_gate_lint ok: eval_cases={len(eval_rows)} "

@@ -1,5 +1,5 @@
 {
-  "trace_version": 1,
+  "trace_version": 2,
   "task_id": "gw-worker-auth-2026-06-29",
   "date": "2026-06-29",
   "agent_role": "implementation-verifier",
@@ -9,6 +9,12 @@
   },
   "intent": "Add a basic WorkerConnect authentication gate without changing the unauthenticated local-dev wire shape.",
   "invariant": "When broker auth is configured, a peer cannot register, allocate egress state, or claim region ownership unless WorkerConnect carries the matching token.",
+  "system_laws": [
+    "SYS-EXECUTION-001",
+    "SYS-CONSISTENCY-001",
+    "SYS-FAILURE-001",
+    "SYS-DATA-LIFECYCLE-001"
+  ],
   "inputs": {
     "files": [
       "src/main.rs",

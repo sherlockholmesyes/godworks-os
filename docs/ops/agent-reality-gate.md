@@ -18,6 +18,7 @@ CI validates this scaffold directly:
 
 ```bash
 python3 tools/agent_reality_gate_lint.py \
+  --laws docs/ops/system-laws.jsonl \
   --schema docs/ops/agent-trace.schema.json \
   --evals docs/ops/agent-eval-cases.jsonl \
   --trace docs/ops/examples/agent-trace.example.json
@@ -34,6 +35,7 @@ an explicit reality gate on that change.
 Every material agent contribution should have a trace:
 
 - the task and intended invariant;
+- the system law IDs touched by that invariant;
 - the agent role;
 - the prompt or skill versions if known;
 - the files or subsystems inspected;
@@ -74,6 +76,7 @@ The first eval set focuses on failure classes already relevant to this runtime:
 - `docs/ops/agent-trace.schema.json` defines the trace shape.
 - `docs/ops/agent-eval-cases.jsonl` contains the first eval cases.
 - `docs/ops/examples/agent-trace.example.json` is a filled example.
+- `docs/ops/system-laws.jsonl` defines the accepted law IDs.
 - `tools/agent_reality_gate_lint.py` validates the scaffold without external
   dependencies.
 
@@ -81,6 +84,7 @@ Run:
 
 ```bash
 python tools/agent_reality_gate_lint.py \
+  --laws docs/ops/system-laws.jsonl \
   --schema docs/ops/agent-trace.schema.json \
   --evals docs/ops/agent-eval-cases.jsonl \
   --trace docs/ops/examples/agent-trace.example.json

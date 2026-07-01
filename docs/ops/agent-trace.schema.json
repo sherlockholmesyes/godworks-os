@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "required": [
     "trace_version",
     "task_id",
@@ -8,6 +8,7 @@
     "repo_ref",
     "intent",
     "invariant",
+    "system_laws",
     "inputs",
     "actions",
     "verification",
@@ -22,6 +23,7 @@
     "prompt_versions": "object",
     "intent": "string",
     "invariant": "string",
+    "system_laws": "array<string>",
     "inputs": {
       "files": "array<string>",
       "notes": "array<string>"
