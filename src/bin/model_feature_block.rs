@@ -52,14 +52,14 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 6 {
         eprintln!(
-            "usage: model_feature_block <replay|reality-loadgen> <path> <project_id> <dataset_id> <trace_id>"
+            "usage: model_feature_block <replay|reality-loadgen|agar-live-gate> <path> <project_id> <dataset_id> <trace_id>"
         );
         process::exit(2);
     }
 
     let mode = &args[1];
     let path = &args[2];
-    let content = match fs::read_to_string(path) {
+    let content = match read_text_artifact(path) {
         Ok(content) => content,
         Err(err) => {
             eprintln!("failed to read '{path}': {err}");
@@ -76,8 +76,9 @@ fn main() {
     let blocks = match mode.as_str() {
         "replay" => build_replay_feature_blocks(&content, &cfg),
         "reality-loadgen" => build_reality_loadgen_feature_blocks(&content, &cfg),
+        "agar-live-gate" => build_agar_live_gate_feature_blocks(&content, &cfg),
         _ => Err(format!(
-            "unknown mode '{mode}', expected replay or reality-loadgen"
+            "unknown mode '{mode}', expected replay, reality-loadgen, or agar-live-gate"
         )),
     };
 
@@ -92,6 +93,38 @@ fn main() {
     for block in blocks {
         println!("{}", block_to_json(&block));
     }
+}
+
+fn read_text_artifact(path: &str) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|err| err.to_string())?;
+    decode_text_artifact_bytes(&bytes)
+}
+
+fn decode_text_artifact_bytes(bytes: &[u8]) -> Result<String, String> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(bytes[3..].to_vec()).map_err(|err| err.to_string());
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16_artifact(&bytes[2..], false);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16_artifact(&bytes[2..], true);
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|err| err.to_string())
+}
+
+fn decode_utf16_artifact(bytes: &[u8], big_endian: bool) -> Result<String, String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err("UTF-16 artifact has an odd byte length".to_string());
+    }
+    let units = bytes.chunks_exact(2).map(|chunk| {
+        if big_endian {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from_le_bytes([chunk[0], chunk[1]])
+        }
+    });
+    String::from_utf16(&units.collect::<Vec<_>>()).map_err(|err| err.to_string())
 }
 
 fn build_replay_feature_blocks(
@@ -326,6 +359,54 @@ fn build_reality_loadgen_feature_blocks(
     validate_blocks(vec![outcome, handoff])
 }
 
+fn build_agar_live_gate_feature_blocks(
+    content: &str,
+    cfg: &FeatureBuildConfig,
+) -> Result<Vec<ModelFeatureBlock>, String> {
+    let artifact = serde_json::from_str::<Value>(content.trim_start_matches('\u{feff}').trim())
+        .map_err(|err| format!("invalid agar live gate json: {err}"))?;
+    reject_forbidden_source_keys(&artifact, 1, "$")?;
+    if artifact.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("agar live gate artifact is not ok".to_string());
+    }
+
+    let family = agar_gate_family(&artifact);
+    let mut outcome = ModelFeatureBlock::new(ModelFeatureBlockKind::Outcome, cfg.provenance())
+        .with_metric("ok", 1.0)
+        .with_dimension("artifact_kind", "agar_live_gate")
+        .with_dimension("gate_family", family);
+
+    if let Some(bytes) = json_number_at(&artifact, &["wal", "bytes"]) {
+        outcome = outcome.with_metric("wal_bytes", bytes);
+    }
+    if let Some(entities) = json_number_at(&artifact, &["brokerView", "entities"]) {
+        outcome = outcome.with_metric("broker_view_entities", entities);
+    }
+    if let Some(security) = artifact.get("security").and_then(Value::as_object) {
+        outcome = outcome.with_metric(
+            "security_checks",
+            security
+                .values()
+                .filter(|value| value.as_bool() == Some(true))
+                .count() as f64,
+        );
+    }
+
+    let mut blocks = vec![outcome];
+
+    if let Some(entity_density) = agar_entity_density_block(&artifact, cfg, family) {
+        blocks.push(entity_density);
+    }
+    if let Some(worker_load) = agar_worker_load_block(&artifact, cfg, family)? {
+        blocks.push(worker_load);
+    }
+    if let Some(handoff) = agar_handoff_block(&artifact, cfg, family) {
+        blocks.push(handoff);
+    }
+
+    validate_blocks(blocks)
+}
+
 fn parse_key_value_line(line: &str) -> BTreeMap<String, String> {
     line.split_whitespace()
         .filter_map(|part| {
@@ -347,6 +428,180 @@ fn parse_metric(fields: &BTreeMap<String, String>, key: &str) -> Result<f64, Str
     value
         .parse::<f64>()
         .map_err(|err| format!("invalid numeric reality_loadgen field {key}: {err}"))
+}
+
+fn agar_gate_family(artifact: &Value) -> &'static str {
+    if artifact.get("monitor").is_some() {
+        "mit_clone_adapter"
+    } else {
+        "godworks_agar_v2"
+    }
+}
+
+fn agar_entity_density_block(
+    artifact: &Value,
+    cfg: &FeatureBuildConfig,
+    family: &str,
+) -> Option<ModelFeatureBlock> {
+    let live_entities = json_number_at(artifact, &["monitor", "entities"])
+        .or_else(|| json_number_at(artifact, &["max_entities"]))?;
+    let mut block = ModelFeatureBlock::new(ModelFeatureBlockKind::EntityDensity, cfg.provenance())
+        .with_metric("live_entities", live_entities)
+        .with_dimension("artifact_kind", "agar_live_gate")
+        .with_dimension("gate_family", family);
+
+    for (path, metric) in [
+        (&["monitor", "players"][..], "live_players"),
+        (&["samples"][..], "samples"),
+        (&["max_owners"][..], "max_owners"),
+        (&["player_owner_count"][..], "player_owner_count"),
+        (&["unknown_owner_frames"][..], "unknown_owner_frames"),
+        (&["duplicate_frames"][..], "duplicate_frames"),
+    ] {
+        if let Some(value) = json_number_at(artifact, path) {
+            block = block.with_metric(metric, value);
+        }
+    }
+
+    Some(block)
+}
+
+fn agar_worker_load_block(
+    artifact: &Value,
+    cfg: &FeatureBuildConfig,
+    family: &str,
+) -> Result<Option<ModelFeatureBlock>, String> {
+    let Some(loads) = json_number_array_at(artifact, &["monitor", "loads"])? else {
+        return Ok(None);
+    };
+    if loads.is_empty() {
+        return Ok(None);
+    }
+    let sum: f64 = loads.iter().sum();
+    let mean = sum / loads.len() as f64;
+    let min = loads.iter().copied().fold(f64::INFINITY, f64::min);
+    let peak = loads.iter().copied().fold(0.0, f64::max);
+    let mut block = ModelFeatureBlock::new(ModelFeatureBlockKind::WorkerLoad, cfg.provenance())
+        .with_metric("worker_count", loads.len() as f64)
+        .with_metric("load_mean", mean)
+        .with_metric("load_min", min)
+        .with_metric("load_peak", peak)
+        .with_dimension("artifact_kind", "agar_live_gate")
+        .with_dimension("gate_family", family);
+
+    for (path, metric) in [
+        (&["monitor", "rebalanceCount"][..], "rebalance_count"),
+        (
+            &["monitor", "dynamicWidthClasses"][..],
+            "dynamic_width_classes",
+        ),
+        (
+            &["monitor", "dynamicHeightClasses"][..],
+            "dynamic_height_classes",
+        ),
+    ] {
+        if let Some(value) = json_number_at(artifact, path) {
+            block = block.with_metric(metric, value);
+        }
+    }
+
+    Ok(Some(block))
+}
+
+fn agar_handoff_block(
+    artifact: &Value,
+    cfg: &FeatureBuildConfig,
+    family: &str,
+) -> Option<ModelFeatureBlock> {
+    let has_handoff_metrics = artifact.get("observed_owner_changes").is_some()
+        || artifact.get("player_owner_count").is_some()
+        || artifact
+            .get("brokerView")
+            .and_then(Value::as_object)
+            .is_some();
+    if !has_handoff_metrics {
+        return None;
+    }
+
+    let mut block =
+        ModelFeatureBlock::new(ModelFeatureBlockKind::HandoffPressure, cfg.provenance())
+            .with_dimension("artifact_kind", "agar_live_gate")
+            .with_dimension("gate_family", family);
+
+    for (path, metric) in [
+        (&["observed_owner_changes"][..], "observed_owner_changes"),
+        (&["player_owner_count"][..], "player_owner_count"),
+        (&["player_path"][..], "player_path"),
+        (&["player_max_displacement"][..], "player_max_displacement"),
+        (&["client_truth_matches"][..], "client_truth_matches"),
+        (&["client_truth_mismatches"][..], "client_truth_mismatches"),
+        (
+            &["probe_max_missing_before_handoff_streak"][..],
+            "probe_max_missing_before_handoff_streak",
+        ),
+        (&["brokerView", "entities"][..], "broker_view_entities"),
+    ] {
+        if let Some(value) = json_number_at(artifact, path) {
+            block = block.with_metric(metric, value);
+        }
+    }
+    for (path, metric) in [
+        (&["initial_command_ok"][..], "initial_command_ok"),
+        (
+            &["command_after_handoff_ok"][..],
+            "command_after_handoff_ok",
+        ),
+    ] {
+        if let Some(value) = json_bool_at(artifact, path) {
+            block = block.with_metric(metric, if value { 1.0 } else { 0.0 });
+        }
+    }
+    if let Some(owners) = artifact
+        .get("brokerView")
+        .and_then(|view| view.get("owners"))
+        .and_then(Value::as_array)
+    {
+        block = block.with_metric("broker_owner_count", owners.len() as f64);
+    }
+
+    (!block.metrics.is_empty()).then_some(block)
+}
+
+fn json_number_at(value: &Value, path: &[&str]) -> Option<f64> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    cursor.as_f64()
+}
+
+fn json_bool_at(value: &Value, path: &[&str]) -> Option<bool> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    cursor.as_bool()
+}
+
+fn json_number_array_at(value: &Value, path: &[&str]) -> Result<Option<Vec<f64>>, String> {
+    let mut cursor = value;
+    for key in path {
+        let Some(next) = cursor.get(*key) else {
+            return Ok(None);
+        };
+        cursor = next;
+    }
+    let Some(items) = cursor.as_array() else {
+        return Err(format!("expected numeric array at {}", path.join(".")));
+    };
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(value) = item.as_f64() else {
+            return Err(format!("expected numeric value at {}", path.join(".")));
+        };
+        values.push(value);
+    }
+    Ok(Some(values))
 }
 
 fn validate_blocks(blocks: Vec<ModelFeatureBlock>) -> Result<Vec<ModelFeatureBlock>, String> {
@@ -415,6 +670,19 @@ mod tests {
     }
 
     #[test]
+    fn text_artifact_decoder_accepts_powershell_utf16_json() {
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "{\"ok\":true}\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        assert_eq!(
+            decode_text_artifact_bytes(&bytes).unwrap(),
+            "{\"ok\":true}\n"
+        );
+    }
+
+    #[test]
     fn replay_builder_emits_valid_redacted_feature_blocks() {
         let tape = r#"
 {"kind":"broker_ingress","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"strip1d","boundary_count":1},"outcome":"dispatched","durable_gen":1,"pending_gen":1,"op_summary":{"op":"UpdateComponent","wire_bytes":96}}
@@ -469,5 +737,93 @@ mod tests {
 
         let err = build_reality_loadgen_feature_blocks(output, &cfg()).unwrap_err();
         assert!(err.contains("NonFiniteMetric"));
+    }
+
+    #[test]
+    fn agar_live_gate_builder_emits_valid_mit_clone_blocks() {
+        let output = r#"{
+          "ok": true,
+          "game": "http://127.0.0.1:3000/",
+          "monitor": {
+            "entities": 1081,
+            "players": 32,
+            "rebalanceCount": 0,
+            "loads": [81,90,86,97],
+            "dynamicWidthClasses": 4,
+            "dynamicHeightClasses": 13
+          },
+          "brokerView": {
+            "entities": 34,
+            "owners": ["mit-Z3_3","mit-Z1_2","mit-Z2_3"]
+          },
+          "wal": {
+            "path": "C:\\local\\mirror.wal",
+            "bytes": 30656189
+          }
+        }"#;
+        let blocks = build_agar_live_gate_feature_blocks(output, &cfg()).unwrap();
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].kind, ModelFeatureBlockKind::Outcome);
+        assert_eq!(blocks[1].kind, ModelFeatureBlockKind::EntityDensity);
+        assert_eq!(blocks[2].kind, ModelFeatureBlockKind::WorkerLoad);
+        assert_eq!(blocks[3].kind, ModelFeatureBlockKind::HandoffPressure);
+        assert_eq!(blocks[0].metrics["wal_bytes"], 30656189.0);
+        assert_eq!(blocks[1].metrics["live_entities"], 1081.0);
+        assert_eq!(blocks[2].metrics["load_peak"], 97.0);
+        assert_eq!(blocks[3].metrics["broker_owner_count"], 3.0);
+        for block in blocks {
+            assert_eq!(block.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn agar_live_gate_builder_emits_valid_godworks_agar_v2_blocks() {
+        let output = r#"{
+          "ok": true,
+          "samples": 90,
+          "max_entities": 180,
+          "max_owners": 16,
+          "unknown_owner_frames": 0,
+          "duplicate_frames": 0,
+          "player_owner_count": 3,
+          "observed_owner_changes": 2,
+          "player_path": 55.5,
+          "player_max_displacement": 44.0,
+          "client_truth_matches": 40,
+          "client_truth_mismatches": 0,
+          "probe_max_missing_before_handoff_streak": 0,
+          "initial_command_ok": true,
+          "command_after_handoff_ok": true,
+          "security": {
+            "peer_declared_mesh_rejected": true,
+            "wrong_claim_mesh_rejected": true
+          }
+        }"#;
+        let blocks = build_agar_live_gate_feature_blocks(output, &cfg()).unwrap();
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].kind, ModelFeatureBlockKind::Outcome);
+        assert_eq!(blocks[1].kind, ModelFeatureBlockKind::EntityDensity);
+        assert_eq!(blocks[2].kind, ModelFeatureBlockKind::HandoffPressure);
+        assert_eq!(blocks[0].metrics["security_checks"], 2.0);
+        assert_eq!(blocks[1].metrics["live_entities"], 180.0);
+        assert_eq!(blocks[2].metrics["command_after_handoff_ok"], 1.0);
+        for block in blocks {
+            assert_eq!(block.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn agar_live_gate_builder_rejects_failed_gate_or_raw_payload() {
+        let failed = r#"{"ok":false,"monitor":{"entities":100,"players":2}}"#;
+        assert!(build_agar_live_gate_feature_blocks(failed, &cfg())
+            .unwrap_err()
+            .contains("not ok"));
+
+        let raw = r#"{"ok":true,"max_entities":10,"payload":{"raw":true}}"#;
+        assert!(build_agar_live_gate_feature_blocks(raw, &cfg())
+            .unwrap_err()
+            .contains("forbidden raw source key"));
     }
 }

@@ -46,13 +46,21 @@ cargo run --bin model_feature_block -- replay \
 cargo run --bin model_feature_block -- reality-loadgen \
   .local/reality_loadgen.out \
   arena rlg-dataset-v1 trace-rlg
+
+cargo run --bin model_feature_block -- agar-live-gate \
+  .local/agar_mit_clone_logs/agar-live-gate.json \
+  arena agar-live-dataset-v1 trace-agar-live
 ```
 
 Replay input produces `IngressRejectCost` and `HandoffPressure` blocks.
-`reality_loadgen` output produces `Outcome` and `HandoffPressure` blocks. The
-builder rejects source replay artifacts that still contain raw redacted keys
-such as `auth_token`, `payload`, `components`, or `updates`, and it rejects
-non-finite numeric metrics before they can enter a dataset.
+`reality_loadgen` output produces `Outcome` and `HandoffPressure` blocks.
+`agar-live-gate` output produces validated `Outcome`, `EntityDensity`, optional
+`WorkerLoad`, and optional `HandoffPressure` blocks from the live Agar gate
+summaries without copying raw WAL paths, component bodies, payloads, or tokens
+into model-plane data. The builder rejects source replay artifacts that still
+contain raw redacted keys such as `auth_token`, `payload`, `components`, or
+`updates`, failed Agar gates (`ok:false`), and non-finite numeric metrics before
+they can enter a dataset.
 
 Allowed action kinds are proposal-only:
 
@@ -104,12 +112,14 @@ cargo test -p godworks-core model_feature_block_rejects_raw_secret_or_payload_sh
 cargo test -p godworks-core model_feature_block_contract_pins_project_local_provenance
 cargo test --bin model_feature_block replay_builder -- --test-threads=1
 cargo test --bin model_feature_block reality_loadgen_builder -- --test-threads=1
+cargo test --bin model_feature_block agar_live_gate_builder -- --test-threads=1
 cargo test -p godworks-core model_action_contract_rejects_direct_runtime_mutation
 cargo test -p godworks-core model_action_proposal_requires_provenance_and_guarded_validator
 ```
 
 These tests should fail if feature blocks accept unredacted/raw runtime bodies,
 non-finite metrics, missing project-local provenance, raw replay source keys, or
-unvalidated `reality_loadgen` metrics; if the public model action vocabulary
-starts accepting direct runtime mutations; or if guarded proposals can be
-emitted without validator provenance.
+unvalidated `reality_loadgen`/Agar live-gate metrics; if a failed live game gate
+can enter the dataset as a success; if the public model action vocabulary starts
+accepting direct runtime mutations; or if guarded proposals can be emitted
+without validator provenance.
