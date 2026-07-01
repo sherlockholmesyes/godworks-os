@@ -58,6 +58,35 @@ Run a broker-command stress ladder:
 
 Use `-StopExisting` when an old local demo owns the same ports.
 
+## Promoted Artifact Map
+
+This directory is the public-clean promotion of the local MIT-clone prototype.
+It carries the Godworks adapter, monitors, and gates; it does not vendor the
+clone source or `node_modules`.
+
+| Prototype role | Public artifact |
+| --- | --- |
+| Stock playable clone | Cloned on demand into `.local/agar_mit_clone` by `run_mit_clone_adapter.ps1` |
+| Spectator feed tap | `_gw_spectator_tap.js` |
+| Bot/player load | `_gw_bots.js` |
+| Dynamic 4x4 / 100x100 live shard monitor on `:8091` | `gw_shard_monitor.js` |
+| Old D2/D3 mirror worker | Superseded by `gw_agar_mirror_worker.js`, one TCP connection per worker region |
+| Old broker-view prototype tool | Superseded by `gw_broker_view.js` on `:8092` |
+| Playable seam proof | `gw_agar_playable_seam_gate.js` |
+| Broker-routed command proof | `gw_agar_broker_command_gate.js` |
+| Multi-player broker-command capacity proof | `gw_agar_broker_command_capacity_gate.js` |
+| Capacity floor proof | `gw_agar_capacity_gate.js` |
+| Old D3 runner | Superseded by `run_mit_clone_adapter.ps1 -MirrorBroker ...` |
+| Stress evidence | `run_mit_clone_stress_ladder.ps1` plus `tests/fixtures/agar_mit_clone/ladder_40_200_telemetry.json` |
+
+The older prototype shape tried to claim several regions through one
+`WorkerConnect` connection. Current public Godworks uses one
+`WorkerConnect.region` per TCP connection, so the supported mirror starts one
+worker process per grid cell. That is noisier operationally but cleaner as a
+public product claim: the broker sees ordinary workers, authority moves through
+the normal handoff path, and the gates cannot pass by relying on a private
+multi-region shortcut.
+
 ## What This Proves
 
 - The real MIT game remains playable on `:3000`.
@@ -131,8 +160,10 @@ gameplay. `-RunBrokerCommandCapacityGate` strengthens that proof to several
 controlled players under live bot load, but the stock clone still owns its food,
 collision, split/eat, and rendering ecology.
 
-The current public protocol uses one `WorkerConnect.region` per TCP connection.
-The old scratchpad D3 multi-region worker harness is therefore not copied as a
-product claim here. Broker-side dynamic rebalance needs a typed multi-region or
-partition-map activation contract before it should be advertised from this
-example.
+Public demo claim: this is a playable MIT agar clone plus Godworks live
+sharding, mirror ownership, and broker-routed controlled-player seam gates. It
+is not yet a claim that the entire MIT clone server has been replaced by
+Godworks-authoritative gameplay. The stock clone still owns food, collision,
+eating, splitting, and rendering ecology. Godworks owns the adapter proof:
+dynamic map partitioning, mirror ownership, broker command routing for selected
+players, and measured local floor gates.
