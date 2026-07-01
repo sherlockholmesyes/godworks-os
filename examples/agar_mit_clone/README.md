@@ -38,6 +38,12 @@ Run the broker-command seam gate:
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandGate
 ```
 
+Run the broker-command capacity gate:
+
+```powershell
+.\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandCapacityGate -CommandPlayers 4 -BotCount 40 -StopExisting
+```
+
 Run the capacity floor gate:
 
 ```powershell
@@ -72,6 +78,12 @@ Use `-StopExisting` when an old local demo owns the same ports.
   to the current `pos` authority owner, the mirror worker must forward the
   command to the bridge, and the gate requires accepted `CommandResponse` frames
   before and after a Godworks ownership seam.
+- `-RunBrokerCommandCapacityGate` starts multiple controlled stock-clone player
+  sockets behind the same local command bridge and requires each selected player
+  to move only through broker `CommandRequest` frames while the normal bot load
+  keeps the live game populated. It combines the aggregate capacity floor with
+  per-controlled-player owner/block changes, post-seam command ACKs, and
+  selected-player survival checks.
 - `-RunCapacityGate` samples the live `:8091` dynamic monitor for a sustained
   window and optionally samples the `:8092` broker mirror. By default it requires
   at least 30 players, 800 live entities, 16 worker load slots, 8 good samples,
@@ -92,7 +104,9 @@ clone still receives the probe movement command directly through its normal
 Socket.IO input. Use `-RunBrokerCommandGate` for the stronger command-routing
 proof. That proof is still limited to one controlled stock-clone player; it does
 not claim the whole MIT clone server has been replaced by Godworks-authoritative
-gameplay.
+gameplay. `-RunBrokerCommandCapacityGate` strengthens that proof to several
+controlled players under live bot load, but the stock clone still owns its food,
+collision, split/eat, and rendering ecology.
 
 The current public protocol uses one `WorkerConnect.region` per TCP connection.
 The old scratchpad D3 multi-region worker harness is therefore not copied as a

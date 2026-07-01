@@ -9,7 +9,16 @@ use godworks_core::{
 };
 use serde_json::{json, Value};
 
-const FORBIDDEN_SOURCE_KEYS: &[&str] = &["auth_token", "value", "payload", "components", "updates"];
+const FORBIDDEN_SOURCE_KEYS: &[&str] = &[
+    "auth_token",
+    "value",
+    "payload",
+    "components",
+    "updates",
+    "lastCommand",
+    "lastTarget",
+    "target",
+];
 
 #[derive(Clone, Debug)]
 struct FeatureBuildConfig {
@@ -447,6 +456,7 @@ fn agar_gate_family(artifact: &Value) -> &'static str {
     if artifact.get("monitor").is_some()
         || artifact.get("playableSeam").is_some()
         || artifact.get("brokerCommand").is_some()
+        || artifact.get("brokerCommandCapacity").is_some()
     {
         "mit_clone_adapter"
     } else {
@@ -547,6 +557,7 @@ fn agar_handoff_block(
         || artifact.get("player_owner_count").is_some()
         || artifact.get("playableSeam").is_some()
         || artifact.get("brokerCommand").is_some()
+        || artifact.get("brokerCommandCapacity").is_some()
         || artifact
             .get("brokerView")
             .and_then(Value::as_object)
@@ -602,6 +613,50 @@ fn agar_handoff_block(
             "broker_command_bridge_count",
         ),
         (
+            &["brokerCommandCapacity", "controlledPlayers"][..],
+            "broker_command_controlled_players",
+        ),
+        (
+            &["brokerCommandCapacity", "completedPlayers"][..],
+            "broker_command_completed_players",
+        ),
+        (
+            &["brokerCommandCapacity", "minCommandResponses"][..],
+            "broker_command_min_responses",
+        ),
+        (
+            &["brokerCommandCapacity", "totalCommandResponses"][..],
+            "broker_command_total_responses",
+        ),
+        (
+            &["brokerCommandCapacity", "totalCommandOwnerMatches"][..],
+            "broker_command_total_owner_matches",
+        ),
+        (
+            &["brokerCommandCapacity", "minOwnerChanges"][..],
+            "broker_command_min_owner_changes",
+        ),
+        (
+            &["brokerCommandCapacity", "maxOwnerChanges"][..],
+            "broker_command_max_owner_changes",
+        ),
+        (
+            &["brokerCommandCapacity", "minBlockChanges"][..],
+            "broker_command_min_block_changes",
+        ),
+        (
+            &["brokerCommandCapacity", "maxBlockChanges"][..],
+            "broker_command_max_block_changes",
+        ),
+        (
+            &["brokerCommandCapacity", "minPath"][..],
+            "broker_command_min_path",
+        ),
+        (
+            &["brokerCommandCapacity", "minPostSeamPath"][..],
+            "broker_command_min_post_seam_path",
+        ),
+        (
             &["probe_max_missing_before_handoff_streak"][..],
             "probe_max_missing_before_handoff_streak",
         ),
@@ -626,6 +681,10 @@ fn agar_handoff_block(
         (
             &["playableSeam", "brokerMirrorMatched"][..],
             "broker_mirror_matched",
+        ),
+        (
+            &["brokerCommandCapacity", "allPostSeamCommandOk"][..],
+            "broker_command_all_post_seam_ok",
         ),
     ] {
         if let Some(value) = json_bool_at(artifact, path) {
@@ -1064,6 +1123,99 @@ mod tests {
     }
 
     #[test]
+    fn agar_live_gate_builder_emits_valid_broker_command_capacity_blocks() {
+        let output = r#"{
+          "ok": true,
+          "gate": "mit_clone_broker_command_capacity",
+          "monitor": {
+            "entities": 1130,
+            "players": 42,
+            "rebalanceCount": 8,
+            "loads": [71,72,70,73],
+            "dynamicWidthClasses": 4,
+            "dynamicHeightClasses": 11
+          },
+          "capacity": {
+            "samples": 18,
+            "okSamples": 16,
+            "durationMs": 21000,
+            "entitiesMin": 1010,
+            "entitiesMax": 1130,
+            "entitiesMean": 1080.5,
+            "playersMin": 38,
+            "playersMax": 42,
+            "playersMean": 40.2,
+            "workersMin": 16,
+            "workersMax": 16,
+            "loadMeanMin": 62.1,
+            "loadMeanMax": 72.25,
+            "loadPeakMin": 81,
+            "loadPeakMax": 99,
+            "loadPeakToMeanMax": 1.37,
+            "rebalanceStart": 7,
+            "rebalanceEnd": 8,
+            "rebalanceDelta": 1
+          },
+          "brokerView": {
+            "samples": 18,
+            "entitiesMax": 44,
+            "ownerCountMax": 16,
+            "mitOwnerCountMax": 16
+          },
+          "brokerCommandCapacity": {
+            "controlledPlayers": 4,
+            "completedPlayers": 4,
+            "minCommandResponses": 5,
+            "totalCommandResponses": 27,
+            "totalCommandOwnerMatches": 27,
+            "minOwnerChanges": 1,
+            "maxOwnerChanges": 2,
+            "minBlockChanges": 1,
+            "maxBlockChanges": 3,
+            "minPath": 147.5,
+            "minPostSeamPath": 22.0,
+            "allPostSeamCommandOk": true,
+            "players": [
+              {
+                "entity": "sock-1:0",
+                "socketId": "sock-1",
+                "ownerChanges": 1,
+                "blockChanges": 1,
+                "path": 211.0,
+                "postSeamPath": 22.0,
+                "commandResponses": 5,
+                "commandOwnerMatches": 5
+              }
+            ]
+          }
+        }"#;
+        let blocks = build_agar_live_gate_feature_blocks(output, &cfg()).unwrap();
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].kind, ModelFeatureBlockKind::Outcome);
+        assert_eq!(blocks[1].kind, ModelFeatureBlockKind::EntityDensity);
+        assert_eq!(blocks[2].kind, ModelFeatureBlockKind::WorkerLoad);
+        assert_eq!(blocks[3].kind, ModelFeatureBlockKind::HandoffPressure);
+        assert_eq!(blocks[0].dimensions["gate_family"], "mit_clone_adapter");
+        assert_eq!(blocks[0].metrics["capacity_ok_samples"], 16.0);
+        assert_eq!(blocks[1].metrics["capacity_players_mean"], 40.2);
+        assert_eq!(blocks[2].metrics["capacity_workers_min"], 16.0);
+        assert_eq!(blocks[3].metrics["broker_command_controlled_players"], 4.0);
+        assert_eq!(blocks[3].metrics["broker_command_completed_players"], 4.0);
+        assert_eq!(blocks[3].metrics["broker_command_min_responses"], 5.0);
+        assert_eq!(
+            blocks[3].metrics["broker_command_total_owner_matches"],
+            27.0
+        );
+        assert_eq!(blocks[3].metrics["broker_command_min_owner_changes"], 1.0);
+        assert_eq!(blocks[3].metrics["broker_command_min_post_seam_path"], 22.0);
+        assert_eq!(blocks[3].metrics["broker_command_all_post_seam_ok"], 1.0);
+        for block in blocks {
+            assert_eq!(block.validate(), Ok(()));
+        }
+    }
+
+    #[test]
     fn agar_live_gate_builder_rejects_failed_gate_or_raw_payload() {
         let failed = r#"{"ok":false,"monitor":{"entities":100,"players":2}}"#;
         assert!(build_agar_live_gate_feature_blocks(failed, &cfg())
@@ -1072,6 +1224,11 @@ mod tests {
 
         let raw = r#"{"ok":true,"max_entities":10,"payload":{"raw":true}}"#;
         assert!(build_agar_live_gate_feature_blocks(raw, &cfg())
+            .unwrap_err()
+            .contains("forbidden raw source key"));
+
+        let raw_command = r#"{"ok":true,"max_entities":10,"brokerCommandCapacity":{"lastCommand":{"target":{"x":1,"y":2}}}}"#;
+        assert!(build_agar_live_gate_feature_blocks(raw_command, &cfg())
             .unwrap_err()
             .contains("forbidden raw source key"));
     }

@@ -60,18 +60,20 @@ summaries. This includes the MIT-clone playable seam gate and broker-command
 gate: a real player joins the stock clone, crosses dynamic shard blocks in the
 `:8091` monitor, the stronger gate drives one controlled player through broker
 `CommandRequest` frames with accepted pre/post-seam `CommandResponse` frames
-from the current `:8092` Godworks owner, and the capacity gate records a
-sustained local floor from the same live monitor. Those summaries can feed
-future per-project load/micro-balancer datasets as redacted facts such as entity
-density, worker load, shard-block changes, owner changes, post-seam movement,
-command-response count, owner-match count, sustained player/entity floors, and
-load peak/mean pressure.
+from the current `:8092` Godworks owner, the broker-command capacity gate
+requires several controlled players to satisfy the same broker-routed seam proof
+under live bot load, and the capacity gate records a sustained local floor from
+the same live monitor. Those summaries can feed future per-project
+load/micro-balancer datasets as redacted facts such as entity density, worker
+load, shard-block changes, owner changes, post-seam movement, controlled-player
+completion count, command-response count, owner-match count, sustained
+player/entity floors, and load peak/mean pressure.
 
-The builder does not copy raw WAL paths, component bodies, payloads, or tokens
-into model-plane data. It rejects source replay artifacts that still contain raw
-redacted keys such as `auth_token`, `payload`, `components`, or `updates`,
-failed Agar gates (`ok:false`), and non-finite numeric metrics before they can
-enter a dataset.
+The builder does not copy raw WAL paths, component bodies, payloads, command
+targets, or tokens into model-plane data. It rejects source replay artifacts that
+still contain raw redacted keys such as `auth_token`, `payload`, `components`,
+`updates`, `lastCommand`, `lastTarget`, or `target`, failed Agar gates
+(`ok:false`), and non-finite numeric metrics before they can enter a dataset.
 
 Allowed action kinds are proposal-only:
 
