@@ -38,9 +38,19 @@ this versioned partition map, because mesh discovery and remote-link lifecycle
 do not currently advance `partition_map_version`. A future mesh-topology
 contract should carry its own provenance instead of hiding inside this one.
 
-The protocol crate exposes typed `SnapshotManifest` accessors for those fields
-and a current-version check. The JSON wire shape stays lossless and unchanged;
-typed consumers no longer need to hand-parse the artifact contract.
+The protocol crate exposes two layers for `SnapshotManifest`:
+
+- lossless JSON fields plus partial typed accessors for debugging and
+  compatibility inspection;
+- `SnapshotManifest::contract()` as the validated restore-artifact view.
+
+`contract()` requires current schema versions, a `wal_offset`, cut summary
+counts (`entity_count`, `pending_mesh`), strict `in_flight` consistency, a valid
+`spatial_schema`, and a strict `partition_map` whose embedded version/schema
+matches the manifest's top-level version/schema. Optional labels/telemetry such
+as `request_id`, `snapshot_id`, `broker_id`, and `t_server` are preserved when
+present. `authority_hash` is optional, but must be well-formed when present.
+None of these checks change the lossless wire shape.
 
 `component_registry_version = 1` means the cut can be interpreted against the
 built-in registry in `godworks-core`; it does not mean unknown project-specific
@@ -72,6 +82,7 @@ snapshot_manifest_carries_spatial_schema_contract
 snapshot_manifest_carries_strip_partition_map_contract
 snapshot_manifest_contract_accessors_match_current_wire_shape
 snapshot_manifest_contract_rejects_future_versions
+snapshot_manifest_contract_requires_wal_offset
 snapshot_vector_restores_in_flight_mesh_handoff_exactly_once
 ```
 

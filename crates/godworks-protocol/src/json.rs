@@ -900,6 +900,8 @@ mod tests {
             "entity_count": 3,
             "pending_mesh": 1,
             "authority_hash": "12345",
+            "in_flight": [{ "entity": "node-2", "target": "E", "type": "MeshHandoff" }],
+            "t_server": 9001,
             "snapshot_manifest_version": 1,
             "snapshot_schema_version": 1,
             "spatial_schema_version": 1,
@@ -949,6 +951,105 @@ mod tests {
                 crate::PartitionMapSpec::grid2d(3, 2, 10.0, 20.0, [0.0, 0.0]).unwrap()
             ))
         );
+
+        let contract = manifest.contract().expect("valid current manifest");
+        assert_eq!(contract.request_id.as_deref(), Some("snap-1"));
+        assert_eq!(contract.snapshot_id.as_deref(), Some("s-1"));
+        assert_eq!(contract.broker_id.as_deref(), Some("broker-a"));
+        assert_eq!(contract.wal_offset, 2048);
+        assert_eq!(contract.entity_count, 3);
+        assert_eq!(contract.pending_mesh, 1);
+        assert_eq!(contract.authority_hash.as_deref(), Some("12345"));
+        assert_eq!(
+            contract.in_flight,
+            vec![crate::SnapshotInFlightHandoff {
+                entity: "node-2".to_string(),
+                target: "E".to_string()
+            }]
+        );
+        assert_eq!(contract.t_server, Some(9001));
+        assert_eq!(
+            contract.spatial_schema,
+            SpatialSchema::current_2d(PartitionSchema::Grid2D { cols: 3, rows: 2 })
+        );
+        assert_eq!(
+            contract.partition_map,
+            crate::VersionedPartitionMap::new(
+                7,
+                crate::PartitionMapSpec::grid2d(3, 2, 10.0, 20.0, [0.0, 0.0]).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_accepts_missing_t_server() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "entity_count": 1,
+            "pending_mesh": 0,
+            "in_flight": [],
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "strip1d",
+                "boundaries": [0.0],
+                "splits": []
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        let contract = manifest.contract().expect("t_server is optional telemetry");
+        assert_eq!(contract.t_server, None);
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_preserves_t_server_when_present() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "entity_count": 1,
+            "pending_mesh": 0,
+            "in_flight": [],
+            "t_server": 123,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "strip1d",
+                "boundaries": [0.0],
+                "splits": []
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        let contract = manifest.contract().expect("valid current manifest");
+        assert_eq!(contract.t_server, Some(123));
     }
 
     #[test]
@@ -975,6 +1076,7 @@ mod tests {
 
         assert_eq!(manifest.spatial_schema(), None);
         assert!(manifest.has_current_versions());
+        assert_eq!(manifest.contract(), None);
     }
 
     #[test]
@@ -1010,6 +1112,184 @@ mod tests {
 
         assert_eq!(manifest.partition_map(), None);
         assert!(manifest.has_current_versions());
+        assert_eq!(manifest.contract(), None);
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_requires_wal_offset() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "strip1d",
+                "boundaries": [0.0],
+                "splits": []
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert!(manifest.has_current_versions());
+        assert_eq!(manifest.wal_offset(), None);
+        assert_eq!(manifest.contract(), None);
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_requires_cut_summary_fields() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "pending_mesh": 0,
+            "in_flight": [],
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "strip1d",
+                "boundaries": [0.0],
+                "splits": []
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert!(manifest.has_current_versions());
+        assert_eq!(manifest.entity_count(), None);
+        assert_eq!(manifest.contract(), None);
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_rejects_pending_mesh_in_flight_count_mismatch() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "entity_count": 1,
+            "pending_mesh": 2,
+            "in_flight": [{ "entity": "node-1", "target": "E", "type": "MeshHandoff" }],
+            "t_server": 2,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "strip1d",
+                "boundaries": [0.0],
+                "splits": []
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.pending_mesh(), Some(2));
+        assert_eq!(manifest.contract(), None);
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_rejects_malformed_in_flight_item() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "entity_count": 1,
+            "pending_mesh": 1,
+            "in_flight": [{ "entity": "", "target": "E", "type": "MeshHandoff" }],
+            "t_server": 2,
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "strip1d",
+                "boundaries": [0.0],
+                "splits": []
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(manifest.contract(), None);
+    }
+
+    #[test]
+    fn snapshot_manifest_raw_json_roundtrip_preserves_unknown_fields_when_contract_rejects() {
+        let input = json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "entity_count": 1,
+            "pending_mesh": 1,
+            "in_flight": [],
+            "t_server": 2,
+            "future_restore_field": { "opaque": true },
+            "spatial_schema": {
+                "spatial_dim": "D2",
+                "coordinate_codec": "debug_f64_2",
+                "partition_schema": { "kind": "strip1d", "boundary_count": 1 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "strip1d",
+                "boundaries": [0.0],
+                "splits": []
+            }
+        });
+        let decoded = decode_json_value(&input).unwrap();
+        let Op::SnapshotManifest(manifest) = &decoded else {
+            panic!("expected SnapshotManifest");
+        };
+        assert_eq!(manifest.contract(), None);
+
+        let encoded = encode_json_value(&decoded);
+        assert_eq!(encoded["future_restore_field"], json!({ "opaque": true }));
+        assert_eq!(encoded["in_flight"], json!([]));
     }
 
     #[test]
@@ -1041,6 +1321,7 @@ mod tests {
         };
 
         assert_eq!(manifest.partition_map(), None);
+        assert_eq!(manifest.contract(), None);
     }
 
     #[test]
@@ -1072,6 +1353,7 @@ mod tests {
         };
 
         assert_eq!(manifest.partition_map(), None);
+        assert_eq!(manifest.contract(), None);
     }
 
     #[test]
@@ -1106,6 +1388,7 @@ mod tests {
         };
 
         assert_eq!(manifest.partition_map(), None);
+        assert_eq!(manifest.contract(), None);
     }
 
     #[test]
@@ -1137,6 +1420,7 @@ mod tests {
         };
 
         assert_eq!(manifest.partition_map(), None);
+        assert_eq!(manifest.contract(), None);
     }
 
     #[test]
@@ -1163,6 +1447,7 @@ mod tests {
 
         assert_eq!(manifest.snapshot_manifest_version(), Some(2));
         assert!(!manifest.has_current_versions());
+        assert_eq!(manifest.contract(), None);
         assert_eq!(
             manifest.spatial_schema(),
             Some(SpatialSchema::current_2d(PartitionSchema::strip1d(1)))
