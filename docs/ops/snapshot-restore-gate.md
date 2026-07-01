@@ -17,13 +17,26 @@ to interpret the cut without relying on out-of-band process state:
 - `partition_map_version`;
 - `spatial_schema.spatial_dim`;
 - `spatial_schema.coordinate_codec`;
-- `spatial_schema.partition_schema`.
+- `spatial_schema.partition_schema`;
+- `partition_map`.
 
 For the current product slice, `spatial_schema` still describes the 2D runtime:
 `D2`, `debug_f64_2`, and either `strip1d` or `grid2d`. The point is not to turn
 snapshot restore into a second persistence system. The point is that the cut
 names the same spatial/partition contract as replay and future protocol
 fixtures.
+
+`partition_map_version` is the revision number. `partition_map` is the
+reproducible routing contract for that revision:
+
+- `strip1d`: sorted cut `boundaries` and deterministic per-region `splits`;
+- `grid2d`: `cols`, `rows`, `cell_w`, `cell_h`, and explicit `origin`.
+
+The map is emitted from the same `ServerState` fields used by runtime routing;
+it is not a second partition engine. Mesh topology is intentionally not part of
+this versioned partition map, because mesh discovery and remote-link lifecycle
+do not currently advance `partition_map_version`. A future mesh-topology
+contract should carry its own provenance instead of hiding inside this one.
 
 The protocol crate exposes typed `SnapshotManifest` accessors for those fields
 and a current-version check. The JSON wire shape stays lossless and unchanged;
@@ -56,6 +69,7 @@ The task-relative regression gates are:
 snapshot_marker_restore_offset_rolls_back_post_cut_entities
 snapshot_marker_flushes_pending_update_before_cut
 snapshot_manifest_carries_spatial_schema_contract
+snapshot_manifest_carries_strip_partition_map_contract
 snapshot_manifest_contract_accessors_match_current_wire_shape
 snapshot_manifest_contract_rejects_future_versions
 snapshot_vector_restores_in_flight_mesh_handoff_exactly_once

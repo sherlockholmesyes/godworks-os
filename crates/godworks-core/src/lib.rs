@@ -381,6 +381,140 @@ impl PartitionSchema {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum PartitionMapSpecError {
+    NonFiniteBoundary,
+    UnsortedBoundary,
+    NonFiniteGridCell,
+    NonFiniteGridOrigin,
+    NonPositiveGridCell,
+}
+
+/// A deterministic split inside one coarse 1D strip region.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionSplitSpec {
+    pub region: RegionId,
+    pub boundaries: Vec<f64>,
+}
+
+impl RegionSplitSpec {
+    pub fn new(
+        region: impl Into<RegionId>,
+        boundaries: Vec<f64>,
+    ) -> Result<Self, PartitionMapSpecError> {
+        validate_sorted_finite(&boundaries)?;
+        Ok(Self {
+            region: region.into(),
+            boundaries,
+        })
+    }
+}
+
+/// The reproducible runtime partition map behind a `PartitionSchema`.
+///
+/// `PartitionSchema` describes artifact shape (`strip1d` vs `grid2d`). This
+/// type carries the actual deterministic routing inputs that a snapshot or
+/// external tool needs to reproduce region assignment for the current map.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PartitionMapSpec {
+    Strip1D {
+        boundaries: Vec<f64>,
+        splits: Vec<RegionSplitSpec>,
+    },
+    Grid2D {
+        cols: u64,
+        rows: u64,
+        cell_w: f64,
+        cell_h: f64,
+        origin: [f64; 2],
+    },
+}
+
+impl PartitionMapSpec {
+    pub fn strip1d(
+        boundaries: Vec<f64>,
+        mut splits: Vec<RegionSplitSpec>,
+    ) -> Result<Self, PartitionMapSpecError> {
+        validate_sorted_finite(&boundaries)?;
+        splits.sort_by(|a, b| a.region.cmp(&b.region));
+        Ok(Self::Strip1D { boundaries, splits })
+    }
+
+    pub fn grid2d(
+        cols: u64,
+        rows: u64,
+        cell_w: f64,
+        cell_h: f64,
+        origin: [f64; 2],
+    ) -> Result<Self, PartitionMapSpecError> {
+        PartitionSchema::grid2d(cols, rows)
+            .map_err(|_| PartitionMapSpecError::NonPositiveGridCell)?;
+        if !cell_w.is_finite() || !cell_h.is_finite() {
+            return Err(PartitionMapSpecError::NonFiniteGridCell);
+        }
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return Err(PartitionMapSpecError::NonPositiveGridCell);
+        }
+        if !origin[0].is_finite() || !origin[1].is_finite() {
+            return Err(PartitionMapSpecError::NonFiniteGridOrigin);
+        }
+        Ok(Self::Grid2D {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+            origin,
+        })
+    }
+
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Strip1D { .. } => "strip1d",
+            Self::Grid2D { .. } => "grid2d",
+        }
+    }
+
+    pub fn partition_schema(&self) -> PartitionSchema {
+        match self {
+            Self::Strip1D { boundaries, .. } => PartitionSchema::Strip1D {
+                boundary_count: boundaries.len() as u64,
+            },
+            Self::Grid2D { cols, rows, .. } => PartitionSchema::Grid2D {
+                cols: *cols,
+                rows: *rows,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VersionedPartitionMap {
+    pub version: u64,
+    pub spec: PartitionMapSpec,
+}
+
+impl VersionedPartitionMap {
+    pub const fn new(version: u64, spec: PartitionMapSpec) -> Self {
+        Self { version, spec }
+    }
+}
+
+fn validate_sorted_finite(values: &[f64]) -> Result<(), PartitionMapSpecError> {
+    let mut prev = None;
+    for value in values {
+        if !value.is_finite() {
+            return Err(PartitionMapSpecError::NonFiniteBoundary);
+        }
+        if let Some(prev) = prev {
+            if *value <= prev {
+                return Err(PartitionMapSpecError::UnsortedBoundary);
+            }
+        }
+        prev = Some(*value);
+    }
+    Ok(())
+}
+
 /// The current spatial artifact contract shared by replay and snapshot rails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpatialSchema {
@@ -698,6 +832,81 @@ mod tests {
         assert_eq!(
             schema.partition_schema,
             PartitionSchema::Strip1D { boundary_count: 1 }
+        );
+    }
+
+    #[test]
+    fn partition_map_spec_pins_deterministic_strip_inputs() {
+        let map = PartitionMapSpec::strip1d(
+            vec![-10.0, 0.0, 10.0],
+            vec![
+                RegionSplitSpec::new("Z1", vec![1.0, 2.0]).unwrap(),
+                RegionSplitSpec::new("Z0", vec![-5.0]).unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let PartitionMapSpec::Strip1D { boundaries, splits } = map else {
+            panic!("expected strip map");
+        };
+
+        assert_eq!(boundaries, vec![-10.0, 0.0, 10.0]);
+        assert_eq!(splits[0].region.as_ref(), "Z0");
+        assert_eq!(splits[1].region.as_ref(), "Z1");
+    }
+
+    #[test]
+    fn partition_map_spec_rejects_non_reproducible_boundaries() {
+        assert_eq!(
+            PartitionMapSpec::strip1d(vec![1.0, 1.0], Vec::new()),
+            Err(PartitionMapSpecError::UnsortedBoundary)
+        );
+        assert_eq!(
+            PartitionMapSpec::strip1d(vec![1.0, f64::NAN], Vec::new()),
+            Err(PartitionMapSpecError::NonFiniteBoundary)
+        );
+        assert_eq!(
+            RegionSplitSpec::new("W", vec![3.0, 2.0]),
+            Err(PartitionMapSpecError::UnsortedBoundary)
+        );
+    }
+
+    #[test]
+    fn partition_map_spec_rejects_non_reproducible_grid_cells() {
+        assert_eq!(
+            PartitionMapSpec::grid2d(0, 2, 10.0, 10.0, [0.0, 0.0]),
+            Err(PartitionMapSpecError::NonPositiveGridCell)
+        );
+        assert_eq!(
+            PartitionMapSpec::grid2d(2, 2, f64::NAN, 10.0, [0.0, 0.0]),
+            Err(PartitionMapSpecError::NonFiniteGridCell)
+        );
+        assert_eq!(
+            PartitionMapSpec::grid2d(2, 2, 0.0, 10.0, [0.0, 0.0]),
+            Err(PartitionMapSpecError::NonPositiveGridCell)
+        );
+        assert_eq!(
+            PartitionMapSpec::grid2d(2, 2, 10.0, 10.0, [f64::NAN, 0.0]),
+            Err(PartitionMapSpecError::NonFiniteGridOrigin)
+        );
+    }
+
+    #[test]
+    fn partition_map_spec_projects_to_partition_schema() {
+        let strip = PartitionMapSpec::strip1d(
+            vec![-10.0, 0.0, 10.0],
+            vec![RegionSplitSpec::new("Z1", vec![3.0]).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            strip.partition_schema(),
+            PartitionSchema::Strip1D { boundary_count: 3 }
+        );
+
+        let grid = PartitionMapSpec::grid2d(3, 2, 10.0, 20.0, [0.0, 0.0]).unwrap();
+        assert_eq!(
+            grid.partition_schema(),
+            PartitionSchema::Grid2D { cols: 3, rows: 2 }
         );
     }
 }

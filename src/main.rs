@@ -29,12 +29,13 @@ use godworks_broker::wal::{
     crc32_ieee, read_wal_events, wal_v1_envelope_line, wal_v1_header_line, WalReadReport,
 };
 use godworks_core::{
-    AuthorityMode, PartitionSchema, SpatialSchema, COORDINATE_CODEC_VERSION,
-    SPATIAL_SCHEMA_VERSION, STANDARD_COMPONENT_REGISTRY_VERSION,
+    AuthorityMode, PartitionMapSpec, PartitionSchema, RegionSplitSpec, SpatialSchema,
+    VersionedPartitionMap, COORDINATE_CODEC_VERSION, SPATIAL_SCHEMA_VERSION,
+    STANDARD_COMPONENT_REGISTRY_VERSION,
 };
 use godworks_protocol::{
-    operation_semantics, DEFAULT_MAX_FRAME_BYTES, SNAPSHOT_MANIFEST_VERSION,
-    SNAPSHOT_SCHEMA_VERSION,
+    operation_semantics, partition_map_contract_value, DEFAULT_MAX_FRAME_BYTES,
+    SNAPSHOT_MANIFEST_VERSION, SNAPSHOT_SCHEMA_VERSION,
 };
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2832,6 +2833,25 @@ fn spatial_schema_for_state(state: &ServerState) -> SpatialSchema {
     SpatialSchema::current_2d(partition_schema_for_state(state))
 }
 
+fn partition_map_for_state(state: &ServerState) -> VersionedPartitionMap {
+    let spec = if let Some((cols, rows, cell_w, cell_h)) = state.grid2d {
+        PartitionMapSpec::grid2d(cols as u64, rows as u64, cell_w, cell_h, [0.0, 0.0])
+            .expect("runtime grid2d partition map must be reproducible")
+    } else {
+        let splits: Vec<RegionSplitSpec> = state
+            .splits
+            .iter()
+            .map(|(region, boundaries)| {
+                RegionSplitSpec::new(region.clone(), boundaries.clone())
+                    .expect("runtime strip splits must be reproducible")
+            })
+            .collect();
+        PartitionMapSpec::strip1d(state.boundaries.clone(), splits)
+            .expect("runtime strip partition map must be reproducible")
+    };
+    VersionedPartitionMap::new(state.zone_topology_rev, spec)
+}
+
 fn spatial_schema_contract(state: &ServerState) -> Value {
     let schema = spatial_schema_for_state(state);
     json!({
@@ -2839,6 +2859,10 @@ fn spatial_schema_contract(state: &ServerState) -> Value {
         "coordinate_codec": schema.coordinate_codec.as_wire_str(),
         "partition_schema": partition_schema_contract_value(schema.partition_schema)
     })
+}
+
+fn partition_map_contract(state: &ServerState) -> Value {
+    partition_map_contract_value(&partition_map_for_state(state))
 }
 
 fn record_replay_tape_spatial_contract(state: &ServerState, event: &mut Map<String, Value>) {
@@ -6505,6 +6529,7 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                     "component_registry_version": STANDARD_COMPONENT_REGISTRY_VERSION,
                     "partition_map_version": state.zone_topology_rev,
                     "spatial_schema": spatial_schema_contract(state),
+                    "partition_map": partition_map_contract(state),
                     "broker_id": broker_id, "wal_offset": wal_offset, "entity_count": state.entities.len(),
                     "authority_hash": authority_hash.to_string(), "pending_mesh": state.pending_mesh.len(),
                     "in_flight": in_flight, "t_server": now_millis()
@@ -11923,6 +11948,18 @@ mod tests {
             manifest["spatial_schema"]["partition_schema"],
             json!({"kind":"grid2d","cols":3,"rows":2})
         );
+        assert_eq!(
+            manifest["partition_map"],
+            json!({
+                "version": 7,
+                "kind": "grid2d",
+                "cols": 3,
+                "rows": 2,
+                "cell_w": 10.0,
+                "cell_h": 20.0,
+                "origin": [0.0, 0.0]
+            })
+        );
 
         let typed =
             godworks_protocol::json::decode_json_value(&manifest).expect("manifest must decode");
@@ -11939,8 +11976,71 @@ mod tests {
                 rows: 2
             }))
         );
+        assert_eq!(
+            typed_manifest.partition_map(),
+            Some(VersionedPartitionMap::new(
+                7,
+                PartitionMapSpec::grid2d(3, 2, 10.0, 20.0, [0.0, 0.0]).unwrap()
+            ))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_manifest_carries_strip_partition_map_contract() {
+        let mut state = ServerState::new(30.0);
+        state.grid2d = None;
+        state.boundary = 0.0;
+        state.boundaries = vec![-10.0, 0.0, 10.0];
+        state.splits.insert("Z1".to_string(), vec![3.0, 6.0]);
+        state.zone_topology_rev = 42;
+
+        let mut rx = add_test_worker_with_rx(&mut state, "snap", "OBS");
+        state
+            .workers
+            .get_mut("snap")
+            .unwrap()
+            .attributes
+            .insert("snapshot".to_string());
+
+        dispatch_test_frame(
+            &mut state,
+            "snap",
+            &json!({"op":"SnapshotMarker","request_id":"s1","snapshot_id":"strip-cut"}),
+        );
+
+        let manifest = decode_test_frame(&rx.try_recv().expect("snapshot manifest must emit"));
+        assert_eq!(manifest["op"], "SnapshotManifest");
+        assert_eq!(manifest["partition_map_version"], 42);
+        assert_eq!(
+            manifest["partition_map"],
+            json!({
+                "version": 42,
+                "kind": "strip1d",
+                "boundaries": [-10.0, 0.0, 10.0],
+                "splits": [
+                    { "region": "Z1", "boundaries": [3.0, 6.0] }
+                ]
+            })
+        );
+
+        let typed =
+            godworks_protocol::json::decode_json_value(&manifest).expect("manifest must decode");
+        let godworks_protocol::Op::SnapshotManifest(typed_manifest) = typed else {
+            panic!("expected typed SnapshotManifest");
+        };
+        assert_eq!(
+            typed_manifest.partition_map(),
+            Some(VersionedPartitionMap::new(
+                42,
+                PartitionMapSpec::strip1d(
+                    vec![-10.0, 0.0, 10.0],
+                    vec![RegionSplitSpec::new("Z1", vec![3.0, 6.0]).unwrap()]
+                )
+                .unwrap()
+            ))
+        );
     }
 
     #[test]

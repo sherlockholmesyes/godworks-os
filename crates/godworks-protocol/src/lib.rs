@@ -8,7 +8,8 @@ pub mod json;
 
 pub use godworks_core::{
     ComponentId, ComponentKind, ComponentRegistry, ComponentSchema, ComponentVersion,
-    CoordinateCodec, PartitionSchema, SpatialDim, SpatialSchema, COORDINATE_CODEC_VERSION,
+    CoordinateCodec, PartitionMapSpec, PartitionMapSpecError, PartitionSchema, RegionSplitSpec,
+    SpatialDim, SpatialSchema, VersionedPartitionMap, COORDINATE_CODEC_VERSION,
     SPATIAL_SCHEMA_VERSION, STANDARD_COMPONENT_REGISTRY_VERSION,
 };
 
@@ -795,6 +796,17 @@ impl SnapshotManifest {
         parse_spatial_schema_contract(self.fields.get("spatial_schema")?)
     }
 
+    pub fn partition_map(&self) -> Option<VersionedPartitionMap> {
+        let map = parse_partition_map_contract(self.fields.get("partition_map")?)?;
+        if Some(map.version) != self.partition_map_version() {
+            return None;
+        }
+        if map.spec.partition_schema() != self.spatial_schema()?.partition_schema {
+            return None;
+        }
+        Some(map)
+    }
+
     pub fn has_current_versions(&self) -> bool {
         self.snapshot_manifest_version() == Some(SNAPSHOT_MANIFEST_VERSION)
             && self.snapshot_schema_version() == Some(SNAPSHOT_SCHEMA_VERSION)
@@ -835,6 +847,94 @@ pub fn parse_partition_schema_contract(value: &Value) -> Option<PartitionSchema>
             Some(PartitionSchema::strip1d(boundary_count))
         }
         _ => None,
+    }
+}
+
+pub fn parse_partition_map_contract(value: &Value) -> Option<VersionedPartitionMap> {
+    let obj = value.as_object()?;
+    let version = obj.get("version").and_then(Value::as_u64)?;
+    let spec = match obj.get("kind").and_then(Value::as_str)? {
+        "grid2d" => {
+            let cols = obj.get("cols").and_then(Value::as_u64)?;
+            let rows = obj.get("rows").and_then(Value::as_u64)?;
+            let cell_w = obj.get("cell_w").and_then(Value::as_f64)?;
+            let cell_h = obj.get("cell_h").and_then(Value::as_f64)?;
+            let origin = parse_f64_pair(obj.get("origin")?)?;
+            PartitionMapSpec::grid2d(cols, rows, cell_w, cell_h, origin).ok()?
+        }
+        "strip1d" => {
+            let boundaries = parse_f64_array(obj.get("boundaries")?)?;
+            let splits = parse_region_splits(obj.get("splits"))?;
+            PartitionMapSpec::strip1d(boundaries, splits).ok()?
+        }
+        _ => return None,
+    };
+    Some(VersionedPartitionMap::new(version, spec))
+}
+
+pub fn partition_map_contract_value(map: &VersionedPartitionMap) -> Value {
+    match &map.spec {
+        PartitionMapSpec::Strip1D { boundaries, splits } => {
+            let splits: Vec<Value> = splits
+                .iter()
+                .map(|split| {
+                    let region: &str = split.region.as_ref();
+                    serde_json::json!({
+                        "region": region,
+                        "boundaries": split.boundaries,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "version": map.version,
+                "kind": "strip1d",
+                "boundaries": boundaries,
+                "splits": splits,
+            })
+        }
+        PartitionMapSpec::Grid2D {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+            origin,
+        } => serde_json::json!({
+            "version": map.version,
+            "kind": "grid2d",
+            "cols": cols,
+            "rows": rows,
+            "cell_w": cell_w,
+            "cell_h": cell_h,
+            "origin": origin,
+        }),
+    }
+}
+
+fn parse_f64_array(value: &Value) -> Option<Vec<f64>> {
+    value.as_array()?.iter().map(Value::as_f64).collect()
+}
+
+fn parse_f64_pair(value: &Value) -> Option<[f64; 2]> {
+    let values = value.as_array()?;
+    if values.len() != 2 {
+        return None;
+    }
+    Some([values[0].as_f64()?, values[1].as_f64()?])
+}
+
+fn parse_region_splits(value: Option<&Value>) -> Option<Vec<RegionSplitSpec>> {
+    match value {
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                let obj = value.as_object()?;
+                let region = obj.get("region").and_then(Value::as_str)?;
+                let boundaries = parse_f64_array(obj.get("boundaries")?)?;
+                RegionSplitSpec::new(region, boundaries).ok()
+            })
+            .collect(),
+        Some(_) => None,
+        None => Some(Vec::new()),
     }
 }
 
@@ -963,5 +1063,60 @@ mod tests {
 
         assert!(legacy.protocol_is_supported());
         assert!(!future.protocol_is_supported());
+    }
+
+    #[test]
+    fn partition_map_contract_roundtrips_strip_inputs() {
+        let original = VersionedPartitionMap::new(
+            12,
+            PartitionMapSpec::strip1d(
+                vec![-8.0, 0.0, 8.0],
+                vec![RegionSplitSpec::new("Z1", vec![3.0]).unwrap()],
+            )
+            .unwrap(),
+        );
+
+        let value = partition_map_contract_value(&original);
+
+        assert_eq!(parse_partition_map_contract(&value), Some(original));
+    }
+
+    #[test]
+    fn partition_map_contract_roundtrips_grid_inputs() {
+        let original = VersionedPartitionMap::new(
+            7,
+            PartitionMapSpec::grid2d(3, 2, 10.0, 20.0, [0.0, 0.0]).unwrap(),
+        );
+
+        let value = partition_map_contract_value(&original);
+
+        assert_eq!(parse_partition_map_contract(&value), Some(original));
+    }
+
+    #[test]
+    fn partition_map_contract_rejects_non_reproducible_strip_inputs() {
+        let value = serde_json::json!({
+            "version": 1,
+            "kind": "strip1d",
+            "boundaries": [5.0, 2.0],
+            "splits": []
+        });
+
+        assert_eq!(parse_partition_map_contract(&value), None);
+    }
+
+    #[test]
+    fn partition_map_contract_rejects_non_reproducible_grid_inputs() {
+        let value = serde_json::json!({
+            "version": 1,
+            "kind": "grid2d",
+            "cols": 2,
+            "rows": 2,
+            "cell_w": 0.0,
+            "cell_h": 20.0,
+            "origin": [0.0, 0.0]
+        });
+
+        assert_eq!(parse_partition_map_contract(&value), None);
     }
 }

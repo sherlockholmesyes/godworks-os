@@ -208,7 +208,7 @@ their response frames are transient result frames.
 | `InspectorQuery` | inspector -> broker | no | Request full debug/ops state frame. |
 | `InspectorFrame` | broker -> inspector | no | Debug/ops state frame. |
 | `SnapshotMarker` | admin -> broker | yes | Flush staged durable transitions and mark coordinated snapshot/restore boundary. |
-| `SnapshotManifest` | broker -> admin | no | Return snapshot cut metadata and schema/version contract. |
+| `SnapshotManifest` | broker -> admin | no | Return snapshot cut metadata, schema/version contract, and typed partition map. |
 
 ## JSON codec coverage
 
