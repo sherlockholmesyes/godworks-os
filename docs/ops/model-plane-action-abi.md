@@ -93,8 +93,13 @@ policy. It only stores a validated dataset cut and, separately, an auditable
 promotion decision record.
 
 ```bash
-cargo run --bin model_feature_block -- agar-live-gate \
-  .local/agar_mit_clone_logs/agar-live-gate.json \
+cargo run --bin replay_eval -- \
+  .local/agar_mit_clone_logs/agar-live.replay.jsonl \
+  arena agar-live-dataset-v1 trace-agar-live \
+  > .local/model-plane/replay_eval_report.json
+
+cargo run --bin model_feature_block -- replay \
+  .local/agar_mit_clone_logs/agar-live.replay.jsonl \
   arena agar-live-dataset-v1 trace-agar-live \
   > .local/model-plane/agar-live-blocks.jsonl
 
@@ -110,16 +115,20 @@ cargo run --bin model_dataset_store -- promote \
   .local/model-plane/promotions/promotion-agar-live-1.json
 ```
 
-`ingest` writes immutable `features.jsonl` and `manifest.json` files. It rejects
-empty input, mixed project/dataset provenance, unredacted feature blocks,
-unknown top-level feature fields, raw payload-like keys, and invalid metrics
-before any dataset cut is stored. Existing dataset files are not overwritten.
+`ingest` writes immutable `features.jsonl` and `manifest.json` files through a
+staging directory and atomic directory commit. It rejects empty input, mixed
+project/dataset provenance, unredacted feature blocks, unknown top-level feature
+fields, raw payload-like keys, and invalid metrics before any dataset cut is
+stored. Existing dataset files are not overwritten.
 
 `promote` requires an existing dataset manifest, a typed proposal JSON, and a
 clean `replay_eval` report (`ok:true`, `error_count:0`, positive `events`, empty
-`errors`). It writes a `ModelPromotionRecord` only when proposal provenance
-matches the dataset and guarded proposals carry validator provenance. The record
-is a replayable audit artifact, not a runtime mutation.
+`errors`). The replay report must also carry the source artifact,
+`input_fingerprint`, and project/dataset/trace binding emitted by `replay_eval`.
+`promote` revalidates `features.jsonl`, recomputes the manifest, and writes a
+`ModelPromotionRecord` only when proposal provenance, stored feature data, and
+replay/eval evidence all match. The record is a replayable audit artifact, not a
+runtime mutation.
 
 Allowed action kinds are proposal-only:
 
@@ -194,8 +203,9 @@ or failed MIT ladder profile can enter the dataset as a success; if the public
 model action vocabulary starts accepting direct runtime mutations; if guarded
 proposals can be emitted without validator provenance; if mixed project/dataset
 feature blocks can form one dataset manifest; if dataset storage overwrites an
-existing cut; or if physical promotion records can omit clean replay/eval
-evidence or mismatch dataset/proposal provenance.
+existing cut or leaves the canonical dataset directory half-written; if physical
+promotion records can omit clean replay/eval evidence, skip stored feature
+verification, or mismatch dataset/proposal/replay provenance.
 
 ## Non-Scope
 

@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use godworks_core::{
     ModelActionKind, ModelActionMode, ModelActionProposal, ModelActionProvenance,
@@ -53,20 +54,35 @@ fn ingest_dataset(input_jsonl: &Path, dataset_dir: &Path) -> Result<ModelDataset
         .validate()
         .map_err(|err| format!("dataset manifest validation failed: {err:?}"))?;
 
-    fs::create_dir_all(dataset_dir).map_err(|err| {
-        format!(
-            "failed to create dataset dir '{}': {err}",
+    if dataset_dir.exists() {
+        return Err(format!(
+            "dataset dir '{}' already exists",
             dataset_dir.display()
+        ));
+    }
+    let staging_dir = staging_dataset_dir(dataset_dir)?;
+    fs::create_dir(&staging_dir).map_err(|err| {
+        format!(
+            "failed to create staging dataset dir '{}': {err}",
+            staging_dir.display()
         )
     })?;
     write_new_utf8(
-        &dataset_dir.join(FEATURES_FILE),
+        &staging_dir.join(FEATURES_FILE),
         &(normalized_lines.join("\n") + "\n"),
     )?;
     write_new_utf8(
-        &dataset_dir.join(MANIFEST_FILE),
+        &staging_dir.join(MANIFEST_FILE),
         &manifest_to_json(&manifest).to_string(),
     )?;
+    fs::rename(&staging_dir, dataset_dir).map_err(|err| {
+        let _ = fs::remove_dir_all(&staging_dir);
+        format!(
+            "failed to commit dataset dir '{}' from staging '{}': {err}",
+            dataset_dir.display(),
+            staging_dir.display()
+        )
+    })?;
     Ok(manifest)
 }
 
@@ -78,9 +94,10 @@ fn persist_promotion_record(
     decision: &str,
     out_path: &Path,
 ) -> Result<ModelPromotionRecord, String> {
-    let manifest = read_manifest(&dataset_dir.join(MANIFEST_FILE))?;
+    let manifest = read_verified_dataset(dataset_dir)?;
     let proposal = read_proposal(proposal_path)?;
-    let replay_eval_artifact = validate_replay_eval_report(replay_eval_report_path)?;
+    let replay_eval_artifact =
+        validate_replay_eval_report(replay_eval_report_path, &manifest, &proposal)?;
     let decision = ModelPromotionDecision::from_wire_str(decision)
         .ok_or_else(|| format!("invalid promotion decision '{decision}'"))?;
     let record = ModelPromotionRecord::new(
@@ -95,6 +112,26 @@ fn persist_promotion_record(
         .map_err(|err| format!("promotion record validation failed: {err:?}"))?;
     write_new_utf8(out_path, &promotion_record_to_json(&record).to_string())?;
     Ok(record)
+}
+
+fn read_verified_dataset(dataset_dir: &Path) -> Result<ModelDatasetManifest, String> {
+    let manifest_path = dataset_dir.join(MANIFEST_FILE);
+    let features_path = dataset_dir.join(FEATURES_FILE);
+    let manifest = read_manifest(&manifest_path)?;
+    let (blocks, _) = read_feature_blocks(&features_path)?;
+    let recomputed = ModelDatasetManifest::from_feature_blocks(&blocks)
+        .map_err(|err| format!("stored feature block validation failed: {err:?}"))?;
+    recomputed
+        .validate()
+        .map_err(|err| format!("stored feature block manifest validation failed: {err:?}"))?;
+    if manifest != recomputed {
+        return Err(format!(
+            "dataset manifest '{}' does not match stored '{}'",
+            manifest_path.display(),
+            features_path.display()
+        ));
+    }
+    Ok(manifest)
 }
 
 fn read_feature_blocks(path: &Path) -> Result<(Vec<ModelFeatureBlock>, Vec<String>), String> {
@@ -240,11 +277,25 @@ fn proposal_from_json(value: &Value) -> Result<ModelActionProposal, String> {
     Ok(proposal)
 }
 
-fn validate_replay_eval_report(path: &Path) -> Result<String, String> {
+fn validate_replay_eval_report(
+    path: &Path,
+    manifest: &ModelDatasetManifest,
+    proposal: &ModelActionProposal,
+) -> Result<String, String> {
     let value = read_json(path)?;
     require_object_keys(
         &value,
-        &["events", "ok", "error_count", "errors"],
+        &[
+            "events",
+            "ok",
+            "error_count",
+            "errors",
+            "source_artifact",
+            "input_fingerprint",
+            "project_id",
+            "dataset_id",
+            "trace_id",
+        ],
         "replay_eval_report",
     )?;
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -264,7 +315,41 @@ fn validate_replay_eval_report(path: &Path) -> Result<String, String> {
     {
         return Err("replay_eval_report.errors must be empty".to_string());
     }
-    Ok(format!("replay_eval:{}", normalize_path(path)))
+    let project_id = required_str(&value, "project_id")?;
+    let dataset_id = required_str(&value, "dataset_id")?;
+    let trace_id = required_str(&value, "trace_id")?;
+    let source_artifact = required_str(&value, "source_artifact")?;
+    let input_fingerprint = required_str(&value, "input_fingerprint")?;
+    if !input_fingerprint.starts_with("fnv1a64:") || input_fingerprint.len() != 24 {
+        return Err("replay_eval_report.input_fingerprint must be fnv1a64:<16hex>".to_string());
+    }
+    if project_id != manifest.project_id || project_id != proposal.provenance.project_id {
+        return Err("replay_eval_report.project_id does not match dataset/proposal".to_string());
+    }
+    if dataset_id != manifest.dataset_id || dataset_id != proposal.provenance.dataset_id {
+        return Err("replay_eval_report.dataset_id does not match dataset/proposal".to_string());
+    }
+    if trace_id != proposal.provenance.source_trace_id {
+        return Err(
+            "replay_eval_report.trace_id does not match proposal source_trace_id".to_string(),
+        );
+    }
+    if !manifest.trace_ids.iter().any(|id| id == trace_id) {
+        return Err("replay_eval_report.trace_id is not in dataset manifest".to_string());
+    }
+    if !manifest
+        .source_artifacts
+        .iter()
+        .any(|artifact| artifact == source_artifact)
+    {
+        return Err("replay_eval_report.source_artifact is not in dataset manifest".to_string());
+    }
+    Ok(format!(
+        "replay_eval:{}:{}:{}",
+        normalize_path(path),
+        source_artifact,
+        input_fingerprint
+    ))
 }
 
 fn feature_block_to_json(block: &ModelFeatureBlock) -> Value {
@@ -340,6 +425,21 @@ fn write_new_utf8(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|err| format!("failed to write '{}': {err}", path.display()))?;
     file.write_all(b"\n")
         .map_err(|err| format!("failed to finish '{}': {err}", path.display()))
+}
+
+fn staging_dataset_dir(dataset_dir: &Path) -> Result<std::path::PathBuf, String> {
+    let parent = dataset_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("failed to create '{}': {err}", parent.display()))?;
+    let name = dataset_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid dataset dir '{}'", dataset_dir.display()))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system clock before unix epoch: {err}"))?
+        .as_nanos();
+    Ok(parent.join(format!(".{name}.staging.{}.{}", process::id(), nanos)))
 }
 
 fn required_object<'a>(
@@ -492,7 +592,12 @@ mod tests {
             "events": 3,
             "ok": true,
             "error_count": 0,
-            "errors": []
+            "errors": [],
+            "source_artifact": "replay:agar-a",
+            "input_fingerprint": "fnv1a64:0123456789abcdef",
+            "project_id": "arena",
+            "dataset_id": "dataset-v1",
+            "trace_id": "trace-a"
         })
     }
 
@@ -502,8 +607,8 @@ mod tests {
         let input = dir.join("blocks.jsonl");
         let store = dir.join("dataset");
         let blocks = [
-            feature_block("trace-a", "agar-a"),
-            feature_block("trace-b", "agar-b"),
+            feature_block("trace-a", "replay:agar-a"),
+            feature_block("trace-b", "replay:agar-b"),
         ]
         .into_iter()
         .map(|block| block.to_string())
@@ -537,9 +642,9 @@ mod tests {
         let dir = unique_dir("mixed_dataset");
         let input = dir.join("blocks.jsonl");
         let store = dir.join("dataset");
-        let mut mixed = feature_block("trace-b", "agar-b");
+        let mut mixed = feature_block("trace-b", "replay:agar-b");
         mixed["dataset_id"] = json!("other-dataset");
-        let blocks = [feature_block("trace-a", "agar-a"), mixed]
+        let blocks = [feature_block("trace-a", "replay:agar-a"), mixed]
             .into_iter()
             .map(|block| block.to_string())
             .collect::<Vec<_>>()
@@ -558,14 +663,14 @@ mod tests {
         let dir = unique_dir("raw_unredacted");
         let input = dir.join("blocks.jsonl");
         let store = dir.join("dataset");
-        let mut raw = feature_block("trace-a", "agar-a");
+        let mut raw = feature_block("trace-a", "replay:agar-a");
         raw["redacted"] = json!(false);
         write_text(&input, &raw.to_string());
 
         assert!(ingest_dataset(&input, &store).is_err());
         assert!(!store.join(FEATURES_FILE).exists());
 
-        let mut extra = feature_block("trace-a", "agar-a");
+        let mut extra = feature_block("trace-a", "replay:agar-a");
         extra["payload"] = json!({"raw": true});
         write_text(&input, &extra.to_string());
 
@@ -583,7 +688,10 @@ mod tests {
         let proposal = dir.join("proposal.json");
         let replay = dir.join("replay_eval.json");
         let out = dir.join("promotion.json");
-        write_text(&input, &feature_block("trace-a", "agar-a").to_string());
+        write_text(
+            &input,
+            &feature_block("trace-a", "replay:agar-a").to_string(),
+        );
         ingest_dataset(&input, &store).unwrap();
         write_text(&proposal, &proposal_json("dataset-v1").to_string());
         write_text(&replay, &clean_replay_eval().to_string());
@@ -608,7 +716,10 @@ mod tests {
         let proposal = dir.join("proposal.json");
         let replay = dir.join("replay_eval.json");
         let out = dir.join("promotion.json");
-        write_text(&input, &feature_block("trace-a", "agar-a").to_string());
+        write_text(
+            &input,
+            &feature_block("trace-a", "replay:agar-a").to_string(),
+        );
         ingest_dataset(&input, &store).unwrap();
 
         let failed_replay = json!({
@@ -632,6 +743,98 @@ mod tests {
 
         write_text(&proposal, &proposal_json("other-dataset").to_string());
         write_text(&replay, &clean_replay_eval().to_string());
+        assert!(persist_promotion_record(
+            &store,
+            &proposal,
+            &replay,
+            "promotion-1",
+            "accept",
+            &out
+        )
+        .is_err());
+        assert!(!out.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promotion_rejects_manifest_only_or_tampered_dataset_before_write() {
+        let dir = unique_dir("promotion_tamper");
+        let input = dir.join("blocks.jsonl");
+        let store = dir.join("dataset");
+        let proposal = dir.join("proposal.json");
+        let replay = dir.join("replay_eval.json");
+        let out = dir.join("promotion.json");
+        write_text(
+            &input,
+            &feature_block("trace-a", "replay:agar-a").to_string(),
+        );
+        ingest_dataset(&input, &store).unwrap();
+        write_text(&proposal, &proposal_json("dataset-v1").to_string());
+        write_text(&replay, &clean_replay_eval().to_string());
+
+        fs::remove_file(store.join(FEATURES_FILE)).unwrap();
+        assert!(persist_promotion_record(
+            &store,
+            &proposal,
+            &replay,
+            "promotion-1",
+            "accept",
+            &out
+        )
+        .is_err());
+        assert!(!out.exists());
+
+        write_text(
+            &store.join(FEATURES_FILE),
+            &feature_block("trace-b", "replay:agar-b").to_string(),
+        );
+        assert!(persist_promotion_record(
+            &store,
+            &proposal,
+            &replay,
+            "promotion-1",
+            "accept",
+            &out
+        )
+        .is_err());
+        assert!(!out.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promotion_rejects_unbound_replay_eval_report_before_write() {
+        let dir = unique_dir("promotion_unbound_replay");
+        let input = dir.join("blocks.jsonl");
+        let store = dir.join("dataset");
+        let proposal = dir.join("proposal.json");
+        let replay = dir.join("replay_eval.json");
+        let out = dir.join("promotion.json");
+        write_text(
+            &input,
+            &feature_block("trace-a", "replay:agar-a").to_string(),
+        );
+        ingest_dataset(&input, &store).unwrap();
+        write_text(&proposal, &proposal_json("dataset-v1").to_string());
+
+        let mut wrong_source = clean_replay_eval();
+        wrong_source["source_artifact"] = json!("replay:other");
+        write_text(&replay, &wrong_source.to_string());
+        assert!(persist_promotion_record(
+            &store,
+            &proposal,
+            &replay,
+            "promotion-1",
+            "accept",
+            &out
+        )
+        .is_err());
+        assert!(!out.exists());
+
+        let mut wrong_trace = clean_replay_eval();
+        wrong_trace["trace_id"] = json!("trace-other");
+        write_text(&replay, &wrong_trace.to_string());
         assert!(persist_promotion_record(
             &store,
             &proposal,
