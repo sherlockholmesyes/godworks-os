@@ -28,6 +28,9 @@ dependency-free CDP pixel gate. It proves:
   privilege, or create platform authority components;
 - the visible canvas is non-blank, reports `source: CLIENT stream`, and moves a
   visible player through the product browser path.
+- a live Rust `godworks-client-sdk::ClientBridge` consumes the same broker
+  `CLIENT` stream and builds a non-empty positional cache with no rejected
+  updates.
 - the broker emits a live `GW_REPLAY_TAPE` artifact and `replay_eval` accepts it
   without redaction leaks, malformed spatial metadata, or protocol semantic
   contradictions.
@@ -59,9 +62,6 @@ they must not be the public render source.
 Before treating the demo as release-quality, promote v1 with these additional
 checks:
 
-- SDK cache proof: route one client-facing check through
-  `godworks-client-sdk::ClientBridge` instead of only the JavaScript gateway
-  cache;
 - duration proof: run a longer multi-client soak and keep owner count,
   duplicate frames, rejects, and command acknowledgements inside expected
   bounds.

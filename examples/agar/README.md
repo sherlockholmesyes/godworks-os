@@ -10,6 +10,8 @@ the current Godworks broker wire directly:
 - live player input through `CommandRequest`;
 - live state read through both a non-privileged `CLIENT` stream and a
   token-bound `OBS` inspector connection;
+- a Rust `godworks-client-sdk::ClientBridge` cache consuming the live
+  non-privileged `CLIENT` stream;
 - visible browser rendering from the non-privileged `CLIENT` stream;
 - an adversarial reality gate that drives a player across seams and verifies
   ownership/conservation from live state.
@@ -66,8 +68,9 @@ The live gate is intentionally stronger than `cargo test`: it proves the browser
 slice can join, send commands, receive command acknowledgements after handoff,
 move, cross partition seams, keep every entity owned by a real worker, reject
 privilege self-assignment, compare client-stream truth against inspector truth,
-avoid duplicate entity ids in observed frames, and render a non-blank moving
-canvas sourced from `/client-state`. `-GateOnly` also runs the broker with
+avoid duplicate entity ids in observed frames, render a non-blank moving canvas
+sourced from `/client-state`, and build a live Rust client SDK cache from the
+same broker stream. `-GateOnly` also runs the broker with
 `GW_REPLAY_TAPE` and validates the resulting live tape with `replay_eval`, so
 the gate fails if runtime breadcrumbs leak secrets, lose spatial contract
 metadata, or contradict protocol operation semantics. After the live cluster is
@@ -82,8 +85,8 @@ reconnected during the restored broker query.
 
 This is the current Agar Reality Gate v1. It is now bound to the System Laws
 index as a runtime ruler, but it is not yet the full release gate. The remaining
-promotion work is tracked in `docs/ops/live-game-reality-gates.md`:
-`godworks-client-sdk` cache proof and longer soak coverage.
+promotion work is tracked in `docs/ops/live-game-reality-gates.md`: longer
+multi-client soak coverage and engine-native Godot gates.
 
 The pixel gate launches Chrome/Edge through the Chrome DevTools Protocol without
 Playwright/Puppeteer. If the browser is not in a standard location, set:

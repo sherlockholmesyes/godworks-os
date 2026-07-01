@@ -17,6 +17,17 @@ if (!(Test-Path $broker)) {
   try { cargo build --bin godworks_broker } finally { Pop-Location }
 }
 $replayEval = Join-Path $Repo "target\debug\replay_eval.exe"
+$sdkGate = Join-Path $Repo "target\debug\examples\agar_live_cache_gate.exe"
+if ($GateOnly) {
+  if (!(Test-Path $replayEval)) {
+    Push-Location $Repo
+    try { cargo build --bin replay_eval } finally { Pop-Location }
+  }
+  if (!(Test-Path $sdkGate)) {
+    Push-Location $Repo
+    try { cargo build -p godworks-client-sdk --example agar_live_cache_gate } finally { Pop-Location }
+  }
+}
 
 $cols, $rows = $Grid -split "x" | ForEach-Object { [int]$_ }
 $regions = for ($y = 0; $y -lt $rows; $y++) { for ($x = 0; $x -lt $cols; $x++) { "Z${x}_${y}" } }
@@ -38,6 +49,9 @@ $old = @{
   GW_REPLAY_TAPE_CAPACITY = $env:GW_REPLAY_TAPE_CAPACITY
   GW_RESTORE_DRYRUN = $env:GW_RESTORE_DRYRUN
   GW_AGAR_RESTORE_EXPECT = $env:GW_AGAR_RESTORE_EXPECT
+  GW_AGAR_SDK_MS = $env:GW_AGAR_SDK_MS
+  GW_AGAR_SDK_MIN_ENTITIES = $env:GW_AGAR_SDK_MIN_ENTITIES
+  GW_AGAR_SDK_MIN_STREAM_OPS = $env:GW_AGAR_SDK_MIN_STREAM_OPS
 }
 
 $procs = @()
@@ -95,16 +109,14 @@ try {
   Write-Host "Godworks agar.io demo: http://localhost:$HttpPort"
 
   if ($GateOnly) {
-    if (!(Test-Path $replayEval)) {
-      Push-Location $Repo
-      try { cargo build --bin replay_eval } finally { Pop-Location }
-    }
     $env:GW_AGAR_URL = "http://127.0.0.1:$HttpPort"
     $env:GW_GATE_MIN_OWNERS = [Math]::Min(4, $regions.Count)
     node (Join-Path $PSScriptRoot "gw_agar_gate.js")
     if ($LASTEXITCODE -ne 0) { throw "agar reality gate failed with exit code $LASTEXITCODE" }
     node (Join-Path $PSScriptRoot "gw_agar_pixel_gate.js")
     if ($LASTEXITCODE -ne 0) { throw "agar pixel gate failed with exit code $LASTEXITCODE" }
+    & $sdkGate
+    if ($LASTEXITCODE -ne 0) { throw "agar SDK client cache gate failed with exit code $LASTEXITCODE" }
     if (!(Test-Path $env:GW_REPLAY_TAPE) -or ((Get-Item $env:GW_REPLAY_TAPE).Length -le 0)) {
       throw "agar replay tape was not written: $env:GW_REPLAY_TAPE"
     }
@@ -155,4 +167,7 @@ finally {
   Remove-Item Env:GW_AGAR_URL -ErrorAction SilentlyContinue
   Remove-Item Env:GW_GATE_MIN_OWNERS -ErrorAction SilentlyContinue
   Remove-Item Env:GW_AGAR_RESTORE_EXPECT -ErrorAction SilentlyContinue
+  Remove-Item Env:GW_AGAR_SDK_MS -ErrorAction SilentlyContinue
+  Remove-Item Env:GW_AGAR_SDK_MIN_ENTITIES -ErrorAction SilentlyContinue
+  Remove-Item Env:GW_AGAR_SDK_MIN_STREAM_OPS -ErrorAction SilentlyContinue
 }
