@@ -52,6 +52,14 @@ $old = @{
   GW_AGAR_SDK_MS = $env:GW_AGAR_SDK_MS
   GW_AGAR_SDK_MIN_ENTITIES = $env:GW_AGAR_SDK_MIN_ENTITIES
   GW_AGAR_SDK_MIN_STREAM_OPS = $env:GW_AGAR_SDK_MIN_STREAM_OPS
+  GW_SOAK_MS = $env:GW_SOAK_MS
+  GW_SOAK_SAMPLE_MS = $env:GW_SOAK_SAMPLE_MS
+  GW_SOAK_COMMAND_MS = $env:GW_SOAK_COMMAND_MS
+  GW_SOAK_PLAYERS = $env:GW_SOAK_PLAYERS
+  GW_SOAK_MIN_HANDOFF_PLAYERS = $env:GW_SOAK_MIN_HANDOFF_PLAYERS
+  GW_SOAK_MIN_PLAYER_PATH = $env:GW_SOAK_MIN_PLAYER_PATH
+  GW_SOAK_MAX_MISSING_STREAK = $env:GW_SOAK_MAX_MISSING_STREAK
+  GW_SOAK_CLIENT_EPSILON = $env:GW_SOAK_CLIENT_EPSILON
 }
 
 $procs = @()
@@ -117,6 +125,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "agar pixel gate failed with exit code $LASTEXITCODE" }
     & $sdkGate
     if ($LASTEXITCODE -ne 0) { throw "agar SDK client cache gate failed with exit code $LASTEXITCODE" }
+    node (Join-Path $PSScriptRoot "gw_agar_soak_gate.js")
+    if ($LASTEXITCODE -ne 0) { throw "agar multi-client soak gate failed with exit code $LASTEXITCODE" }
     if (!(Test-Path $env:GW_REPLAY_TAPE) -or ((Get-Item $env:GW_REPLAY_TAPE).Length -le 0)) {
       throw "agar replay tape was not written: $env:GW_REPLAY_TAPE"
     }
@@ -166,8 +176,4 @@ finally {
   Remove-Item Env:GW_BROWSER_TOKEN -ErrorAction SilentlyContinue
   Remove-Item Env:GW_AGAR_URL -ErrorAction SilentlyContinue
   Remove-Item Env:GW_GATE_MIN_OWNERS -ErrorAction SilentlyContinue
-  Remove-Item Env:GW_AGAR_RESTORE_EXPECT -ErrorAction SilentlyContinue
-  Remove-Item Env:GW_AGAR_SDK_MS -ErrorAction SilentlyContinue
-  Remove-Item Env:GW_AGAR_SDK_MIN_ENTITIES -ErrorAction SilentlyContinue
-  Remove-Item Env:GW_AGAR_SDK_MIN_STREAM_OPS -ErrorAction SilentlyContinue
 }

@@ -5,7 +5,7 @@ Live game gates are part of the Godworks OS foundation, not release polish.
 client-facing stream, game commands, and observable game state still compose into
 a playable slice.
 
-## Agar Reality Gate v1
+## Agar Reality Gate v2
 
 Current command:
 
@@ -31,6 +31,10 @@ dependency-free CDP pixel gate. It proves:
 - a live Rust `godworks-client-sdk::ClientBridge` consumes the same broker
   `CLIENT` stream and builds a non-empty positional cache with no rejected
   updates.
+- a multi-player soak phase joins several player probes through the same product
+  path, repeatedly commands them across the grid, observes ownership changes for
+  each player, verifies post-handoff command acknowledgements, and keeps
+  `/client-state` aligned with inspector truth.
 - the broker emits a live `GW_REPLAY_TAPE` artifact and `replay_eval` accepts it
   without redaction leaks, malformed spatial metadata, or protocol semantic
   contradictions.
@@ -44,8 +48,8 @@ dependency-free CDP pixel gate. It proves:
   reconnected for this query.
 
 The gate is intentionally stronger than a synthetic protocol test because it
-uses the actual demo cluster and live state. It is still not the full release
-gate.
+uses the actual demo cluster and live state. It is now the default Agar release
+ruler, though longer external soak/stress profiles can still be added above it.
 
 The probe player is protected from autonomous NPC eating by default so gameplay
 randomness cannot delete the invariant carrier before the seam proof. Set
@@ -57,14 +61,13 @@ non-privileged stream checked by the automated gate. `/state` and
 `/broker-state` are broker-truth oracle endpoints for the gate and debugging;
 they must not be the public render source.
 
-## Agar Reality Gate v2
+The default soak knobs can be overridden for heavier manual runs:
 
-Before treating the demo as release-quality, promote v1 with these additional
-checks:
-
-- duration proof: run a longer multi-client soak and keep owner count,
-  duplicate frames, rejects, and command acknowledgements inside expected
-  bounds.
+```powershell
+$env:GW_SOAK_PLAYERS = "4"
+$env:GW_SOAK_MS = "30000"
+$env:GW_SOAK_COMMAND_MS = "1500"
+```
 
 ## Godot Gates
 

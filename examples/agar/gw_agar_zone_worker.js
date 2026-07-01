@@ -256,7 +256,7 @@ setInterval(() => {
     } else {
       let best = null, bd = Infinity;
       for (const [oid, o] of view.entries()) {
-        if (isProtectedPlayer(oid, o) && c.type !== "player") continue;
+        if (isProtectedPlayer(oid, o)) continue;
         if (oid === eid || !o.pos || (o.mass || 1) >= c.mass) continue;
         const d = Math.hypot(o.pos[0] - x, o.pos[1] - y);
         if (d < bd) { bd = d; best = o; }
@@ -282,7 +282,7 @@ setInterval(() => {
 
     for (const [oid, o] of Array.from(owned.entries())) {
       if (!o.hydrated) continue;
-      if (isProtectedPlayer(oid, o) && c.type !== "player") continue;
+      if (isProtectedPlayer(oid, o)) continue;
       if (oid === eid || !o.pos || o.type !== "food" && c.mass <= o.mass * 1.1) continue;
       if (Math.hypot(o.pos[0] - x, o.pos[1] - y) < r) {
         c.mass += o.mass || 1;
