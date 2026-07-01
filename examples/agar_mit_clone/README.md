@@ -56,6 +56,12 @@ Run a broker-command stress ladder:
 .\examples\agar_mit_clone\run_mit_clone_stress_ladder.ps1 -BotCounts 40,80,120,200 -CommandPlayers 8 -CommandCapacityMinCompleted 4
 ```
 
+Run the first Godworks-authoritative server mode:
+
+```powershell
+.\examples\agar_mit_clone\run_godworks_authoritative.ps1 -BuildBroker -StopExisting -RunGate
+```
+
 Use `-StopExisting` when an old local demo owns the same ports.
 
 ## Promoted Artifact Map
@@ -78,6 +84,7 @@ clone source or `node_modules`.
 | Capacity floor proof | `gw_agar_capacity_gate.js` |
 | Old D3 runner | Superseded by `run_mit_clone_adapter.ps1 -MirrorBroker ...` |
 | Stress evidence | `run_mit_clone_stress_ladder.ps1` plus `tests/fixtures/agar_mit_clone/ladder_40_200_telemetry.json` |
+| Godworks-authoritative v0 | `run_godworks_authoritative.ps1`, `gw_authoritative_server.js`, `gw_authoritative_zone_worker.js`, `gw_authoritative_gate.js` |
 
 The older prototype shape tried to claim several regions through one
 `WorkerConnect` connection. Current public Godworks uses one
@@ -167,3 +174,33 @@ Godworks-authoritative gameplay. The stock clone still owns food, collision,
 eating, splitting, and rendering ecology. Godworks owns the adapter proof:
 dynamic map partitioning, mirror ownership, broker command routing for selected
 players, and measured local floor gates.
+
+## Godworks-authoritative v0
+
+`run_godworks_authoritative.ps1` is the first mode that removes the stock MIT
+server from the authority path. It still reuses the MIT browser client and local
+clone dependencies, but it does not start `npm start` / `src/server/server.js`.
+Instead:
+
+- the runner installs the clone dependencies when needed and builds the MIT
+  browser bundle into `bin/client`;
+- the runner starts a real Godworks broker with `GW_GRID2D=4x4`;
+- it starts one `gw_authoritative_zone_worker.js` process per grid cell;
+- each zone worker connects through normal `WorkerConnect.region`, spawns food,
+  owns entities through broker authority, moves owned players, eats owned food
+  or smaller players, and hands entities across broker grid seams;
+- `gw_authoritative_server.js` serves the MIT client on `:3000`, accepts the
+  clone Socket.IO protocol, asks the correct region worker to spawn each player,
+  sends movement as broker `CommandRequest`, and emits `serverTellPlayerMove`
+  from Godworks broker state;
+- `gw_authoritative_gate.js` proves a real Socket.IO player receives frames,
+  moves through Godworks commands, sees food, and gets fresh command responses
+  from the broker path. The browser layer is also expected to show the normal
+  MIT `Open Agar` client on `:3000`; pressing Play should enter a live canvas
+  backed by this Godworks-authoritative server.
+
+This is an authority-path milestone, not the whole final game. Current non-scope
+for v0: split, mass eject, viruses, multi-cell merge timing, production
+matchmaking, persistence of accounts, and a 10k-player capacity claim. Those are
+now implementation work on top of the Godworks-authoritative path, not blockers
+hidden behind the stock server.
