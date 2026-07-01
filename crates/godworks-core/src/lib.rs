@@ -682,6 +682,211 @@ pub struct ComponentAuthority {
     pub mode: AuthorityMode,
 }
 
+/// Current schema version for model-plane feature blocks.
+pub const MODEL_FEATURE_BLOCK_SCHEMA_VERSION: u64 = 1;
+
+/// Typed feature families the model plane may learn from.
+///
+/// These are observations, not runtime commands. Runtime mutation remains under
+/// broker validators, epochs, WAL, and versioned activation contracts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelFeatureBlockKind {
+    WorkerLoad,
+    AoiFidelityPressure,
+    EntityDensity,
+    HandoffPressure,
+    IngressRejectCost,
+    WalSync,
+    Outcome,
+}
+
+impl ModelFeatureBlockKind {
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::WorkerLoad => "WorkerLoad",
+            Self::AoiFidelityPressure => "AoiFidelityPressure",
+            Self::EntityDensity => "EntityDensity",
+            Self::HandoffPressure => "HandoffPressure",
+            Self::IngressRejectCost => "IngressRejectCost",
+            Self::WalSync => "WalSync",
+            Self::Outcome => "Outcome",
+        }
+    }
+
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        match value {
+            "WorkerLoad" => Some(Self::WorkerLoad),
+            "AoiFidelityPressure" => Some(Self::AoiFidelityPressure),
+            "EntityDensity" => Some(Self::EntityDensity),
+            "HandoffPressure" => Some(Self::HandoffPressure),
+            "IngressRejectCost" => Some(Self::IngressRejectCost),
+            "WalSync" => Some(Self::WalSync),
+            "Outcome" => Some(Self::Outcome),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelFeatureBlockValidationError {
+    EmptyProjectId,
+    EmptyDatasetId,
+    EmptyTraceId,
+    EmptySourceArtifact,
+    InvalidSchemaVersion,
+    UnredactedFeatureBlock,
+    EmptyMetricSet,
+    EmptyMetricName,
+    NonFiniteMetric { name: String },
+    ForbiddenFeatureName { name: String },
+    EmptyDimensionName,
+    EmptyDimensionValue { name: String },
+}
+
+/// Provenance for a project-local model-plane feature block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelFeatureBlockProvenance {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub trace_id: String,
+    pub source_artifact: String,
+    pub schema_version: u64,
+}
+
+impl ModelFeatureBlockProvenance {
+    pub fn new(
+        project_id: impl Into<String>,
+        dataset_id: impl Into<String>,
+        trace_id: impl Into<String>,
+        source_artifact: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_id: project_id.into(),
+            dataset_id: dataset_id.into(),
+            trace_id: trace_id.into(),
+            source_artifact: source_artifact.into(),
+            schema_version: MODEL_FEATURE_BLOCK_SCHEMA_VERSION,
+        }
+    }
+
+    pub const fn with_schema_version(mut self, schema_version: u64) -> Self {
+        self.schema_version = schema_version;
+        self
+    }
+}
+
+/// Redacted, replayable observation block for project-local micro-models.
+///
+/// A feature block may summarize runtime/replay/loadgen pressure, but it cannot
+/// carry raw auth tokens or component/update payload bodies. Keeping this typed
+/// is the first guardrail between "learn from traces" and "hidden control
+/// plane".
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelFeatureBlock {
+    pub kind: ModelFeatureBlockKind,
+    pub provenance: ModelFeatureBlockProvenance,
+    pub redacted: bool,
+    pub metrics: BTreeMap<String, f64>,
+    pub dimensions: BTreeMap<String, String>,
+}
+
+impl ModelFeatureBlock {
+    pub fn new(kind: ModelFeatureBlockKind, provenance: ModelFeatureBlockProvenance) -> Self {
+        Self {
+            kind,
+            provenance,
+            redacted: true,
+            metrics: BTreeMap::new(),
+            dimensions: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_metric(mut self, name: impl Into<String>, value: f64) -> Self {
+        self.metrics.insert(name.into(), value);
+        self
+    }
+
+    pub fn with_dimension(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.dimensions.insert(name.into(), value.into());
+        self
+    }
+
+    pub const fn with_redacted(mut self, redacted: bool) -> Self {
+        self.redacted = redacted;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), ModelFeatureBlockValidationError> {
+        if self.provenance.project_id.trim().is_empty() {
+            return Err(ModelFeatureBlockValidationError::EmptyProjectId);
+        }
+        if self.provenance.dataset_id.trim().is_empty() {
+            return Err(ModelFeatureBlockValidationError::EmptyDatasetId);
+        }
+        if self.provenance.trace_id.trim().is_empty() {
+            return Err(ModelFeatureBlockValidationError::EmptyTraceId);
+        }
+        if self.provenance.source_artifact.trim().is_empty() {
+            return Err(ModelFeatureBlockValidationError::EmptySourceArtifact);
+        }
+        if self.provenance.schema_version == 0 {
+            return Err(ModelFeatureBlockValidationError::InvalidSchemaVersion);
+        }
+        if !self.redacted {
+            return Err(ModelFeatureBlockValidationError::UnredactedFeatureBlock);
+        }
+        if self.metrics.is_empty() {
+            return Err(ModelFeatureBlockValidationError::EmptyMetricSet);
+        }
+
+        for (name, value) in &self.metrics {
+            validate_feature_name(name)?;
+            if !value.is_finite() {
+                return Err(ModelFeatureBlockValidationError::NonFiniteMetric {
+                    name: name.clone(),
+                });
+            }
+        }
+
+        for (name, value) in &self.dimensions {
+            validate_feature_name(name)?;
+            if value.trim().is_empty() {
+                return Err(ModelFeatureBlockValidationError::EmptyDimensionValue {
+                    name: name.clone(),
+                });
+            }
+            validate_feature_name(value)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_feature_name(name: &str) -> Result<(), ModelFeatureBlockValidationError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ModelFeatureBlockValidationError::EmptyMetricName);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for forbidden in [
+        "auth_token",
+        "token",
+        "secret",
+        "password",
+        "payload",
+        "component_body",
+        "components",
+        "updates",
+    ] {
+        if lower.contains(forbidden) {
+            return Err(ModelFeatureBlockValidationError::ForbiddenFeatureName {
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Promotion mode for a model-plane proposal.
 ///
 /// Model output may rank or recommend policy actions, but the deterministic
@@ -1143,5 +1348,116 @@ mod tests {
                 ModelActionProposal::new(ModelActionKind::Noop, ModelActionMode::Observe, bad);
             assert!(proposal.validate().is_err());
         }
+    }
+
+    #[test]
+    fn model_feature_block_requires_redacted_finite_replayable_features() {
+        let provenance = ModelFeatureBlockProvenance::new(
+            "arena",
+            "load-dataset-v1",
+            "trace-42",
+            "replay_tape:agar.replay.jsonl",
+        );
+
+        let block = ModelFeatureBlock::new(ModelFeatureBlockKind::WorkerLoad, provenance.clone())
+            .with_metric("tick_hz", 24.0)
+            .with_metric("owned_entities", 120.0)
+            .with_metric("pending_mesh", 2.0)
+            .with_dimension("world_id", "arena-dev")
+            .with_dimension("partition_schema", "grid2d");
+
+        assert_eq!(block.validate(), Ok(()));
+        assert_eq!(MODEL_FEATURE_BLOCK_SCHEMA_VERSION, 1);
+        assert_eq!(
+            ModelFeatureBlockKind::from_wire_str(ModelFeatureBlockKind::WorkerLoad.as_wire_str()),
+            Some(ModelFeatureBlockKind::WorkerLoad)
+        );
+
+        let unredacted = block.clone().with_redacted(false);
+        assert_eq!(
+            unredacted.validate(),
+            Err(ModelFeatureBlockValidationError::UnredactedFeatureBlock)
+        );
+
+        let non_finite = ModelFeatureBlock::new(ModelFeatureBlockKind::WorkerLoad, provenance)
+            .with_metric("tick_hz", f64::NAN);
+        assert_eq!(
+            non_finite.validate(),
+            Err(ModelFeatureBlockValidationError::NonFiniteMetric {
+                name: "tick_hz".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn model_feature_block_rejects_raw_secret_or_payload_shapes() {
+        let provenance = ModelFeatureBlockProvenance::new(
+            "arena",
+            "load-dataset-v1",
+            "trace-42",
+            "replay_tape:agar.replay.jsonl",
+        );
+
+        for forbidden in [
+            "auth_token",
+            "worker_secret",
+            "raw_payload_bytes",
+            "component_body",
+            "components_json",
+            "updates_json",
+        ] {
+            let block =
+                ModelFeatureBlock::new(ModelFeatureBlockKind::WorkerLoad, provenance.clone())
+                    .with_metric("tick_hz", 24.0)
+                    .with_dimension(forbidden, "present");
+
+            assert!(matches!(
+                block.validate(),
+                Err(ModelFeatureBlockValidationError::ForbiddenFeatureName { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn model_feature_block_contract_pins_project_local_provenance() {
+        let valid = ModelFeatureBlock::new(
+            ModelFeatureBlockKind::HandoffPressure,
+            ModelFeatureBlockProvenance::new(
+                "project-alpha",
+                "handoff-v1",
+                "trace-99",
+                "reality_loadgen:cross-broker",
+            ),
+        )
+        .with_metric("handoff_rate", 3.0)
+        .with_dimension("region", "Z1_0");
+        assert_eq!(valid.validate(), Ok(()));
+
+        for bad in [
+            ModelFeatureBlockProvenance::new("", "handoff-v1", "trace-99", "reality_loadgen"),
+            ModelFeatureBlockProvenance::new("project-alpha", "", "trace-99", "reality_loadgen"),
+            ModelFeatureBlockProvenance::new("project-alpha", "handoff-v1", "", "reality_loadgen"),
+            ModelFeatureBlockProvenance::new("project-alpha", "handoff-v1", "trace-99", ""),
+        ] {
+            let block = ModelFeatureBlock::new(ModelFeatureBlockKind::HandoffPressure, bad)
+                .with_metric("handoff_rate", 3.0);
+            assert!(block.validate().is_err());
+        }
+
+        let bad_version = ModelFeatureBlock::new(
+            ModelFeatureBlockKind::HandoffPressure,
+            ModelFeatureBlockProvenance::new(
+                "project-alpha",
+                "handoff-v1",
+                "trace-99",
+                "reality_loadgen",
+            )
+            .with_schema_version(0),
+        )
+        .with_metric("handoff_rate", 3.0);
+        assert_eq!(
+            bad_version.validate(),
+            Err(ModelFeatureBlockValidationError::InvalidSchemaVersion)
+        );
     }
 }
