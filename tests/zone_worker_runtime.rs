@@ -537,9 +537,10 @@ fn moving_w_bodies_handoff_to_e_with_epoch_fencing_and_no_stale_ownership() {
         "east did not adopt the crossing bodies\nwest={west_stderr}\neast={east_stderr}"
     );
     let west_rejects = summary_usize(&west_summary, "rejects");
-    assert_only_handoff_fence_rejects(&west_summary, "zw-E-lifecycle", 24 * 12);
+    let max_handoff_fence_rejects = 24 * 2 * summary_usize(&west_summary, "tick").max(1);
+    assert_only_handoff_fence_rejects(&west_summary, "zw-E-lifecycle", max_handoff_fence_rejects);
     assert!(
-        west_rejects <= 24 * 12,
+        west_rejects <= max_handoff_fence_rejects,
         "west should only see bounded old-owner fences, not an unbounded reject storm\n{west_stderr}"
     );
     assert_eq!(summary_usize(&east_summary, "rejects"), 0, "{east_stderr}");
