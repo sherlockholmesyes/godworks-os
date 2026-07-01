@@ -62,6 +62,12 @@ Run the first Godworks-authoritative server mode:
 .\examples\agar_mit_clone\run_godworks_authoritative.ps1 -BuildBroker -StopExisting -RunGate
 ```
 
+Run the Godworks-authoritative stress ladder:
+
+```powershell
+.\examples\agar_mit_clone\run_godworks_authoritative_stress_ladder.ps1 -BotCounts 20,50,100
+```
+
 Use `-StopExisting` when an old local demo owns the same ports.
 
 ## Promoted Artifact Map
@@ -85,6 +91,7 @@ clone source or `node_modules`.
 | Old D3 runner | Superseded by `run_mit_clone_adapter.ps1 -MirrorBroker ...` |
 | Stress evidence | `run_mit_clone_stress_ladder.ps1` plus `tests/fixtures/agar_mit_clone/ladder_40_200_telemetry.json` |
 | Godworks-authoritative v0 | `run_godworks_authoritative.ps1`, `gw_authoritative_server.js`, `gw_authoritative_zone_worker.js`, `gw_authoritative_gate.js` |
+| Godworks-authoritative capacity floor | `gw_authoritative_bots.js`, `gw_authoritative_capacity_gate.js`, `run_godworks_authoritative_stress_ladder.ps1` |
 
 The older prototype shape tried to claim several regions through one
 `WorkerConnect` connection. Current public Godworks uses one
@@ -204,3 +211,28 @@ for v0: split, mass eject, viruses, multi-cell merge timing, production
 matchmaking, persistence of accounts, and a 10k-player capacity claim. Those are
 now implementation work on top of the Godworks-authoritative path, not blockers
 hidden behind the stock server.
+
+## Godworks-authoritative Capacity Ladder
+
+`run_godworks_authoritative_stress_ladder.ps1` measures capacity floors for the
+authoritative path, not the old stock-server mirror path. For each configured
+bot count it:
+
+- starts a clean Godworks-authoritative stack;
+- starts real Socket.IO player bots through the same `:3000` gateway as the
+  browser client;
+- samples `:3000/state` and the bot controller state;
+- requires sustained players, player entities, total entities, all worker-owner
+  slots, fresh broker command-response growth, zero fresh command-reject growth
+  during the measured window by default, bounded transient stale/no-owner
+  command retries, live bot frames, and live bots at the end of the window;
+- after stopping the bots, waits for authoritative cleanup and requires
+  `players=0` plus `playerEntities=0` so a stale owner during handoff cannot
+  leave an orphan player entity behind a green capacity row;
+- writes `.local/agar_authoritative_ladder/ladder_summary.json` with host,
+  logs, thresholds, initial/latest server state, initial/latest bot state, raw
+  reject diagnostics, cleanup state, and process resource snapshots.
+
+This is the first step toward larger-map and 10k-player work. Treat the highest
+green row as an observed local floor under the current runner and hardware, not
+as a maximum-player claim.

@@ -39,6 +39,13 @@ let clientBuf = Buffer.alloc(0);
 let requestSeq = 0;
 let commandResponses = 0;
 let commandRejects = 0;
+let commandTransientRejects = 0;
+let despawnFallbacks = 0;
+let despawnFailures = 0;
+const rejectedCommands = [];
+const transientRejectedCommands = [];
+const failedDespawns = [];
+const pendingCommands = new Map();
 
 app.use(express.static(clientRoot));
 
@@ -145,7 +152,68 @@ function handleObsFrame(msg) {
 function handleClientFrame(msg) {
   if (msg.op !== "CommandResponse") return;
   commandResponses++;
-  if (!msg.success) commandRejects++;
+  const pending = pendingCommands.get(msg.request_id);
+  pendingCommands.delete(msg.request_id);
+  const player = pending ? players.get(pending.player) : null;
+  if (player && player.commandInFlight === msg.request_id) {
+    player.commandInFlight = null;
+  }
+  if (!msg.success) {
+    const retryable = pending
+      && isRetryableCommandReject(msg.reason)
+      && (pending.attempt || 0) < 2
+      && player
+      && player.spawned
+      && entities.has(player.entity);
+    if (retryable) {
+      commandTransientRejects++;
+      recordCommandReject(transientRejectedCommands, msg, pending);
+      player.queuedTarget = pending.target;
+      setTimeout(() => flushQueuedTarget(player, (pending.attempt || 0) + 1), 25);
+    } else {
+      commandRejects++;
+      recordCommandReject(rejectedCommands, msg, pending);
+    }
+  } else if (player && player.queuedTarget) {
+    setTimeout(() => flushQueuedTarget(player, 0), 0);
+  }
+  while (pendingCommands.size > 1024) {
+    const oldest = pendingCommands.keys().next().value;
+    if (oldest === undefined) break;
+    pendingCommands.delete(oldest);
+  }
+}
+
+function isRetryableCommandReject(reason) {
+  const text = String(reason || "").toLowerCase();
+  return text.includes("stale command authority")
+    || text.includes("no authoritative worker")
+    || text.includes("entity not owned");
+}
+
+function recordCommandReject(list, msg, pending) {
+  list.push({
+    request_id: msg.request_id || null,
+    entity: msg.entity || (pending && pending.entity) || null,
+    player: (pending && pending.player) || null,
+    reason: msg.reason || "unknown",
+    target: (pending && pending.target) || null,
+    attempt: pending ? (pending.attempt || 0) : null,
+    age_ms: pending ? Math.max(0, Date.now() - pending.sentAt) : null,
+  });
+  while (list.length > 16) list.shift();
+}
+
+function recordFailedDespawn(player, reason, region) {
+  despawnFailures++;
+  failedDespawns.push({
+    player: player.id,
+    entity: player.entity,
+    reason: String(reason || "unknown"),
+    region: region || null,
+    ts: Date.now(),
+  });
+  while (failedDespawns.length > 16) failedDespawns.shift();
 }
 
 function ensureEntity(id) {
@@ -179,6 +247,54 @@ function spawnPoint() {
     WIDTH / 2 + (Math.random() - 0.5) * WIDTH * 0.1,
     HEIGHT / 2 + (Math.random() - 0.5) * HEIGHT * 0.1,
   ];
+}
+
+function clampWorld(pos) {
+  return {
+    x: Math.max(0, Math.min(WIDTH, Number(pos.x) || 0)),
+    y: Math.max(0, Math.min(HEIGHT, Number(pos.y) || 0)),
+  };
+}
+
+function worldTargetFor(player, target) {
+  const raw = target || {};
+  const entity = entities.get(player.entity);
+  const base = entity && Array.isArray(entity.pos) ? entity.pos : [WIDTH / 2, HEIGHT / 2];
+  return clampWorld({
+    x: base[0] + (Number(raw.x) || 0),
+    y: base[1] + (Number(raw.y) || 0),
+  });
+}
+
+function flushQueuedTarget(player, attempt) {
+  if (!player || !player.queuedTarget || player.commandInFlight) return;
+  const target = player.queuedTarget;
+  player.queuedTarget = null;
+  sendTargetCommand(player, target, attempt || 0);
+}
+
+function sendTargetCommand(player, worldTarget, attempt) {
+  if (!player.spawned || !entities.has(player.entity)) return;
+  if (player.commandInFlight) {
+    player.queuedTarget = worldTarget;
+    return;
+  }
+  const requestId = `auth-cmd-${requestSeq++}`;
+  player.commandInFlight = requestId;
+  pendingCommands.set(requestId, {
+    entity: player.entity,
+    player: player.id,
+    target: worldTarget,
+    attempt: attempt || 0,
+    sentAt: Date.now(),
+  });
+  send(clientSock, {
+    op: "CommandRequest",
+    request_id: requestId,
+    entity: player.entity,
+    command: "set_target",
+    payload: { target: worldTarget },
+  });
 }
 
 function postJson(url, body) {
@@ -226,15 +342,36 @@ async function spawnPlayer(player) {
 
 async function despawnPlayer(player) {
   const entity = entities.get(player.entity);
-  const region = regionForOwner(entity && entity.owner)
+  const primary = regionForOwner(entity && entity.owner)
     || regionFor((entity && entity.pos) || player.spawnPos || [WIDTH / 2, HEIGHT / 2]);
-  const url = `http://127.0.0.1:${CONTROL_BASE + region.index}/despawn`;
-  try {
-    const reply = await postJson(url, { entity: player.entity });
-    if (!reply.ok) console.error(`[auth-server] despawn ${player.entity} via ${region.region} failed: ${reply.reason || "unknown"}`);
-  } catch (e) {
-    console.error(`[auth-server] despawn ${player.entity} via ${region.region} error: ${e.message}`);
+  const tried = new Set();
+  const regions = [primary];
+  for (let row = 0; row < ROWS; row++) {
+    for (let col = 0; col < COLS; col++) {
+      regions.push({ col, row, region: `Z${col}_${row}`, index: row * COLS + col });
+    }
   }
+  let firstFailure = null;
+  for (const region of regions) {
+    if (!region || tried.has(region.index)) continue;
+    tried.add(region.index);
+    const url = `http://127.0.0.1:${CONTROL_BASE + region.index}/despawn`;
+    try {
+      const reply = await postJson(url, { entity: player.entity });
+      if (reply.ok) {
+        if (region.index !== primary.index) despawnFallbacks++;
+        return true;
+      }
+      firstFailure = firstFailure || { region: region.region, reason: reply.reason || "unknown" };
+    } catch (e) {
+      firstFailure = firstFailure || { region: region.region, reason: e.message };
+    }
+  }
+  recordFailedDespawn(player, firstFailure && firstFailure.reason, firstFailure && firstFailure.region);
+  console.error(
+    `[auth-server] despawn ${player.entity} failed after ${tried.size} workers; first=${(firstFailure && firstFailure.region) || "?"}: ${(firstFailure && firstFailure.reason) || "unknown"}`
+  );
+  return false;
 }
 
 function playerFrame(player) {
@@ -313,6 +450,8 @@ io.on("connection", socket => {
     hue: Math.round(Math.random() * 360),
     lastTarget: { x: WIDTH / 2, y: HEIGHT / 2 },
     spawned: false,
+    commandInFlight: null,
+    queuedTarget: null,
   };
   players.set(socket.id, player);
 
@@ -342,13 +481,9 @@ io.on("connection", socket => {
 
   socket.on("0", target => {
     player.lastTarget = target || player.lastTarget;
-    send(clientSock, {
-      op: "CommandRequest",
-      request_id: `auth-cmd-${requestSeq++}`,
-      entity: player.entity,
-      command: "set_target",
-      payload: target,
-    });
+    if (!player.spawned || !entities.has(player.entity)) return;
+    const worldTarget = worldTargetFor(player, player.lastTarget);
+    sendTargetCommand(player, worldTarget, 0);
   });
   socket.on("1", () => socket.emit("serverMSG", "Split is not implemented in Godworks authoritative v0."));
   socket.on("2", () => socket.emit("serverMSG", "Mass eject is not implemented in Godworks authoritative v0."));
@@ -379,6 +514,12 @@ app.get("/state", (_req, res) => {
     playerEntities: Array.from(entities.values()).filter(entity => entity.kind === "player").length,
     commandResponses,
     commandRejects,
+    commandTransientRejects,
+    despawnFallbacks,
+    despawnFailures,
+    rejectedCommands,
+    transientRejectedCommands,
+    failedDespawns,
     owners: Array.from(entities.values()).reduce((acc, entity) => {
       const key = entity.owner || entity.region || "?";
       acc[key] = (acc[key] || 0) + 1;
