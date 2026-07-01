@@ -4,6 +4,7 @@ param(
   [switch]$RunGate,
   [switch]$RunPlayableSeamGate,
   [switch]$RunBrokerCommandGate,
+  [switch]$RunBrokerCommandCapacityGate,
   [switch]$RunCapacityGate,
   [switch]$SkipGame,
   [switch]$StopExisting,
@@ -20,7 +21,9 @@ param(
   [int]$CapacityMinPlayers = 30,
   [int]$CapacityMinEntities = 800,
   [int]$CapacityMinWorkers = 16,
-  [int]$CapacityMinOkSamples = 8
+  [int]$CapacityMinOkSamples = 8,
+  [int]$CommandPlayers = 4,
+  [int]$CommandCapacityMinCompleted = 4
 )
 
 $ErrorActionPreference = "Stop"
@@ -164,7 +167,7 @@ function Ensure-StockClone {
 
 function Copy-CloneTools {
   if (-not (Test-Path -LiteralPath $CloneRoot)) { return }
-  foreach ($name in @("_gw_spectator_tap.js", "_gw_bots.js", "gw_shard_monitor.js", "gw_agar_mirror_worker.js", "gw_agar_command_bridge.js", "gw_agar_playable_seam_gate.js", "gw_agar_broker_command_gate.js", "gw_agar_capacity_gate.js")) {
+  foreach ($name in @("_gw_spectator_tap.js", "_gw_bots.js", "gw_shard_monitor.js", "gw_agar_mirror_worker.js", "gw_agar_command_bridge.js", "gw_agar_playable_seam_gate.js", "gw_agar_broker_command_gate.js", "gw_agar_broker_command_capacity_gate.js", "gw_agar_capacity_gate.js")) {
     Copy-Item -LiteralPath (Join-Path $ToolsDir $name) -Destination (Join-Path $CloneRoot $name) -Force
   }
 }
@@ -179,6 +182,10 @@ Copy-CloneTools
 
 if ($RunBrokerCommandGate -and -not $MirrorBroker) {
   throw "-RunBrokerCommandGate requires -MirrorBroker because it verifies broker-routed CommandRequest ownership"
+}
+
+if ($RunBrokerCommandCapacityGate -and -not $MirrorBroker) {
+  throw "-RunBrokerCommandCapacityGate requires -MirrorBroker because it verifies broker-routed CommandRequest ownership"
 }
 
 if (-not $SkipGame -and -not (Test-PortListening 3000)) {
@@ -235,9 +242,17 @@ if ($MirrorBroker) {
     Write-Host "Godworks broker already listening on :$PortBroker"
   }
 
-  if ($RunBrokerCommandGate) {
+  $NeedsCommandBridge = $RunBrokerCommandGate -or $RunBrokerCommandCapacityGate
+
+  if ($RunBrokerCommandCapacityGate -and (Test-PortListening $PortCommandBridge)) {
+    Write-Host "broker-command capacity gate needs a fresh multi-player command bridge; restarting :$PortCommandBridge"
+    Stop-CommandProcessAll @("gw_agar_command_bridge.js")
+    Start-Sleep -Milliseconds 500
+  }
+
+  if ($NeedsCommandBridge) {
     if (-not (Test-PortListening $PortCommandBridge)) {
-      $cmd = "Set-Location '$CloneRoot'; `$env:GW_AGAR_GAME_URL='http://127.0.0.1:3000'; `$env:GW_AGAR_COMMAND_PORT='$PortCommandBridge'; & '$NodeExe' 'gw_agar_command_bridge.js'"
+      $cmd = "Set-Location '$CloneRoot'; `$env:GW_AGAR_GAME_URL='http://127.0.0.1:3000'; `$env:GW_AGAR_COMMAND_PORT='$PortCommandBridge'; `$env:GW_AGAR_COMMAND_PLAYERS='$CommandPlayers'; & '$NodeExe' 'gw_agar_command_bridge.js'"
       Start-LoggedPowerShell "agar_command_bridge_$PortCommandBridge" $cmd $CloneRoot | Out-Null
       Wait-Port $PortCommandBridge "agar command bridge"
     } else {
@@ -250,19 +265,19 @@ if ($MirrorBroker) {
       $r = "Z${x}_${y}"
       $wid = "mit-$r"
       $workerNeedles = @($wid, "GW_PORT='$PortBroker'")
-      if ($RunBrokerCommandGate) {
+      if ($NeedsCommandBridge) {
         $workerNeedles += "GW_AGAR_COMMAND_URL"
       }
       if (Test-CommandProcessAll $workerNeedles) {
         Write-Host "$wid mirror worker already running"
       } else {
-        if ($RunBrokerCommandGate -and (Test-CommandProcessAll @($wid, "GW_PORT='$PortBroker'", "gw_agar_mirror_worker.js"))) {
+        if ($NeedsCommandBridge -and (Test-CommandProcessAll @($wid, "GW_PORT='$PortBroker'", "gw_agar_mirror_worker.js"))) {
           Write-Host "$wid mirror worker is running without command bridge env; restarting it"
           Stop-CommandProcessAll @($wid, "GW_PORT='$PortBroker'", "gw_agar_mirror_worker.js")
           Start-Sleep -Milliseconds 300
         }
         $commandBridgeEnv = ""
-        if ($RunBrokerCommandGate) {
+        if ($NeedsCommandBridge) {
           $commandBridgeEnv = "`$env:GW_AGAR_COMMAND_URL='http://127.0.0.1:$PortCommandBridge'; "
         }
         $cmd = "Set-Location '$CloneRoot'; `$env:GW_PORT='$PortBroker'; `$env:GW_GRID2D='4x4'; `$env:GW_ARENA='5000'; `$env:GW_REGION='$r'; `$env:GW_WID='$wid'; `$env:GW_CONNECT_TOKEN='$r-token'; $commandBridgeEnv& '$NodeExe' 'gw_agar_mirror_worker.js'"
@@ -289,6 +304,8 @@ if ($MirrorBroker) {
   Write-Host "  view:    http://localhost:$PortView/"
   if ($RunBrokerCommandGate) {
     Write-Host "  command: http://localhost:$PortCommandBridge/"
+  } elseif ($RunBrokerCommandCapacityGate) {
+    Write-Host "  command: http://localhost:$PortCommandBridge/ ($CommandPlayers controlled players)"
   }
   Write-Host "  wal:     $WalPath"
 }
@@ -336,6 +353,29 @@ if ($RunBrokerCommandGate) {
   Push-Location $CloneRoot
   try {
     & $NodeExe "gw_agar_broker_command_gate.js"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  } finally {
+    Pop-Location
+  }
+}
+
+if ($RunBrokerCommandCapacityGate) {
+  Start-Sleep -Seconds 3
+  $env:GW_HOST = "127.0.0.1"
+  $env:GW_PORT = "$PortBroker"
+  $env:GW_CLIENT_TOKEN = "client-token"
+  $env:GW_AGAR_COMMAND_BRIDGE_URL = "http://127.0.0.1:$PortCommandBridge"
+  $env:GW_AGAR_MONITOR_URL = "http://127.0.0.1:$PortMonitor/state"
+  $env:GW_AGAR_BROKER_VIEW_URL = "http://127.0.0.1:$PortView/state"
+  $env:GW_AGAR_COMMAND_CAPACITY_PLAYERS = "$CommandPlayers"
+  $env:GW_AGAR_COMMAND_CAPACITY_MIN_COMPLETED = "$CommandCapacityMinCompleted"
+  $env:GW_AGAR_CAPACITY_MIN_PLAYERS = "$CapacityMinPlayers"
+  $env:GW_AGAR_CAPACITY_MIN_ENTITIES = "$CapacityMinEntities"
+  $env:GW_AGAR_CAPACITY_MIN_WORKERS = "$CapacityMinWorkers"
+  $env:GW_AGAR_CAPACITY_MIN_OK_SAMPLES = "$CapacityMinOkSamples"
+  Push-Location $CloneRoot
+  try {
+    & $NodeExe "gw_agar_broker_command_capacity_gate.js"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   } finally {
     Pop-Location

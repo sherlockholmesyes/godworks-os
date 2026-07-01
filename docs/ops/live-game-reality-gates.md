@@ -81,6 +81,7 @@ Commands:
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -RunGate
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunPlayableSeamGate
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandGate
+.\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandCapacityGate -CommandPlayers 4
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunCapacityGate
 ```
 
@@ -102,6 +103,14 @@ Godworks `pos` authority owner before and after a broker ownership seam. A direc
 Socket.IO command path cannot satisfy this gate because the gate waits for the
 broker-routed response correlation key.
 
+`-RunBrokerCommandCapacityGate` combines the broker-command proof with the
+capacity ruler. The command bridge owns several selected stock-clone players,
+the gate polls those exact entities rather than the aggregate bridge state, and
+each completed player must cross a dynamic `:8091` block, cross a Godworks owner
+seam in `:8092`, keep moving after the seam, and receive an accepted
+post-seam `CommandResponse` from the current owner. Background bots can satisfy
+the population floor, but they cannot satisfy the controlled-player metrics.
+
 `-RunCapacityGate` is the first reproducible MIT-clone capacity floor. It samples
 the live `:8091` dynamic-zone monitor for a sustained window and optionally the
 `:8092` Godworks broker mirror. The default floor is intentionally modest and
@@ -113,7 +122,7 @@ is not a maximum CCU benchmark; it is the live-game ruler that prevents
 Boundary: even the broker-command MIT clone gate is not yet a full
 Godworks-authoritative replacement for the MIT clone server. The stock clone
 still owns its gameplay ecology and physics; Godworks proves live projection,
-ownership, and broker-routed command control for a controlled player.
+ownership, and broker-routed command control for controlled players.
 
 ## Godot Gates
 
