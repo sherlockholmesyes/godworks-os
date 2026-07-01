@@ -81,6 +81,7 @@ Commands:
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -RunGate
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunPlayableSeamGate
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandGate
+.\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunCapacityGate
 ```
 
 `-RunGate` proves the stock game is playable on `:3000`, the dynamic `:8091`
@@ -100,6 +101,14 @@ frames, and requires accepted `CommandResponse` frames from the current
 Godworks `pos` authority owner before and after a broker ownership seam. A direct
 Socket.IO command path cannot satisfy this gate because the gate waits for the
 broker-routed response correlation key.
+
+`-RunCapacityGate` is the first reproducible MIT-clone capacity floor. It samples
+the live `:8091` dynamic-zone monitor for a sustained window and optionally the
+`:8092` Godworks broker mirror. The default floor is intentionally modest and
+repeatable on a local machine: at least 30 players, 800 live entities, 16 worker
+load slots, 8 good samples, and observed non-uniform dynamic zone geometry. This
+is not a maximum CCU benchmark; it is the live-game ruler that prevents
+"capacity" from being inferred from one screenshot or one transient sample.
 
 Boundary: even the broker-command MIT clone gate is not yet a full
 Godworks-authoritative replacement for the MIT clone server. The stock clone
