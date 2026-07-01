@@ -66,13 +66,26 @@ The live gate is intentionally stronger than `cargo test`: it proves the browser
 slice can join, send commands, receive command acknowledgements after handoff,
 move, cross partition seams, keep every entity owned by a real worker, reject
 privilege self-assignment, compare client-stream truth against inspector truth,
-and avoid duplicate entity ids in observed frames.
+avoid duplicate entity ids in observed frames, and render a non-blank moving
+canvas sourced from `/client-state`.
 
 This is the current Agar Reality Gate v1. It is now bound to the System Laws
 index as a runtime ruler, but it is not yet the full release gate. The remaining
-promotion work is tracked in `docs/ops/live-game-reality-gates.md`: pixel/canvas
-proof, `godworks-client-sdk` cache proof, replay tape validation, WAL restore
-agreement, and longer soak coverage.
+promotion work is tracked in `docs/ops/live-game-reality-gates.md`:
+`godworks-client-sdk` cache proof, replay tape validation, WAL restore agreement,
+and longer soak coverage.
+
+The pixel gate launches Chrome/Edge through the Chrome DevTools Protocol without
+Playwright/Puppeteer. If the browser is not in a standard location, set:
+
+```powershell
+$env:GW_PIXEL_BROWSER = "C:\Path\To\chrome.exe"
+```
+
+The demo protects `P-*` player probes from autonomous NPC eating by default so
+the release gate measures seam handoff instead of random early deletion. Set
+`GW_AGAR_PROTECT_PLAYERS=0` for chaos/gameplay runs that should allow NPCs to
+eat players.
 
 ## Local Reference Clone
 

@@ -14,7 +14,8 @@ Current command:
 ```
 
 The gate starts one broker, a 4x4 worker pool, the browser gateway, and an
-automated driver. It proves:
+automated driver. It also launches a headless Chromium browser through the
+dependency-free CDP pixel gate. It proves:
 
 - a player can join through the product path;
 - `CommandRequest` input reaches the current owner;
@@ -24,11 +25,18 @@ automated driver. It proves:
 - observed frames do not duplicate entity ids;
 - the non-privileged `CLIENT` stream matches the token-bound inspector truth;
 - client-role peers cannot create entities, query inspector state, claim mesh
-  privilege, or create platform authority components.
+  privilege, or create platform authority components;
+- the visible canvas is non-blank, reports `source: CLIENT stream`, and moves a
+  visible player through the product browser path.
 
 The gate is intentionally stronger than a synthetic protocol test because it
 uses the actual demo cluster and live state. It is still not the full release
 gate.
+
+The probe player is protected from autonomous NPC eating by default so gameplay
+randomness cannot delete the invariant carrier before the seam proof. Set
+`GW_AGAR_PROTECT_PLAYERS=0` for chaos/gameplay runs where that protection is not
+desired.
 
 The visible browser canvas must consume `/client-state`, the same
 non-privileged stream checked by the automated gate. `/state` and
@@ -40,8 +48,6 @@ they must not be the public render source.
 Before treating the demo as release-quality, promote v1 with these additional
 checks:
 
-- pixel proof: open `http://localhost:8091`, verify the canvas is non-blank,
-  moving, sourced from `/client-state`, and aligned with the gate summary;
 - SDK cache proof: route one client-facing check through
   `godworks-client-sdk::ClientBridge` instead of only the JavaScript gateway
   cache;

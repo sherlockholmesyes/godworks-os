@@ -20,6 +20,7 @@ const WORLD = parseWorld(process.env.GW_WORLD || "0,120,0,120");
 const GRID = process.env.GW_GRID || process.env.GW_GRID2D || "";
 const ARENA = parseArena(process.env.GW_ARENA || `${WORLD[1] - WORLD[0]},${WORLD[3] - WORLD[2]}`);
 const BOX = parseBox(process.env.GW_BOX) || boxForRegion(REGION, GRID, ARENA, WORLD);
+const PROTECT_PLAYERS = process.env.GW_AGAR_PROTECT_PLAYERS !== "0";
 
 const view = new Map();
 const owned = new Map();
@@ -76,6 +77,10 @@ function send(sock, obj) {
 
 function rnd(min, max) {
   return min + Math.random() * (max - min);
+}
+
+function isProtectedPlayer(eid, entity) {
+  return PROTECT_PLAYERS && ((entity && entity.type === "player") || /^P-\d+$/.test(String(eid)));
 }
 
 function newComponents(pos, vel, mass, type) {
@@ -154,12 +159,25 @@ sock.on("data", d => {
       process.exit(2);
     } else if (f.op === "AddEntity") {
       const c = f.components || {};
-      view.set(f.entity, {
+      const entityState = {
         pos: Array.isArray(c.pos) ? c.pos : [0, 0],
         vel: Array.isArray(c.vel) ? c.vel : [0, 0],
         mass: Number.isFinite(Number(c.mass)) ? Number(c.mass) : 1,
         type: typeof c.type === "string" ? c.type : (String(f.entity).includes("-food-") ? "food" : "cell")
-      });
+      };
+      view.set(f.entity, entityState);
+      const existingOwned = owned.get(f.entity);
+      if (existingOwned) {
+        owned.set(f.entity, {
+          pos: entityState.pos.slice(),
+          vel: entityState.vel.slice(),
+          mass: entityState.mass,
+          type: entityState.type,
+          target: existingOwned.target,
+          epoch: existingOwned.epoch,
+          hydrated: true
+        });
+      }
     } else if (f.op === "ComponentUpdate") {
       applyComponent(f.entity, componentName(f), componentValue(f));
     } else if (f.op === "RemoveEntity") {
@@ -177,7 +195,8 @@ sock.on("data", d => {
           mass: Number(prev && prev.mass || v.mass || 1),
           type: prev && prev.type || v.type || (String(f.entity).includes("-food-") ? "food" : "cell"),
           target: prev && prev.target,
-          epoch: f.authority_epoch || (prev && prev.epoch) || 1
+          epoch: f.authority_epoch || (prev && prev.epoch) || 1,
+          hydrated: !!view.get(f.entity) || !!(prev && prev.hydrated)
         });
       } else {
         owned.delete(f.entity);
@@ -218,6 +237,7 @@ setInterval(() => {
 
   for (const [eid, c] of Array.from(owned.entries())) {
     if (c.type === "food") continue;
+    if (!c.hydrated) continue;
     let [x, y] = c.pos;
     let [vx, vy] = c.vel;
     const r = RADIUS_BASE * Math.sqrt(Math.max(1, c.mass));
@@ -236,6 +256,7 @@ setInterval(() => {
     } else {
       let best = null, bd = Infinity;
       for (const [oid, o] of view.entries()) {
+        if (isProtectedPlayer(oid, o) && c.type !== "player") continue;
         if (oid === eid || !o.pos || (o.mass || 1) >= c.mass) continue;
         const d = Math.hypot(o.pos[0] - x, o.pos[1] - y);
         if (d < bd) { bd = d; best = o; }
@@ -260,6 +281,8 @@ setInterval(() => {
     view.set(eid, { pos: c.pos.slice(), vel: c.vel.slice(), mass: c.mass, type: c.type });
 
     for (const [oid, o] of Array.from(owned.entries())) {
+      if (!o.hydrated) continue;
+      if (isProtectedPlayer(oid, o) && c.type !== "player") continue;
       if (oid === eid || !o.pos || o.type !== "food" && c.mass <= o.mass * 1.1) continue;
       if (Math.hypot(o.pos[0] - x, o.pos[1] - y) < r) {
         c.mass += o.mass || 1;

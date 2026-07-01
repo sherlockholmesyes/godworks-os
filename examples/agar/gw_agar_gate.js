@@ -163,6 +163,12 @@ async function main() {
   let initialCommand = null;
   let clientTruthMatches = 0;
   let clientTruthMismatches = 0;
+  let playerMissingAfterSeen = 0;
+  let playerAbsentStreak = 0;
+  let playerMaxAbsentStreak = 0;
+  let probeMissingBeforeHandoff = 0;
+  let probeMissingBeforeHandoffStreak = 0;
+  let probeMaxMissingBeforeHandoffStreak = 0;
   let commandAfterHandoff = null;
   let commandAfterHandoffOwnerAtSend = null;
 
@@ -183,6 +189,8 @@ async function main() {
       maxOwners = Math.max(maxOwners, owners.size);
       const p = state.find(e => e.e === player);
       if (p && Array.isArray(p.p)) {
+        playerAbsentStreak = 0;
+        probeMissingBeforeHandoffStreak = 0;
         playerSeen = true;
         if (!playerStart) playerStart = p.p.slice();
         if (!driveTarget) {
@@ -213,6 +221,15 @@ async function main() {
         if (!commandAfterHandoff && (playerOwners.size > 1 || observedOwnerChanges > 0)) {
           commandAfterHandoffOwnerAtSend = p.o || null;
           commandAfterHandoff = await req("POST", "/input?wait=1", { id: player, target: driveTarget || p.p });
+        }
+      } else if (playerSeen) {
+        playerMissingAfterSeen++;
+        playerAbsentStreak++;
+        playerMaxAbsentStreak = Math.max(playerMaxAbsentStreak, playerAbsentStreak);
+        if (playerOwners.size <= 1 && observedOwnerChanges <= 0) {
+          probeMissingBeforeHandoff++;
+          probeMissingBeforeHandoffStreak++;
+          probeMaxMissingBeforeHandoffStreak = Math.max(probeMaxMissingBeforeHandoffStreak, probeMissingBeforeHandoffStreak);
         }
       }
     }
@@ -257,6 +274,11 @@ async function main() {
     observed_owner_changes: observedOwnerChanges,
     client_truth_matches: clientTruthMatches,
     client_truth_mismatches: clientTruthMismatches,
+    player_missing_after_seen: playerMissingAfterSeen,
+    player_max_absent_streak: playerMaxAbsentStreak,
+    player_terminal_absent_streak: playerAbsentStreak,
+    probe_missing_before_handoff: probeMissingBeforeHandoff,
+    probe_max_missing_before_handoff_streak: probeMaxMissingBeforeHandoffStreak,
     initial_command_ok: initialCommandOk,
     initial_command_owner: initialCommandOwner || null,
     command_after_handoff_ok: commandAfterHandoffOk,
@@ -273,6 +295,7 @@ async function main() {
   if (unknownOwner > 0) failures.push(`unknown owners observed: ${unknownOwner}`);
   if (duplicateFrames > 0) failures.push(`duplicate entity ids observed: ${duplicateFrames}`);
   if (!playerSeen) failures.push("player never appeared in live state");
+  if (probeMaxMissingBeforeHandoffStreak > 2) failures.push(`probe player disappeared before seam proof: ${probeMaxMissingBeforeHandoffStreak} consecutive samples`);
   if (!initialCommandOk) failures.push(`initial command was not acknowledged by an authoritative worker: ${JSON.stringify(initialCommand)}`);
   if (playerPath < 8) failures.push(`player path too short: ${playerPath.toFixed(2)}`);
   if (REQUIRE_PLAYER_HANDOFF && !handoffObserved) failures.push("player handoff was not observed");
