@@ -378,6 +378,11 @@ fn build_agar_live_gate_feature_blocks(
     if artifact.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err("agar live gate artifact is not ok".to_string());
     }
+    if artifact.get("gate").and_then(Value::as_str)
+        == Some("mit_clone_broker_command_stress_ladder")
+    {
+        return build_mit_clone_stress_ladder_feature_blocks(&artifact, cfg);
+    }
 
     let family = agar_gate_family(&artifact);
     let mut outcome = ModelFeatureBlock::new(ModelFeatureBlockKind::Outcome, cfg.provenance())
@@ -453,7 +458,9 @@ fn parse_metric(fields: &BTreeMap<String, String>, key: &str) -> Result<f64, Str
 }
 
 fn agar_gate_family(artifact: &Value) -> &'static str {
-    if artifact.get("monitor").is_some()
+    if artifact.get("gate").and_then(Value::as_str)
+        == Some("mit_clone_broker_command_stress_ladder")
+        || artifact.get("monitor").is_some()
         || artifact.get("playableSeam").is_some()
         || artifact.get("brokerCommand").is_some()
         || artifact.get("brokerCommandCapacity").is_some()
@@ -462,6 +469,121 @@ fn agar_gate_family(artifact: &Value) -> &'static str {
     } else {
         "godworks_agar_v2"
     }
+}
+
+fn build_mit_clone_stress_ladder_feature_blocks(
+    artifact: &Value,
+    cfg: &FeatureBuildConfig,
+) -> Result<Vec<ModelFeatureBlock>, String> {
+    let rows = artifact
+        .get("rows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "MIT clone stress ladder artifact has no rows".to_string())?;
+    if rows.is_empty() {
+        return Err("MIT clone stress ladder artifact has no rows".to_string());
+    }
+
+    let row_count = rows.len() as f64;
+    let passed_rows = rows
+        .iter()
+        .filter(|row| row.get("ok").and_then(Value::as_bool) == Some(true))
+        .count() as f64;
+    if passed_rows < row_count {
+        return Err("MIT clone stress ladder contains failed profile rows".to_string());
+    }
+
+    let max_bot_count = max_row_metric(rows, "botCount")?;
+    let min_players = min_row_metric(rows, "playersMin")?;
+    let max_players = max_row_metric(rows, "playersMax")?;
+    let min_entities = min_row_metric(rows, "entitiesMin")?;
+    let max_entities = max_row_metric(rows, "entitiesMax")?;
+    let min_worker_slots = min_row_metric(rows, "workerSlotsMin")?;
+    let max_worker_slots = max_row_metric(rows, "workerSlotsMax")?;
+    let max_peak_to_mean = max_row_metric(rows, "loadPeakToMeanMax")?;
+    let total_completed = sum_row_metric(rows, "completedPlayers")?;
+    let total_failed = sum_row_metric(rows, "failedPlayers")?;
+    let total_responses = sum_row_metric(rows, "totalCommandResponses")?;
+    let total_owner_matches = sum_row_metric(rows, "totalCommandOwnerMatches")?;
+    let min_post_seam_path = min_row_metric(rows, "minPostSeamPath")?;
+    let all_post_seam_ok = rows
+        .iter()
+        .all(|row| row.get("allPostSeamCommandOk").and_then(Value::as_bool) == Some(true));
+
+    let outcome = ModelFeatureBlock::new(ModelFeatureBlockKind::Outcome, cfg.provenance())
+        .with_metric("ok", 1.0)
+        .with_metric("ladder_profiles", row_count)
+        .with_metric("ladder_passed_profiles", passed_rows)
+        .with_metric("ladder_max_bot_count_green", max_bot_count)
+        .with_dimension("artifact_kind", "agar_live_gate")
+        .with_dimension("gate_family", "mit_clone_adapter")
+        .with_dimension("gate", "mit_clone_broker_command_stress_ladder");
+
+    let density = ModelFeatureBlock::new(ModelFeatureBlockKind::EntityDensity, cfg.provenance())
+        .with_metric("capacity_entities_min", min_entities)
+        .with_metric("capacity_entities_max", max_entities)
+        .with_metric("capacity_players_min", min_players)
+        .with_metric("capacity_players_max", max_players)
+        .with_dimension("artifact_kind", "agar_live_gate")
+        .with_dimension("gate_family", "mit_clone_adapter")
+        .with_dimension("gate", "mit_clone_broker_command_stress_ladder");
+
+    let worker_load = ModelFeatureBlock::new(ModelFeatureBlockKind::WorkerLoad, cfg.provenance())
+        .with_metric("capacity_workers_min", min_worker_slots)
+        .with_metric("capacity_workers_max", max_worker_slots)
+        .with_metric("capacity_load_peak_to_mean_max", max_peak_to_mean)
+        .with_metric(
+            "capacity_rebalance_delta",
+            sum_row_metric(rows, "rebalanceDelta")?,
+        )
+        .with_dimension("artifact_kind", "agar_live_gate")
+        .with_dimension("gate_family", "mit_clone_adapter")
+        .with_dimension("gate", "mit_clone_broker_command_stress_ladder");
+
+    let handoff = ModelFeatureBlock::new(ModelFeatureBlockKind::HandoffPressure, cfg.provenance())
+        .with_metric("broker_command_completed_players", total_completed)
+        .with_metric("broker_command_failed_players", total_failed)
+        .with_metric("broker_command_total_responses", total_responses)
+        .with_metric("broker_command_total_owner_matches", total_owner_matches)
+        .with_metric("broker_command_min_post_seam_path", min_post_seam_path)
+        .with_metric(
+            "broker_command_all_post_seam_ok",
+            if all_post_seam_ok { 1.0 } else { 0.0 },
+        )
+        .with_dimension("artifact_kind", "agar_live_gate")
+        .with_dimension("gate_family", "mit_clone_adapter")
+        .with_dimension("gate", "mit_clone_broker_command_stress_ladder");
+
+    validate_blocks(vec![outcome, density, worker_load, handoff])
+}
+
+fn row_metric(row: &Value, key: &str) -> Result<f64, String> {
+    row.get(key)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("MIT clone stress ladder row missing numeric {key}"))
+}
+
+fn min_row_metric(rows: &[Value], key: &str) -> Result<f64, String> {
+    let mut min = f64::INFINITY;
+    for row in rows {
+        min = min.min(row_metric(row, key)?);
+    }
+    Ok(min)
+}
+
+fn max_row_metric(rows: &[Value], key: &str) -> Result<f64, String> {
+    let mut max = f64::NEG_INFINITY;
+    for row in rows {
+        max = max.max(row_metric(row, key)?);
+    }
+    Ok(max)
+}
+
+fn sum_row_metric(rows: &[Value], key: &str) -> Result<f64, String> {
+    let mut sum = 0.0;
+    for row in rows {
+        sum += row_metric(row, key)?;
+    }
+    Ok(sum)
 }
 
 fn agar_entity_density_block(
@@ -1231,5 +1353,108 @@ mod tests {
         assert!(build_agar_live_gate_feature_blocks(raw_command, &cfg())
             .unwrap_err()
             .contains("forbidden raw source key"));
+    }
+
+    #[test]
+    fn agar_live_gate_builder_emits_valid_mit_clone_ladder_blocks() {
+        let output = r#"{
+          "ok": true,
+          "gate": "mit_clone_broker_command_stress_ladder",
+          "generatedAt": "2026-07-01T12:07:57.6795128-03:00",
+          "rows": [
+            {
+              "ok": true,
+              "botCount": 40,
+              "commandPlayers": 8,
+              "minCompleted": 4,
+              "minPlayersRequired": 30,
+              "stackExitCode": 0,
+              "gateExitCode": 0,
+              "stackLog": ".local/agar_mit_clone_ladder/bots_40.stack.raw.log",
+              "gateLog": ".local/agar_mit_clone_ladder/bots_40.gate.raw.log",
+              "entitiesMin": 1085,
+              "entitiesMax": 1097,
+              "playersMin": 43,
+              "playersMax": 48,
+              "samples": 28,
+              "okSamples": 28,
+              "workerSlotsMin": 16,
+              "workerSlotsMax": 16,
+              "rebalanceDelta": 0,
+              "loadPeakToMeanMax": 1.2578616352201257,
+              "brokerMirrorEntitiesMax": 48,
+              "brokerMirrorOwnerCountMax": 15,
+              "completedPlayers": 4,
+              "failedPlayers": 0,
+              "totalCommandResponses": 84,
+              "totalCommandOwnerMatches": 84,
+              "minPostSeamPath": 28.57172610222915,
+              "allPostSeamCommandOk": true
+            }
+          ]
+        }"#;
+        let blocks = build_agar_live_gate_feature_blocks(output, &cfg()).unwrap();
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].kind, ModelFeatureBlockKind::Outcome);
+        assert_eq!(blocks[1].kind, ModelFeatureBlockKind::EntityDensity);
+        assert_eq!(blocks[2].kind, ModelFeatureBlockKind::WorkerLoad);
+        assert_eq!(blocks[3].kind, ModelFeatureBlockKind::HandoffPressure);
+        assert_eq!(blocks[0].dimensions["gate_family"], "mit_clone_adapter");
+        assert_eq!(
+            blocks[0].dimensions["gate"],
+            "mit_clone_broker_command_stress_ladder"
+        );
+        assert_eq!(blocks[0].metrics["ladder_max_bot_count_green"], 40.0);
+        assert_eq!(blocks[1].metrics["capacity_entities_min"], 1085.0);
+        assert_eq!(blocks[1].metrics["capacity_players_max"], 48.0);
+        assert_eq!(blocks[2].metrics["capacity_workers_min"], 16.0);
+        assert!(
+            (blocks[2].metrics["capacity_load_peak_to_mean_max"] - 1.2578616352201257).abs()
+                < 0.00000000000001
+        );
+        assert_eq!(blocks[3].metrics["broker_command_completed_players"], 4.0);
+        assert_eq!(blocks[3].metrics["broker_command_failed_players"], 0.0);
+        assert_eq!(blocks[3].metrics["broker_command_total_responses"], 84.0);
+        assert_eq!(
+            blocks[3].metrics["broker_command_total_owner_matches"],
+            84.0
+        );
+        assert_eq!(blocks[3].metrics["broker_command_all_post_seam_ok"], 1.0);
+        for block in blocks {
+            assert_eq!(block.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn agar_live_gate_builder_rejects_failed_mit_clone_ladder_row() {
+        let output = r#"{
+          "ok": true,
+          "gate": "mit_clone_broker_command_stress_ladder",
+          "rows": [
+            {
+              "ok": false,
+              "botCount": 80,
+              "entitiesMin": 1000,
+              "entitiesMax": 1200,
+              "playersMin": 60,
+              "playersMax": 70,
+              "workerSlotsMin": 16,
+              "workerSlotsMax": 16,
+              "rebalanceDelta": 1,
+              "loadPeakToMeanMax": 1.5,
+              "completedPlayers": 2,
+              "failedPlayers": 6,
+              "totalCommandResponses": 10,
+              "totalCommandOwnerMatches": 8,
+              "minPostSeamPath": 0,
+              "allPostSeamCommandOk": false
+            }
+          ]
+        }"#;
+
+        assert!(build_agar_live_gate_feature_blocks(output, &cfg())
+            .unwrap_err()
+            .contains("failed profile rows"));
     }
 }

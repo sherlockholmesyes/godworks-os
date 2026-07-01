@@ -63,11 +63,14 @@ gate: a real player joins the stock clone, crosses dynamic shard blocks in the
 from the current `:8092` Godworks owner, the broker-command capacity gate
 requires several controlled players to satisfy the same broker-routed seam proof
 under live bot load, and the capacity gate records a sustained local floor from
-the same live monitor. Those summaries can feed future per-project
+the same live monitor. The MIT stress ladder summary is also accepted as a
+multi-profile live artifact: it records the observed local floor across bot
+profiles while preserving only aggregate profile metrics, not raw command
+targets or player identity traces. Those summaries can feed future per-project
 load/micro-balancer datasets as redacted facts such as entity density, worker
 load, shard-block changes, owner changes, post-seam movement, controlled-player
 completion count, command-response count, owner-match count, sustained
-player/entity floors, and load peak/mean pressure.
+player/entity floors, profile pass counts, and load peak/mean pressure.
 
 The builder does not copy raw WAL paths, component bodies, payloads, command
 targets, or tokens into model-plane data. It rejects source replay artifacts that
@@ -133,6 +136,6 @@ cargo test -p godworks-core model_action_proposal_requires_provenance_and_guarde
 These tests should fail if feature blocks accept unredacted/raw runtime bodies,
 non-finite metrics, missing project-local provenance, raw replay source keys, or
 unvalidated `reality_loadgen`/Agar live-gate metrics; if a failed live game gate
-can enter the dataset as a success; if the public model action vocabulary starts
-accepting direct runtime mutations; or if guarded proposals can be emitted
-without validator provenance.
+or failed MIT ladder profile can enter the dataset as a success; if the public
+model action vocabulary starts accepting direct runtime mutations; or if
+guarded proposals can be emitted without validator provenance.
