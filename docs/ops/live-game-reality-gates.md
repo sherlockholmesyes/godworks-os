@@ -80,6 +80,7 @@ Commands:
 ```powershell
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -RunGate
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunPlayableSeamGate
+.\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandGate
 ```
 
 `-RunGate` proves the stock game is playable on `:3000`, the dynamic `:8091`
@@ -92,11 +93,18 @@ player to cross at least one dynamic `:8091` worker-zone boundary, and requires
 continued movement after crossing. With `-MirrorBroker`, it also checks the
 probe against the `:8092` Godworks mirror state.
 
-Boundary: this MIT clone gate is not yet a Godworks broker-authoritative command
-path. Movement commands still enter the stock clone through its normal Socket.IO
-protocol. The stronger follow-up gate is a broker `CommandRequest` bridge for a
-controlled clone player, with pre/post-handoff command ACKs from the current
-Godworks owner.
+`-RunBrokerCommandGate` adds the stronger command-routing proof for one
+controlled stock-clone player. The gate starts a local command bridge, connects
+to the broker as a `CLIENT`, sends movement only as broker `CommandRequest`
+frames, and requires accepted `CommandResponse` frames from the current
+Godworks `pos` authority owner before and after a broker ownership seam. A direct
+Socket.IO command path cannot satisfy this gate because the gate waits for the
+broker-routed response correlation key.
+
+Boundary: even the broker-command MIT clone gate is not yet a full
+Godworks-authoritative replacement for the MIT clone server. The stock clone
+still owns its gameplay ecology and physics; Godworks proves live projection,
+ownership, and broker-routed command control for a controlled player.
 
 ## Godot Gates
 

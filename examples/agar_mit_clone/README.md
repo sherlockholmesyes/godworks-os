@@ -11,6 +11,8 @@ Ports:
 - `http://localhost:8091` - dynamic 4x4 shard monitor over the live clone feed.
 - `http://localhost:8092` - optional Godworks broker ownership view for mirrored
   player cells.
+- `http://localhost:8093` - optional controlled-player command bridge used only
+  by the broker-command gate.
 
 Run the playable clone plus dynamic shard monitor:
 
@@ -28,6 +30,12 @@ Run the playable seam gate:
 
 ```powershell
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunPlayableSeamGate
+```
+
+Run the broker-command seam gate:
+
+```powershell
+.\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandGate
 ```
 
 Use `-StopExisting` when an old local demo owns the same ports.
@@ -52,6 +60,12 @@ Use `-StopExisting` when an old local demo owns the same ports.
   across at least one dynamic `:8091` worker-zone boundary, and requires
   continued movement after crossing. With `-MirrorBroker`, the same probe is
   matched against the optional `:8092` Godworks broker mirror view.
+- `-RunBrokerCommandGate` starts a controlled stock-clone player socket behind
+  a local command bridge, then drives that player only by sending broker
+  `CommandRequest` frames as a `CLIENT` peer. The broker must route each command
+  to the current `pos` authority owner, the mirror worker must forward the
+  command to the bridge, and the gate requires accepted `CommandResponse` frames
+  before and after a Godworks ownership seam.
 
 ## Honest Boundary
 
@@ -62,9 +76,10 @@ broker/client agreement.
 
 The playable seam gate is also not a broker-authoritative command claim. The MIT
 clone still receives the probe movement command directly through its normal
-Socket.IO input. The next stronger Godworks slice is a broker `CommandRequest`
-bridge for a controlled clone player, with pre/post-handoff command ACKs from
-the current Godworks owner.
+Socket.IO input. Use `-RunBrokerCommandGate` for the stronger command-routing
+proof. That proof is still limited to one controlled stock-clone player; it does
+not claim the whole MIT clone server has been replaced by Godworks-authoritative
+gameplay.
 
 The current public protocol uses one `WorkerConnect.region` per TCP connection.
 The old scratchpad D3 multi-region worker harness is therefore not copied as a
