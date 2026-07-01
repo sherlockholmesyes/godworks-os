@@ -199,6 +199,8 @@ func _init():
 	var port_w := int(_env("GW_PORT_W", "7801"))
 	var port_e := int(_env("GW_PORT_E", "7802"))
 	var entity_id := _env("GW_CROSS_ENTITY", "godot-cross-probe")
+	var w_token := _env("GW_GODOT_W_TOKEN", "godot-cross-w-token")
+	var e_token := _env("GW_GODOT_E_TOKEN", "godot-cross-e-token")
 	var query_id := "godot-cross-query"
 
 	if not _connect_client(_tcp_w, host, port_w, "W"):
@@ -208,9 +210,9 @@ func _init():
 		quit(2)
 		return
 
-	_send_w({"op":"WorkerConnect","worker_id":"godot-cross-owner-W","region":"W","attributes":["observer","physics","server"],"proto":1})
+	_send_w({"op":"WorkerConnect","worker_id":"godot-cross-owner-W","region":"W","attributes":["physics","server"],"auth_token":w_token,"proto":1})
 	_send_w({"op":"Interest","center":[-2.0,0.0],"radius":200.0,"full_radius":200.0})
-	_send_e({"op":"WorkerConnect","worker_id":"godot-cross-owner-E","region":"E","attributes":["observer","physics","server"],"proto":1})
+	_send_e({"op":"WorkerConnect","worker_id":"godot-cross-owner-E","region":"E","attributes":["physics","server"],"auth_token":e_token,"proto":1})
 	_send_e({"op":"Interest","center":[2.0,0.0],"radius":200.0,"full_radius":200.0})
 	_pump_for(500, entity_id, query_id)
 

@@ -26,9 +26,14 @@ $EnvKeys = @(
   "GW_ADVERTISE",
   "GW_MESH",
   "GW_DURABLE_FLUSH_MS",
+  "GW_AUTH_CLAIMS",
   "GW_CLIENT_BRIDGE_FIXTURE",
   "GW_BRIDGE_STALE_ENTITY",
   "GW_BRIDGE_FRESH_ENTITY",
+  "GW_GODOT_OWNER_TOKEN",
+  "GW_GODOT_OBS_TOKEN",
+  "GW_GODOT_W_TOKEN",
+  "GW_GODOT_E_TOKEN",
   "GW_CROSS_ENTITY"
 )
 
@@ -148,23 +153,32 @@ try {
   Invoke-GodotProbe "client_bridge_contract_probe.gd"
 
   Write-Host "GODOT PROBES: real broker reconnect/resync"
+  $ownerToken = "godot-owner-token"
+  $obsToken = "godot-observer-token"
   $resyncBroker = Start-Broker "godot-bridge-resync" 7811 @{
     GW_BIND = "127.0.0.1"
     GW_PORT = "7811"
     GW_WAL = (Join-Path $LocalDir "godot-bridge-resync.wal")
     GW_DURABLE_FLUSH_MS = "5"
+    GW_AUTH_CLAIMS = "${ownerToken}:W:physics|server,${obsToken}:OBS:observer"
   }
   [void]$procs.Add($resyncBroker)
   Clear-GateEnv $EnvKeys
   Set-GateEnv @{
     GW_HOST = "127.0.0.1"
     GW_PORT = "7811"
+    GW_GODOT_OWNER_TOKEN = $ownerToken
+    GW_GODOT_OBS_TOKEN = $obsToken
   }
   Invoke-GodotProbe "client_bridge_tcp_resync_probe.gd"
   Stop-Brokers $procs
   $procs.Clear()
 
   Write-Host "GODOT PROBES: cross-broker handoff"
+  $wToken = "godot-cross-w-token"
+  $eToken = "godot-cross-e-token"
+  $meshToken = "godot-cross-mesh-token"
+  $crossClaims = "${wToken}:W:physics|server,${eToken}:E:physics|server,${meshToken}:MESH:role.mesh"
   $eBroker = Start-Broker "godot-cross-e" 7802 @{
     GW_BIND = "127.0.0.1"
     GW_PORT = "7802"
@@ -172,6 +186,7 @@ try {
     GW_BOUNDARY = "0"
     GW_ADVERTISE = "E=127.0.0.1:7802"
     GW_DURABLE_FLUSH_MS = "5"
+    GW_AUTH_CLAIMS = $crossClaims
   }
   [void]$procs.Add($eBroker)
   $wBroker = Start-Broker "godot-cross-w" 7801 @{
@@ -182,6 +197,7 @@ try {
     GW_ADVERTISE = "W=127.0.0.1:7801"
     GW_MESH = "E=127.0.0.1:7802"
     GW_DURABLE_FLUSH_MS = "5"
+    GW_AUTH_CLAIMS = $crossClaims
   }
   [void]$procs.Add($wBroker)
   Clear-GateEnv $EnvKeys
@@ -189,6 +205,8 @@ try {
     GW_HOST = "127.0.0.1"
     GW_PORT_W = "7801"
     GW_PORT_E = "7802"
+    GW_GODOT_W_TOKEN = $wToken
+    GW_GODOT_E_TOKEN = $eToken
   }
   Invoke-GodotProbe "cross_broker_handoff_probe.gd"
 
