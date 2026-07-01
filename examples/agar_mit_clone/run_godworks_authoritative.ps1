@@ -73,6 +73,8 @@ function Stop-GodworksAuthoritativeAgar {
     "gw_authoritative_zone_worker.js",
     "gw_authoritative_server.js",
     "gw_authoritative_gate.js",
+    "gw_authoritative_bots.js",
+    "gw_authoritative_capacity_gate.js",
     "_gw_bots.js",
     "_gw_spectator_tap.js",
     "gw_shard_monitor.js",
@@ -140,7 +142,7 @@ function Ensure-ClientBuild {
 }
 
 function Copy-Tools {
-  foreach ($name in @("gw_authoritative_zone_worker.js", "gw_authoritative_server.js", "gw_authoritative_gate.js")) {
+  foreach ($name in @("gw_authoritative_zone_worker.js", "gw_authoritative_server.js", "gw_authoritative_gate.js", "gw_authoritative_bots.js", "gw_authoritative_capacity_gate.js")) {
     Copy-Item -LiteralPath (Join-Path $ToolsDir $name) -Destination (Join-Path $CloneRoot $name) -Force
   }
 }
