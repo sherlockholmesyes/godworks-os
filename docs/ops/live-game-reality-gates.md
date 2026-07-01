@@ -83,6 +83,7 @@ Commands:
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandGate
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandCapacityGate -CommandPlayers 4
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunCapacityGate
+.\examples\agar_mit_clone\run_mit_clone_stress_ladder.ps1 -BotCounts 40 -CommandPlayers 8 -CommandCapacityMinCompleted 4
 ```
 
 `-RunGate` proves the stock game is playable on `:3000`, the dynamic `:8091`
@@ -118,6 +119,12 @@ repeatable on a local machine: at least 30 players, 800 live entities, 16 worker
 load slots, 8 good samples, and observed non-uniform dynamic zone geometry. This
 is not a maximum CCU benchmark; it is the live-game ruler that prevents
 "capacity" from being inferred from one screenshot or one transient sample.
+
+`run_mit_clone_stress_ladder.ps1` is the executable ladder form of that ruler.
+The System Laws gate binds the local path for the observed floor profile:
+`-BotCounts 40 -CommandPlayers 8 -CommandCapacityMinCompleted 4`. This is still
+an observed local floor, not a maximum-player claim; larger profiles must be
+rerun and recorded before they can be advertised.
 
 Boundary: even the broker-command MIT clone gate is not yet a full
 Godworks-authoritative replacement for the MIT clone server. The stock clone
