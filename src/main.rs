@@ -6272,7 +6272,11 @@ fn dispatch_inner(state: &mut ServerState, wid: &str, f: &Value) {
                         &pending.caller,
                         json!({"op":"CommandResponse","request_id":req_id,
                         "entity":pending.entity,
+                        "routed_owner":pending.owner,
+                        "authority_comp":pending.authority_comp,
+                        "authority_epoch":pending.authority_epoch,
                         "success":f.get("success").cloned().unwrap_or(Value::Bool(true)),
+                        "reason":f.get("reason").cloned().unwrap_or(Value::Null),
                         "payload":f.get("payload").cloned().unwrap_or(Value::Null)}),
                     );
                 }
@@ -9127,7 +9131,9 @@ mod tests {
         assert_eq!(forwarded["op"], "CommandRequest");
         assert_eq!(forwarded["entity"], "ship");
         assert_eq!(forwarded["authority_comp"], "pos");
-        assert!(forwarded["authority_epoch"].as_u64().is_some());
+        let routed_epoch = forwarded["authority_epoch"]
+            .as_u64()
+            .expect("command must carry the routed authority epoch");
 
         dispatch_test_frame(
             &mut state,
@@ -9151,6 +9157,9 @@ mod tests {
             decode_test_frame(&caller_rx.try_recv().expect("owner response must forward"));
         assert_eq!(response["op"], "CommandResponse");
         assert_eq!(response["entity"], "ship");
+        assert_eq!(response["routed_owner"], "w1");
+        assert_eq!(response["authority_comp"], "pos");
+        assert_eq!(response["authority_epoch"].as_u64(), Some(routed_epoch));
         assert_eq!(response["success"], true);
         assert!(!state.pending_commands.contains_key("cmd-1"));
     }
@@ -9195,6 +9204,9 @@ mod tests {
             decode_test_frame(&caller_rx.try_recv().expect("matching entity must forward"));
         assert_eq!(response["op"], "CommandResponse");
         assert_eq!(response["entity"], "ship");
+        assert_eq!(response["routed_owner"], "w1");
+        assert_eq!(response["authority_comp"], "pos");
+        assert!(response["authority_epoch"].as_u64().is_some());
         assert_eq!(response["success"], true);
         assert!(!state.pending_commands.contains_key("cmd-entity"));
     }
