@@ -982,6 +982,79 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_manifest_contract_accepts_future_grid3d_contract() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "request_id": "snap-3d",
+            "snapshot_id": "s-3d",
+            "broker_id": "broker-3d",
+            "wal_offset": 4096,
+            "entity_count": 5,
+            "pending_mesh": 0,
+            "authority_hash": "98765",
+            "in_flight": [],
+            "t_server": 12345,
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 12,
+            "spatial_schema": {
+                "spatial_dim": "D3",
+                "coordinate_codec": "debug_f64_3",
+                "partition_schema": { "kind": "grid3d", "cols": 2, "rows": 3, "layers": 4 }
+            },
+            "partition_map": {
+                "version": 12,
+                "kind": "grid3d",
+                "cols": 2,
+                "rows": 3,
+                "layers": 4,
+                "cell_w": 10.0,
+                "cell_h": 20.0,
+                "cell_d": 30.0,
+                "origin": [0.0, 1.0, -2.0]
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        let spatial_schema = SpatialSchema::future_3d(
+            PartitionSchema::grid3d(2, 3, 4).expect("valid future 3D grid schema"),
+        );
+        let partition_map = crate::VersionedPartitionMap::new(
+            12,
+            crate::PartitionMapSpec::grid3d(2, 3, 4, 10.0, 20.0, 30.0, [0.0, 1.0, -2.0])
+                .expect("valid future 3D partition map"),
+        );
+
+        assert!(manifest.has_current_versions());
+        assert_eq!(manifest.spatial_schema(), Some(spatial_schema));
+        assert_eq!(manifest.partition_map(), Some(partition_map.clone()));
+
+        let contract = manifest
+            .contract()
+            .expect("valid future 3D snapshot manifest contract");
+        assert_eq!(contract.request_id.as_deref(), Some("snap-3d"));
+        assert_eq!(contract.snapshot_id.as_deref(), Some("s-3d"));
+        assert_eq!(contract.broker_id.as_deref(), Some("broker-3d"));
+        assert_eq!(contract.wal_offset, 4096);
+        assert_eq!(contract.entity_count, 5);
+        assert_eq!(contract.pending_mesh, 0);
+        assert_eq!(contract.authority_hash.as_deref(), Some("98765"));
+        assert_eq!(
+            contract.in_flight,
+            Vec::<crate::SnapshotInFlightHandoff>::new()
+        );
+        assert_eq!(contract.t_server, Some(12345));
+        assert_eq!(contract.spatial_schema, spatial_schema);
+        assert_eq!(contract.partition_map, partition_map);
+    }
+
+    #[test]
     fn snapshot_manifest_contract_accepts_missing_t_server() {
         let decoded = decode_json_value(&json!({
             "op": "SnapshotManifest",
@@ -1387,6 +1460,52 @@ mod tests {
             panic!("expected SnapshotManifest");
         };
 
+        assert_eq!(manifest.partition_map(), None);
+        assert_eq!(manifest.contract(), None);
+    }
+
+    #[test]
+    fn snapshot_manifest_contract_rejects_grid3d_layer_mismatch() {
+        let decoded = decode_json_value(&json!({
+            "op": "SnapshotManifest",
+            "snapshot_manifest_version": 1,
+            "snapshot_schema_version": 1,
+            "spatial_schema_version": 1,
+            "coordinate_codec_version": 1,
+            "component_registry_version": 1,
+            "partition_map_version": 1,
+            "wal_offset": 1,
+            "entity_count": 1,
+            "pending_mesh": 0,
+            "in_flight": [],
+            "spatial_schema": {
+                "spatial_dim": "D3",
+                "coordinate_codec": "debug_f64_3",
+                "partition_schema": { "kind": "grid3d", "cols": 2, "rows": 3, "layers": 4 }
+            },
+            "partition_map": {
+                "version": 1,
+                "kind": "grid3d",
+                "cols": 2,
+                "rows": 3,
+                "layers": 5,
+                "cell_w": 10.0,
+                "cell_h": 20.0,
+                "cell_d": 30.0,
+                "origin": [0.0, 0.0, 0.0]
+            }
+        }))
+        .unwrap();
+        let Op::SnapshotManifest(manifest) = decoded else {
+            panic!("expected SnapshotManifest");
+        };
+
+        assert_eq!(
+            manifest.spatial_schema(),
+            Some(SpatialSchema::future_3d(
+                PartitionSchema::grid3d(2, 3, 4).expect("valid future 3D grid schema")
+            ))
+        );
         assert_eq!(manifest.partition_map(), None);
         assert_eq!(manifest.contract(), None);
     }
