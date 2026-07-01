@@ -38,6 +38,12 @@ Run the broker-command seam gate:
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunBrokerCommandGate
 ```
 
+Run the capacity floor gate:
+
+```powershell
+.\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunCapacityGate -BotCount 40 -StopExisting
+```
+
 Use `-StopExisting` when an old local demo owns the same ports.
 
 ## What This Proves
@@ -66,13 +72,20 @@ Use `-StopExisting` when an old local demo owns the same ports.
   to the current `pos` authority owner, the mirror worker must forward the
   command to the bridge, and the gate requires accepted `CommandResponse` frames
   before and after a Godworks ownership seam.
+- `-RunCapacityGate` samples the live `:8091` dynamic monitor for a sustained
+  window and optionally samples the `:8092` broker mirror. By default it requires
+  at least 30 players, 800 live entities, 16 worker load slots, 8 good samples,
+  and observed dynamic zone geometry. This is a reproducible capacity floor,
+  not a maximum-player benchmark.
 
 ## Honest Boundary
 
-This is not a benchmark claim. It proves integration shape and live-game
-visibility. Capacity must be measured by a separate soak profile with real
-numbers for bot/client count, command ACK latency, handoff success, CPU/RSS, and
-broker/client agreement.
+`-RunCapacityGate` is a soak ruler, not an absolute benchmark claim. It answers
+"this local machine sustained at least this configured floor under this adapter"
+and emits a redacted JSON summary for model-plane ingestion. A real maximum
+claim still needs a profile that records hardware, CPU/RSS, command ACK latency,
+handoff success rate, and broker/client agreement under increasing bot/client
+counts.
 
 The playable seam gate is also not a broker-authoritative command claim. The MIT
 clone still receives the probe movement command directly through its normal

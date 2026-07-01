@@ -382,6 +382,19 @@ fn build_agar_live_gate_feature_blocks(
     if let Some(entities) = json_number_at(&artifact, &["brokerView", "entities"]) {
         outcome = outcome.with_metric("broker_view_entities", entities);
     }
+    for (path, metric) in [
+        (&["capacity", "samples"][..], "capacity_samples"),
+        (&["capacity", "okSamples"][..], "capacity_ok_samples"),
+        (&["capacity", "durationMs"][..], "capacity_duration_ms"),
+        (
+            &["capacity", "loadPeakToMeanMax"][..],
+            "capacity_load_peak_to_mean_max",
+        ),
+    ] {
+        if let Some(value) = json_number_at(&artifact, path) {
+            outcome = outcome.with_metric(metric, value);
+        }
+    }
     if let Some(security) = artifact.get("security").and_then(Value::as_object) {
         outcome = outcome.with_metric(
             "security_checks",
@@ -455,6 +468,10 @@ fn agar_entity_density_block(
 
     for (path, metric) in [
         (&["monitor", "players"][..], "live_players"),
+        (&["capacity", "entitiesMin"][..], "capacity_entities_min"),
+        (&["capacity", "entitiesMean"][..], "capacity_entities_mean"),
+        (&["capacity", "playersMin"][..], "capacity_players_min"),
+        (&["capacity", "playersMean"][..], "capacity_players_mean"),
         (&["samples"][..], "samples"),
         (&["max_owners"][..], "max_owners"),
         (&["player_owner_count"][..], "player_owner_count"),
@@ -501,6 +518,16 @@ fn agar_worker_load_block(
         (
             &["monitor", "dynamicHeightClasses"][..],
             "dynamic_height_classes",
+        ),
+        (&["capacity", "workersMin"][..], "capacity_workers_min"),
+        (&["capacity", "workersMax"][..], "capacity_workers_max"),
+        (&["capacity", "loadMeanMin"][..], "capacity_load_mean_min"),
+        (&["capacity", "loadMeanMax"][..], "capacity_load_mean_max"),
+        (&["capacity", "loadPeakMin"][..], "capacity_load_peak_min"),
+        (&["capacity", "loadPeakMax"][..], "capacity_load_peak_max"),
+        (
+            &["capacity", "rebalanceDelta"][..],
+            "capacity_rebalance_delta",
         ),
     ] {
         if let Some(value) = json_number_at(artifact, path) {
@@ -579,6 +606,12 @@ fn agar_handoff_block(
             "probe_max_missing_before_handoff_streak",
         ),
         (&["brokerView", "entities"][..], "broker_view_entities"),
+        (&["brokerView", "entitiesMax"][..], "broker_view_entities"),
+        (&["brokerView", "ownerCountMax"][..], "broker_owner_count"),
+        (
+            &["brokerView", "mitOwnerCountMax"][..],
+            "broker_mit_owner_count",
+        ),
     ] {
         if let Some(value) = json_number_at(artifact, path) {
             block = block.with_metric(metric, value);
@@ -966,6 +999,65 @@ mod tests {
         assert_eq!(blocks[3].metrics["broker_command_owner_changes"], 1.0);
         assert_eq!(blocks[3].metrics["broker_command_responses"], 7.0);
         assert_eq!(blocks[3].metrics["broker_command_post_seam_path"], 32.25);
+        for block in blocks {
+            assert_eq!(block.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn agar_live_gate_builder_emits_valid_capacity_blocks() {
+        let output = r#"{
+          "ok": true,
+          "gate": "mit_clone_capacity",
+          "monitor": {
+            "entities": 1108,
+            "players": 40,
+            "rebalanceCount": 7,
+            "loads": [71,72,70,73],
+            "dynamicWidthClasses": 4,
+            "dynamicHeightClasses": 11
+          },
+          "capacity": {
+            "samples": 30,
+            "okSamples": 29,
+            "durationMs": 15100,
+            "entitiesMin": 1012,
+            "entitiesMax": 1108,
+            "entitiesMean": 1066.4,
+            "playersMin": 37,
+            "playersMax": 40,
+            "playersMean": 39.1,
+            "workersMin": 16,
+            "workersMax": 16,
+            "loadMeanMin": 66.5,
+            "loadMeanMax": 72.25,
+            "loadPeakMin": 81,
+            "loadPeakMax": 97,
+            "loadPeakToMeanMax": 1.35,
+            "rebalanceStart": 6,
+            "rebalanceEnd": 7,
+            "rebalanceDelta": 1
+          },
+          "brokerView": {
+            "samples": 30,
+            "entitiesMax": 40,
+            "ownerCountMax": 16,
+            "mitOwnerCountMax": 16
+          }
+        }"#;
+        let blocks = build_agar_live_gate_feature_blocks(output, &cfg()).unwrap();
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0].kind, ModelFeatureBlockKind::Outcome);
+        assert_eq!(blocks[1].kind, ModelFeatureBlockKind::EntityDensity);
+        assert_eq!(blocks[2].kind, ModelFeatureBlockKind::WorkerLoad);
+        assert_eq!(blocks[3].kind, ModelFeatureBlockKind::HandoffPressure);
+        assert_eq!(blocks[0].metrics["capacity_ok_samples"], 29.0);
+        assert_eq!(blocks[1].metrics["capacity_entities_min"], 1012.0);
+        assert_eq!(blocks[1].metrics["capacity_players_mean"], 39.1);
+        assert_eq!(blocks[2].metrics["capacity_workers_min"], 16.0);
+        assert_eq!(blocks[2].metrics["capacity_load_peak_max"], 97.0);
+        assert_eq!(blocks[3].metrics["broker_mit_owner_count"], 16.0);
         for block in blocks {
             assert_eq!(block.validate(), Ok(()));
         }

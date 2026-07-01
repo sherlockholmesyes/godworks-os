@@ -4,6 +4,7 @@ param(
   [switch]$RunGate,
   [switch]$RunPlayableSeamGate,
   [switch]$RunBrokerCommandGate,
+  [switch]$RunCapacityGate,
   [switch]$SkipGame,
   [switch]$StopExisting,
   [switch]$SkipNpmInstall,
@@ -14,7 +15,12 @@ param(
   [int]$PortBroker = 7990,
   [int]$PortMonitor = 8091,
   [int]$PortView = 8092,
-  [int]$PortCommandBridge = 8093
+  [int]$PortCommandBridge = 8093,
+  [int]$CapacityMs = 15000,
+  [int]$CapacityMinPlayers = 30,
+  [int]$CapacityMinEntities = 800,
+  [int]$CapacityMinWorkers = 16,
+  [int]$CapacityMinOkSamples = 8
 )
 
 $ErrorActionPreference = "Stop"
@@ -158,7 +164,7 @@ function Ensure-StockClone {
 
 function Copy-CloneTools {
   if (-not (Test-Path -LiteralPath $CloneRoot)) { return }
-  foreach ($name in @("_gw_spectator_tap.js", "_gw_bots.js", "gw_shard_monitor.js", "gw_agar_mirror_worker.js", "gw_agar_command_bridge.js", "gw_agar_playable_seam_gate.js", "gw_agar_broker_command_gate.js")) {
+  foreach ($name in @("_gw_spectator_tap.js", "_gw_bots.js", "gw_shard_monitor.js", "gw_agar_mirror_worker.js", "gw_agar_command_bridge.js", "gw_agar_playable_seam_gate.js", "gw_agar_broker_command_gate.js", "gw_agar_capacity_gate.js")) {
     Copy-Item -LiteralPath (Join-Path $ToolsDir $name) -Destination (Join-Path $CloneRoot $name) -Force
   }
 }
@@ -330,6 +336,28 @@ if ($RunBrokerCommandGate) {
   Push-Location $CloneRoot
   try {
     & $NodeExe "gw_agar_broker_command_gate.js"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  } finally {
+    Pop-Location
+  }
+}
+
+if ($RunCapacityGate) {
+  Start-Sleep -Seconds 3
+  $env:GW_AGAR_MONITOR_URL = "http://127.0.0.1:$PortMonitor/state"
+  $env:GW_AGAR_CAPACITY_MS = "$CapacityMs"
+  $env:GW_AGAR_CAPACITY_MIN_PLAYERS = "$CapacityMinPlayers"
+  $env:GW_AGAR_CAPACITY_MIN_ENTITIES = "$CapacityMinEntities"
+  $env:GW_AGAR_CAPACITY_MIN_WORKERS = "$CapacityMinWorkers"
+  $env:GW_AGAR_CAPACITY_MIN_OK_SAMPLES = "$CapacityMinOkSamples"
+  if ($MirrorBroker) {
+    $env:GW_AGAR_BROKER_VIEW_URL = "http://127.0.0.1:$PortView/state"
+  } else {
+    Remove-Item Env:\GW_AGAR_BROKER_VIEW_URL -ErrorAction SilentlyContinue
+  }
+  Push-Location $CloneRoot
+  try {
+    & $NodeExe "gw_agar_capacity_gate.js"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   } finally {
     Pop-Location
