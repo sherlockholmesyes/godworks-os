@@ -425,6 +425,16 @@ async fn poll_entities_at_pos_x(
     }
 }
 
+async fn wait_for_counter_at_least(counter: &AtomicU64, min: u64, timeout: Duration) -> u64 {
+    let started = Instant::now();
+    let mut best = Counters::get(counter);
+    while best < min && started.elapsed() < timeout {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        best = best.max(Counters::get(counter));
+    }
+    best
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let host = env::var("GW_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -658,6 +668,10 @@ async fn main() {
     let mut stale_pos_overwrite_blocked = 0;
     let mut handoff_pos_query_error = "none".to_string();
     if require_mesh {
+        let _ = wait_for_counter_at_least(&east.add_entity, entities, Duration::from_secs(5)).await;
+        let _ =
+            wait_for_counter_at_least(&east.authority_gain, entities, Duration::from_secs(5)).await;
+
         let e_probe_x = 3.25;
         let stale_probe_x = 4.25;
         let mut e_pos_updates = Vec::with_capacity(entities as usize);
