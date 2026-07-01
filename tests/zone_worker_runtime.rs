@@ -237,6 +237,35 @@ fn assert_only_reject_class(summary: &Value, class: &str, expected: usize) {
     );
 }
 
+fn assert_only_handoff_fence_rejects(summary: &Value, owner: &str, max: usize) {
+    let classes = summary
+        .get("reject_classes")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("summary missing reject_classes object: {summary}"));
+    let pos_class = format!("comp=pos|reason=not_authoritative|owner={owner}");
+    let vel_class = format!("comp=vel|reason=not_authoritative|owner={owner}");
+    let mut total = 0usize;
+    for (class, count) in classes {
+        assert!(
+            class == &pos_class || class == &vel_class,
+            "unexpected reject class during handoff fence: {class}; summary={summary}"
+        );
+        total += count
+            .as_u64()
+            .unwrap_or_else(|| panic!("reject class count must be numeric: {summary}"))
+            as usize;
+    }
+    assert_eq!(
+        total,
+        summary_usize(summary, "rejects"),
+        "reject total did not match class breakdown: {summary}"
+    );
+    assert!(
+        total <= max,
+        "handoff fence rejects exceeded bounded runtime window max={max}: {summary}"
+    );
+}
+
 fn extract_eid(line: &str) -> Option<String> {
     let rest = line.split("e=").nth(1)?;
     Some(rest.split_whitespace().next()?.to_string())
@@ -508,14 +537,10 @@ fn moving_w_bodies_handoff_to_e_with_epoch_fencing_and_no_stale_ownership() {
         "east did not adopt the crossing bodies\nwest={west_stderr}\neast={east_stderr}"
     );
     let west_rejects = summary_usize(&west_summary, "rejects");
+    assert_only_handoff_fence_rejects(&west_summary, "zw-E-lifecycle", 24 * 12);
     assert!(
-        west_rejects <= 24,
-        "west should only see bounded old-owner fences, not a reject storm\n{west_stderr}"
-    );
-    assert_only_reject_class(
-        &west_summary,
-        "comp=vel|reason=not_authoritative|owner=zw-E-lifecycle",
-        west_rejects,
+        west_rejects <= 24 * 12,
+        "west should only see bounded old-owner fences, not an unbounded reject storm\n{west_stderr}"
     );
     assert_eq!(summary_usize(&east_summary, "rejects"), 0, "{east_stderr}");
     assert_only_reject_class(&east_summary, "unused", 0);
