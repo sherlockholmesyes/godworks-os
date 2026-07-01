@@ -744,6 +744,75 @@ impl AuthorityMode {
             _ => None,
         }
     }
+
+    pub const fn authority_group(&self) -> AuthorityGroupKind {
+        match self {
+            Self::ClientForwardSparse | Self::ServerArbitrated => AuthorityGroupKind::Gameplay,
+            Self::ServerPhysicsIsland => AuthorityGroupKind::PhysicsIsland,
+            Self::ThresholdOverlap => AuthorityGroupKind::Threshold,
+            Self::PersistentKernelLock => AuthorityGroupKind::Kernel,
+        }
+    }
+}
+
+/// Atomic authority group for components whose authority must move together.
+///
+/// This is a contract label, not a replacement for per-component authority.
+/// Runtime can still own components independently unless a component is in an
+/// explicit authority group such as the physics island.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AuthorityGroupKind {
+    PhysicsIsland,
+    Gameplay,
+    Threshold,
+    Kernel,
+}
+
+impl AuthorityGroupKind {
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::PhysicsIsland => "physics_island",
+            Self::Gameplay => "gameplay",
+            Self::Threshold => "threshold",
+            Self::Kernel => "kernel",
+        }
+    }
+
+    pub fn from_wire_str(value: &str) -> Option<Self> {
+        match value {
+            "physics_island" => Some(Self::PhysicsIsland),
+            "gameplay" => Some(Self::Gameplay),
+            "threshold" => Some(Self::Threshold),
+            "kernel" => Some(Self::Kernel),
+            _ => None,
+        }
+    }
+}
+
+pub fn standard_component_schema_for_name(name: &str) -> Option<ComponentSchema> {
+    STANDARD_COMPONENT_SCHEMAS
+        .iter()
+        .copied()
+        .find(|schema| schema.names().any(|candidate| candidate == name))
+}
+
+pub fn standard_component_authority_group(name: &str) -> Option<AuthorityGroupKind> {
+    let schema = standard_component_schema_for_name(name)?;
+    match schema.id.get() {
+        10_001 | 10_002 | 10_003 | 10_004 | 10_020 | 10_021 | 10_022 | 10_023 | 11_001 | 11_002
+        | 11_003 | 11_004 | 11_005 | 11_006 | 11_007 => Some(AuthorityGroupKind::PhysicsIsland),
+        10_006 => Some(AuthorityGroupKind::Kernel),
+        _ => Some(AuthorityGroupKind::Gameplay),
+    }
+}
+
+pub fn standard_component_default_authority_mode(name: &str) -> Option<AuthorityMode> {
+    match standard_component_authority_group(name)? {
+        AuthorityGroupKind::PhysicsIsland => Some(AuthorityMode::ServerPhysicsIsland),
+        AuthorityGroupKind::Kernel => Some(AuthorityMode::PersistentKernelLock),
+        AuthorityGroupKind::Gameplay => Some(AuthorityMode::ServerArbitrated),
+        AuthorityGroupKind::Threshold => Some(AuthorityMode::ThresholdOverlap),
+    }
 }
 
 /// Component authority snapshot that can be shared by broker, protocol, and SDK code.
@@ -1153,6 +1222,98 @@ mod tests {
                 Some(mode.clone())
             );
         }
+    }
+
+    #[test]
+    fn authority_modes_project_to_typed_authority_groups() {
+        assert_eq!(
+            AuthorityMode::ServerPhysicsIsland.authority_group(),
+            AuthorityGroupKind::PhysicsIsland
+        );
+        assert_eq!(
+            AuthorityMode::ServerArbitrated.authority_group(),
+            AuthorityGroupKind::Gameplay
+        );
+        assert_eq!(
+            AuthorityMode::ClientForwardSparse.authority_group(),
+            AuthorityGroupKind::Gameplay
+        );
+        assert_eq!(
+            AuthorityMode::ThresholdOverlap.authority_group(),
+            AuthorityGroupKind::Threshold
+        );
+        assert_eq!(
+            AuthorityMode::PersistentKernelLock.authority_group(),
+            AuthorityGroupKind::Kernel
+        );
+
+        for group in [
+            AuthorityGroupKind::PhysicsIsland,
+            AuthorityGroupKind::Gameplay,
+            AuthorityGroupKind::Threshold,
+            AuthorityGroupKind::Kernel,
+        ] {
+            assert_eq!(
+                AuthorityGroupKind::from_wire_str(group.as_wire_str()),
+                Some(group)
+            );
+        }
+    }
+
+    #[test]
+    fn standard_component_authority_groups_pin_2d_and_3d_physics_island() {
+        for name in [
+            "pos",
+            "core.pos2",
+            "vel",
+            "core.vel2",
+            "gen",
+            "sim_time",
+            "rot",
+            "lin",
+            "ang",
+            "at_rest",
+            "core.pos3",
+            "core.vel3",
+            "core.rot3",
+            "core.lin3",
+            "core.ang3",
+            "core.local_frame",
+            "core.physics_body",
+        ] {
+            assert_eq!(
+                standard_component_authority_group(name),
+                Some(AuthorityGroupKind::PhysicsIsland),
+                "{name}"
+            );
+            assert_eq!(
+                standard_component_default_authority_mode(name),
+                Some(AuthorityMode::ServerPhysicsIsland),
+                "{name}"
+            );
+        }
+
+        assert_eq!(
+            standard_component_authority_group("core.kind"),
+            Some(AuthorityGroupKind::Gameplay)
+        );
+        assert_eq!(
+            standard_component_default_authority_mode("core.kind"),
+            Some(AuthorityMode::ServerArbitrated)
+        );
+        assert_eq!(
+            standard_component_authority_group("core.parent"),
+            Some(AuthorityGroupKind::Kernel)
+        );
+        assert_eq!(
+            standard_component_default_authority_mode("core.parent"),
+            Some(AuthorityMode::PersistentKernelLock)
+        );
+        assert_eq!(standard_component_authority_group("game.inventory"), None);
+        assert_eq!(
+            standard_component_default_authority_mode("game.inventory"),
+            None
+        );
     }
 
     #[test]
