@@ -46,6 +46,17 @@ jobs:
             exit 1
           fi
 
+      - name: Validate PR invariant body
+        run: |
+          python3 tools/pr_invariant_gate.py
+          python3 tools/pr_invariant_gate.py \
+            --body-file docs/ops/examples/pr-body.valid.md
+          if python3 tools/pr_invariant_gate.py \
+            --body-file docs/ops/examples/pr-body.invalid-missing-fail-gate.md; then
+            echo "PR body without fail-under-broken section unexpectedly passed"
+            exit 1
+          fi
+
   rust-baseline:
     name: Rust baseline
     runs-on: ubuntu-latest
