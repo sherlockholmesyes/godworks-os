@@ -29,9 +29,9 @@ use godworks_broker::wal::{
     crc32_ieee, read_wal_events, wal_v1_envelope_line, wal_v1_header_line, WalReadReport,
 };
 use godworks_core::{
-    AuthorityMode, PartitionMapSpec, PartitionSchema, RegionSplitSpec, SpatialSchema,
-    VersionedPartitionMap, COORDINATE_CODEC_VERSION, SPATIAL_SCHEMA_VERSION,
-    STANDARD_COMPONENT_REGISTRY_VERSION,
+    standard_component_authority_group, AuthorityGroupKind, AuthorityMode, PartitionMapSpec,
+    PartitionSchema, RegionSplitSpec, SpatialSchema, VersionedPartitionMap,
+    COORDINATE_CODEC_VERSION, SPATIAL_SCHEMA_VERSION, STANDARD_COMPONENT_REGISTRY_VERSION,
 };
 use godworks_protocol::{
     operation_semantics, partition_map_contract_value, DEFAULT_MAX_FRAME_BYTES,
@@ -745,7 +745,9 @@ fn default_authority_mode(comps: &Map<String, Value>, comp: &str) -> AuthorityMo
         AuthorityMode::ThresholdOverlap
     } else if acl_client_write_attr_from_components(comps, comp).is_some() {
         AuthorityMode::ClientForwardSparse
-    } else if is_spatial_component(comp) {
+    } else if standard_component_authority_group(comp) == Some(AuthorityGroupKind::PhysicsIsland)
+        || is_spatial_component(comp)
+    {
         AuthorityMode::ServerPhysicsIsland
     } else {
         AuthorityMode::ServerArbitrated
@@ -8563,6 +8565,55 @@ mod tests {
             "rot" => json!(0.5),
             "vel" => json!([0.0, 2.0]),
             other => panic!("unexpected physics-island comp {other}"),
+        }
+    }
+
+    #[test]
+    fn standard_3d_components_default_to_physics_island_authority_group() {
+        let mut components = Map::new();
+        components.insert("core.pos3".to_string(), json!([0.0, 1.0, 2.0]));
+        components.insert("core.vel3".to_string(), json!([0.5, 0.0, -0.5]));
+        components.insert("core.rot3".to_string(), json!([0.0, 0.0, 0.0, 1.0]));
+        components.insert("core.lin3".to_string(), json!([1.0, 0.0, 0.0]));
+        components.insert("core.ang3".to_string(), json!([0.0, 1.0, 0.0]));
+        components.insert("core.local_frame".to_string(), json!({"basis": "debug"}));
+        components.insert("core.physics_body".to_string(), json!({"shape": "sphere"}));
+        components.insert("core.kind".to_string(), json!("ship"));
+        components.insert("inventory".to_string(), json!({"ore": 1}));
+
+        let authority = initial_authority_map(&components, 1);
+        let physics = physics_island_component_names(&components, &authority);
+
+        for comp in [
+            "core.pos3",
+            "core.vel3",
+            "core.rot3",
+            "core.lin3",
+            "core.ang3",
+            "core.local_frame",
+            "core.physics_body",
+        ] {
+            assert_eq!(
+                authority.get(comp).map(|ca| &ca.mode),
+                Some(&AuthorityMode::ServerPhysicsIsland),
+                "{comp}"
+            );
+            assert!(
+                physics.iter().any(|item| item == comp),
+                "{comp} must join the atomic physics-island authority group"
+            );
+        }
+
+        for comp in ["core.kind", "inventory"] {
+            assert_eq!(
+                authority.get(comp).map(|ca| &ca.mode),
+                Some(&AuthorityMode::ServerArbitrated),
+                "{comp}"
+            );
+            assert!(
+                !physics.iter().any(|item| item == comp),
+                "{comp} must not be pulled into the physics-island group"
+            );
         }
     }
 
