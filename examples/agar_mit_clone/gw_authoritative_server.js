@@ -21,6 +21,7 @@ const ROWS = parseInt(process.env.GW_ROWS || "4", 10);
 const WIDTH = parseFloat(process.env.GW_WIDTH || "5000");
 const HEIGHT = parseFloat(process.env.GW_HEIGHT || "5000");
 const UPDATE_HZ = parseFloat(process.env.GW_UPDATE_HZ || "25");
+const STATE_ENTITY_LIMIT = parseInt(process.env.GW_AUTH_STATE_ENTITY_LIMIT || "20000", 10);
 
 const app = express();
 const httpServer = http.Server(app);
@@ -504,10 +505,15 @@ setInterval(() => {
   }
 }, 1000 / UPDATE_HZ);
 
-app.get("/state", (_req, res) => {
-  res.json({
+app.get("/state", (req, res) => {
+  const includeEntities = req.query.entities === "1" || req.query.entities === "true";
+  const body = {
     ok: true,
     godworksAuthoritative: true,
+    ts: Date.now(),
+    width: WIDTH,
+    height: HEIGHT,
+    grid: { cols: COLS, rows: ROWS },
     players: players.size,
     entities: entities.size,
     foods: Array.from(entities.values()).filter(entity => entity.kind === "food").length,
@@ -525,7 +531,23 @@ app.get("/state", (_req, res) => {
       acc[key] = (acc[key] || 0) + 1;
       return acc;
     }, {}),
-  });
+  };
+  if (includeEntities) {
+    body.entityRows = Array.from(entities.values())
+      .slice(0, STATE_ENTITY_LIMIT)
+      .map(entity => ({
+        id: entity.id,
+        x: Array.isArray(entity.pos) ? entity.pos[0] : null,
+        y: Array.isArray(entity.pos) ? entity.pos[1] : null,
+        mass: entity.mass || 1,
+        kind: entity.kind || "cell",
+        hue: entity.hue || 100,
+        owner: entity.owner || null,
+        region: entity.region || null,
+      }));
+    body.entityRowsTruncated = entities.size > body.entityRows.length;
+  }
+  res.json(body);
 });
 
 obsSock = connectObs();

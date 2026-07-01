@@ -7,6 +7,7 @@ param(
   [string]$CloneRoot = "",
   [int]$PortBroker = 7990,
   [int]$PortGame = 3000,
+  [int]$PortMonitor = 8091,
   [int]$ControlBase = 8100,
   [int]$GridCols = 4,
   [int]$GridRows = 4,
@@ -75,6 +76,7 @@ function Stop-GodworksAuthoritativeAgar {
     "gw_authoritative_gate.js",
     "gw_authoritative_bots.js",
     "gw_authoritative_capacity_gate.js",
+    "gw_authoritative_monitor.js",
     "_gw_bots.js",
     "_gw_spectator_tap.js",
     "gw_shard_monitor.js",
@@ -87,7 +89,7 @@ function Stop-GodworksAuthoritativeAgar {
     "gw_agar_mirror_worker.js",
     "gw_broker_view.js"
   )
-  $ports = @($PortBroker, $PortGame)
+  $ports = @($PortBroker, $PortGame, $PortMonitor)
   for ($i = 0; $i -lt ($GridCols * $GridRows); $i++) { $ports += ($ControlBase + $i) }
   $listenerPids = @(Get-NetTCPConnection -LocalPort $ports -ErrorAction SilentlyContinue |
     Select-Object -ExpandProperty OwningProcess -Unique |
@@ -142,7 +144,7 @@ function Ensure-ClientBuild {
 }
 
 function Copy-Tools {
-  foreach ($name in @("gw_authoritative_zone_worker.js", "gw_authoritative_server.js", "gw_authoritative_gate.js", "gw_authoritative_bots.js", "gw_authoritative_capacity_gate.js")) {
+  foreach ($name in @("gw_authoritative_zone_worker.js", "gw_authoritative_server.js", "gw_authoritative_gate.js", "gw_authoritative_bots.js", "gw_authoritative_capacity_gate.js", "gw_authoritative_monitor.js")) {
     Copy-Item -LiteralPath (Join-Path $ToolsDir $name) -Destination (Join-Path $CloneRoot $name) -Force
   }
 }
@@ -209,9 +211,16 @@ if (-not (Test-PortListening $PortGame)) {
   Wait-Port $PortGame "Godworks authoritative agar server"
 }
 
+if (-not (Test-PortListening $PortMonitor)) {
+  $cmd = "Set-Location '$CloneRoot'; `$env:GW_MONITOR_PORT='$PortMonitor'; `$env:GW_AGAR_STATE_URL='http://127.0.0.1:$PortGame/state?entities=1'; `$env:GW_WORKER_COLS='$GridCols'; `$env:GW_WORKER_ROWS='$GridRows'; & '$NodeExe' 'gw_authoritative_monitor.js'"
+  Start-LoggedPowerShell "auth_monitor_$PortMonitor" $cmd $CloneRoot | Out-Null
+  Wait-Port $PortMonitor "Godworks authoritative monitor"
+}
+
 Write-Host ""
 Write-Host "Godworks authoritative agar:"
 Write-Host "  game/client: http://localhost:$PortGame/"
+Write-Host "  monitor:     http://localhost:$PortMonitor/"
 Write-Host "  state:       http://localhost:$PortGame/state"
 Write-Host "  broker:      127.0.0.1:$PortBroker"
 Write-Host "  workers:     $($GridCols * $GridRows) region workers, controls $ControlBase-$($ControlBase + $GridCols * $GridRows - 1)"
@@ -223,6 +232,7 @@ if ($RunGate) {
   Start-Sleep -Seconds 3
   $env:GW_AGAR_GAME_URL = "http://127.0.0.1:$PortGame"
   $env:GW_AGAR_STATE_URL = "http://127.0.0.1:$PortGame/state"
+  $env:GW_AGAR_MONITOR_URL = "http://127.0.0.1:$PortMonitor/state"
   Push-Location $CloneRoot
   try {
     & $NodeExe "gw_authoritative_gate.js"

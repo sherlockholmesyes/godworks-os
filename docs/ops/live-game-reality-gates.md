@@ -175,6 +175,20 @@ transient retries, and then post-run cleanup with `players=0` and
 green if controlled players disconnect but their Godworks player entities remain
 orphaned after a stale-owner handoff window.
 
+Godworks-authoritative single-player and live-monitor gate:
+
+```powershell
+python C:\Users\elean\Downloads\AGI\bridge\mcp_supervisor.py preflight
+.\examples\agar_mit_clone\run_godworks_authoritative.ps1 -BuildBroker -StopExisting -RunGate
+```
+
+This serves the MIT browser client on `:3000` and the authoritative monitor on
+`:8091`. The monitor is fed from the same Godworks-authoritative `/state` stream
+as the gate, draws actual broker owner load, draws the fixed broker grid, and
+adds a dynamic load-balanced diagnostic view. The diagnostic view must not be
+described as dynamic broker rebalance until a future PartitionMap activation
+contract makes broker region movement real.
+
 ## Godot Gates
 
 Godot is the engine-facing proof path:

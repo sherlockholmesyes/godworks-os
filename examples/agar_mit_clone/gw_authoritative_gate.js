@@ -5,6 +5,7 @@ const io = require("socket.io-client");
 
 const GAME_URL = process.env.GW_AGAR_GAME_URL || "http://127.0.0.1:3000";
 const STATE_URL = process.env.GW_AGAR_STATE_URL || `${GAME_URL.replace(/\/$/, "")}/state`;
+const MONITOR_URL = process.env.GW_AGAR_MONITOR_URL || "";
 const NAME = process.env.GW_AGAR_AUTH_NAME || `gw_auth_${Date.now()}`;
 const TIMEOUT_MS = parseInt(process.env.GW_AGAR_AUTH_TIMEOUT_MS || "12000", 10);
 
@@ -32,6 +33,7 @@ async function main() {
   let maxDistance = 0;
   let rip = false;
   let kicked = null;
+  let monitorState = null;
 
   socket.on("connect", () => socket.emit("respawn"));
   socket.on("welcome", player => {
@@ -64,6 +66,21 @@ async function main() {
     await new Promise(resolve => setTimeout(resolve, 250));
     if (latest) socket.emit("0", { x: 4500, y: 4500 });
     try { state = await getJson(STATE_URL); } catch (_) {}
+    if (MONITOR_URL) {
+      try { monitorState = await getJson(MONITOR_URL); } catch (_) {}
+    }
+    const monitorOk = !MONITOR_URL || (
+      monitorState &&
+      monitorState.godworksAuthoritative === true &&
+      monitorState.upstream &&
+      monitorState.upstream.entities > 0 &&
+      Array.isArray(monitorState.entities) &&
+      monitorState.entities.length > 0 &&
+      Array.isArray(monitorState.bands) &&
+      monitorState.bands.length === 4 &&
+      Array.isArray(monitorState.dynamicLoads) &&
+      monitorState.dynamicLoads.length >= 16
+    );
     if (
       welcomed &&
       frames >= 10 &&
@@ -73,6 +90,7 @@ async function main() {
       state.foods > 0 &&
       state.playerEntities > 0 &&
       Number(state.commandResponses || 0) > initialCommandResponses &&
+      monitorOk &&
       !rip &&
       !kicked
     ) {
@@ -84,6 +102,7 @@ async function main() {
         maxDistance,
         commandResponseDelta: Number(state.commandResponses || 0) - initialCommandResponses,
         state,
+        monitorState,
       }, null, 2));
       return;
     }
@@ -100,6 +119,7 @@ async function main() {
     latest,
     initialCommandResponses,
     state,
+    monitorState,
   }, null, 2));
   process.exit(1);
 }
