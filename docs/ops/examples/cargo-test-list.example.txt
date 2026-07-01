@@ -1,0 +1,2 @@
+tests::known_law_gate: test
+other_module::another_gate: test

@@ -45,6 +45,15 @@ jobs:
             echo "system laws row without fail-under-broken gate unexpectedly passed"
             exit 1
           fi
+          python3 tools/system_laws_test_inventory.py \
+            --laws docs/ops/examples/system-laws.valid-test-inventory.jsonl \
+            --test-list-file docs/ops/examples/cargo-test-list.example.txt
+          if python3 tools/system_laws_test_inventory.py \
+            --laws docs/ops/examples/system-laws.invalid-missing-test.jsonl \
+            --test-list-file docs/ops/examples/cargo-test-list.example.txt; then
+            echo "system law row with missing cargo test gate unexpectedly passed"
+            exit 1
+          fi
 
       - name: Validate PR invariant body
         run: |
@@ -74,6 +83,9 @@ jobs:
 
       - name: Compile all targets
         run: cargo check --workspace --all-targets
+
+      - name: System laws test inventory
+        run: python3 tools/system_laws_test_inventory.py --laws docs/ops/system-laws.jsonl
 
       - name: Clippy baseline
         run: cargo clippy --workspace --all-targets -- -D warnings

@@ -23,6 +23,17 @@ CI validates the machine-readable law index:
 python3 tools/system_laws_lint.py --laws docs/ops/system-laws.jsonl
 ```
 
+The Rust baseline also binds law rows to the current Rust test inventory:
+
+```bash
+python3 tools/system_laws_test_inventory.py --laws docs/ops/system-laws.jsonl
+```
+
+This runs `cargo test --workspace --all-targets -- --list` and fails if a
+`current_gates[].command` names a `cargo test` filter that no longer resolves
+to a real test. It does not replace running the tests; it prevents stale or
+invented law gates from surviving as documentation.
+
 CI also runs a deliberately malformed fixture and expects it to fail:
 
 ```bash
@@ -53,6 +64,11 @@ test, fixture, or runtime ruler that would fail when the law is broken.
 - `docs/ops/system-laws.jsonl` is the current law index.
 - `docs/ops/examples/system-laws.invalid-missing-fail-gate.jsonl` proves the
   linter rejects a row without a fail-under-broken gate.
+- `docs/ops/examples/system-laws.valid-test-inventory.jsonl` and
+  `docs/ops/examples/system-laws.invalid-missing-test.jsonl` prove the
+  inventory checker accepts an existing cargo test gate and rejects a stale one.
 - `tools/system_laws_lint.py` validates the index without external
   dependencies.
+- `tools/system_laws_test_inventory.py` validates that law rows pointing at
+  Rust tests still point at tests in the current workspace inventory.
 
