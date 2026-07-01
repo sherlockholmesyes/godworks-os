@@ -18,7 +18,7 @@ const s = net.connect(BPORT, '127.0.0.1', () => {
   setInterval(()=>s.write(frame({op:'InspectorQuery', request_id:'v', max_entities:1000})), 80);
   console.error('[d2-view] connected broker :'+BPORT);
 });
-s.on('data', d => { buf=Buffer.concat([buf,d]); while(buf.length>=4){ const n=buf.readUInt32BE(0); if(buf.length<4+n)break; let f; try{f=JSON.parse(buf.slice(4,4+n).toString('utf8'));}catch(e){} buf=buf.slice(4+n); if(f&&f.op==='InspectorFrame'){ snap=(f.entities||[]).map(e=>({p:e.pos, o:((e.authority||{}).pos||{}).owner||e.region||'?', r:e.region})); } }});
+s.on('data', d => { buf=Buffer.concat([buf,d]); while(buf.length>=4){ const n=buf.readUInt32BE(0); if(buf.length<4+n)break; let f; try{f=JSON.parse(buf.slice(4,4+n).toString('utf8'));}catch(e){} buf=buf.slice(4+n); if(f&&f.op==='InspectorFrame'){ snap=(f.entities||[]).map(e=>({id:e.entity||e.id||e.entity_id,p:e.pos, o:((e.authority||{}).pos||{}).owner||e.region||'?', r:e.region})); } }});
 s.on('error', e=>console.error('[d2-view] broker', e.message));
 s.on('close', ()=>{ console.error('[d2-view] broker closed'); process.exit(0); });
 

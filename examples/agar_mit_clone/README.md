@@ -24,6 +24,12 @@ Run with a public Godworks broker mirror:
 .\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunGate
 ```
 
+Run the playable seam gate:
+
+```powershell
+.\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunPlayableSeamGate
+```
+
 Use `-StopExisting` when an old local demo owns the same ports.
 
 ## What This Proves
@@ -41,6 +47,11 @@ Use `-StopExisting` when an old local demo owns the same ports.
   you want a stress check that requires an actual rebalance event during the gate
   window. The default gate accepts already-dynamic non-uniform geometry, because
   a balanced live snapshot should not rebalance just to satisfy a test.
+- `-RunPlayableSeamGate` joins a real stock-clone player, sends normal movement
+  commands over the MIT clone Socket.IO protocol, requires the player to move
+  across at least one dynamic `:8091` worker-zone boundary, and requires
+  continued movement after crossing. With `-MirrorBroker`, the same probe is
+  matched against the optional `:8092` Godworks broker mirror view.
 
 ## Honest Boundary
 
@@ -48,6 +59,12 @@ This is not a benchmark claim. It proves integration shape and live-game
 visibility. Capacity must be measured by a separate soak profile with real
 numbers for bot/client count, command ACK latency, handoff success, CPU/RSS, and
 broker/client agreement.
+
+The playable seam gate is also not a broker-authoritative command claim. The MIT
+clone still receives the probe movement command directly through its normal
+Socket.IO input. The next stronger Godworks slice is a broker `CommandRequest`
+bridge for a controlled clone player, with pre/post-handoff command ACKs from
+the current Godworks owner.
 
 The current public protocol uses one `WorkerConnect.region` per TCP connection.
 The old scratchpad D3 multi-region worker harness is therefore not copied as a

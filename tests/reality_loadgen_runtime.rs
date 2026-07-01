@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ const OBS_RLG_TOKEN: &str = "rlg-obs-token";
 const CLIENT_RLG_TOKEN: &str = "rlg-client-token";
 const MESH_RLG_TOKEN: &str = "rlg-mesh-token";
 const RLG_AUTH_CLAIMS: &str = "rlg-w-token:W:physics|server,rlg-e-token:E:physics|server,rlg-obs-token:OBS:observer,rlg-client-token:CLIENT:role.client,rlg-mesh-token:MESH:role.mesh";
+static CROSS_BROKER_RLG_LOCK: Mutex<()> = Mutex::new(());
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -110,6 +112,7 @@ fn metric_u64(metrics: &HashMap<String, String>, key: &str) -> u64 {
 }
 
 fn run_cross_broker_reality_loadgen(auth_claims: Option<&str>) {
+    let _guard = CROSS_BROKER_RLG_LOCK.lock().expect("cross-broker RLG lock");
     let port_w = free_port();
     let port_e = free_port();
     assert_ne!(port_w, port_e);
