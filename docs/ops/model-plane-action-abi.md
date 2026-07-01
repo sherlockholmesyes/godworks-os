@@ -85,6 +85,51 @@ still contain raw redacted keys such as `auth_token`, `payload`, `components`,
 `updates`, `lastCommand`, `lastTarget`, or `target`, failed Agar gates
 (`ok:false`), and non-finite numeric metrics before they can enter a dataset.
 
+## Dataset Store
+
+`model_dataset_store` is the first physical persistence cut for model-plane
+data. It still does not train a model, register weights, or activate runtime
+policy. It only stores a validated dataset cut and, separately, an auditable
+promotion decision record.
+
+```bash
+cargo run --bin replay_eval -- \
+  .local/agar_mit_clone_logs/agar-live.replay.jsonl \
+  arena agar-live-dataset-v1 trace-agar-live \
+  > .local/model-plane/replay_eval_report.json
+
+cargo run --bin model_feature_block -- replay \
+  .local/agar_mit_clone_logs/agar-live.replay.jsonl \
+  arena agar-live-dataset-v1 trace-agar-live \
+  > .local/model-plane/agar-live-blocks.jsonl
+
+cargo run --bin model_dataset_store -- ingest \
+  .local/model-plane/agar-live-blocks.jsonl \
+  .local/model-plane/datasets/agar-live-dataset-v1
+
+cargo run --bin model_dataset_store -- promote \
+  .local/model-plane/datasets/agar-live-dataset-v1 \
+  .local/model-plane/proposal.json \
+  .local/model-plane/replay_eval_report.json \
+  promotion-agar-live-1 accept \
+  .local/model-plane/promotions/promotion-agar-live-1.json
+```
+
+`ingest` writes immutable `features.jsonl` and `manifest.json` files through a
+staging directory and atomic directory commit. It rejects empty input, mixed
+project/dataset provenance, unredacted feature blocks, unknown top-level feature
+fields, raw payload-like keys, and invalid metrics before any dataset cut is
+stored. Existing dataset files are not overwritten.
+
+`promote` requires an existing dataset manifest, a typed proposal JSON, and a
+clean `replay_eval` report (`ok:true`, `error_count:0`, positive `events`, empty
+`errors`). The replay report must also carry the source artifact,
+`input_fingerprint`, and project/dataset/trace binding emitted by `replay_eval`.
+`promote` revalidates `features.jsonl`, recomputes the manifest, and writes a
+`ModelPromotionRecord` only when proposal provenance, stored feature data, and
+replay/eval evidence all match. The record is a replayable audit artifact, not a
+runtime mutation.
+
 Allowed action kinds are proposal-only:
 
 - `RecommendPartitionMap`
@@ -143,6 +188,8 @@ cargo test -p godworks-core model_feature_block_contract_pins_project_local_prov
 cargo test --bin model_feature_block replay_builder -- --test-threads=1
 cargo test --bin model_feature_block reality_loadgen_builder -- --test-threads=1
 cargo test --bin model_feature_block agar_live_gate_builder -- --test-threads=1
+cargo test --bin model_dataset_store dataset_store -- --test-threads=1
+cargo test --bin model_dataset_store promotion_ -- --test-threads=1
 cargo test -p godworks-core model_action_contract_rejects_direct_runtime_mutation
 cargo test -p godworks-core model_action_proposal_requires_provenance_and_guarded_validator
 cargo test -p godworks-core model_dataset_manifest_accepts_only_one_valid_project_dataset_cut
@@ -155,11 +202,13 @@ unvalidated `reality_loadgen`/Agar live-gate metrics; if a failed live game gate
 or failed MIT ladder profile can enter the dataset as a success; if the public
 model action vocabulary starts accepting direct runtime mutations; if guarded
 proposals can be emitted without validator provenance; if mixed project/dataset
-feature blocks can form one dataset manifest; or if promotion records can omit
-replay/eval evidence or mismatch dataset/proposal provenance.
+feature blocks can form one dataset manifest; if dataset storage overwrites an
+existing cut or leaves the canonical dataset directory half-written; if physical
+promotion records can omit clean replay/eval evidence, skip stored feature
+verification, or mismatch dataset/proposal/replay provenance.
 
 ## Non-Scope
 
-This ABI does not yet provide a physical dataset store, model training loop,
-model registry, or runtime activation path. The current layer is only the typed
-contract that a future `model_dataset_store` or promotion runner must obey.
+This ABI does not yet provide a model training loop, model registry, or runtime
+activation path. The current physical store is intentionally narrow: immutable
+feature-block dataset cuts plus replay/eval-bound promotion records only.

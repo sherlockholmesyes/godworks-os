@@ -12,6 +12,11 @@ const REDACTED_KEYS: &[&str] = &["auth_token", "value", "payload", "components",
 struct ReplayEvalReport {
     events: usize,
     errors: Vec<String>,
+    source_artifact: Option<String>,
+    input_fingerprint: Option<String>,
+    project_id: Option<String>,
+    dataset_id: Option<String>,
+    trace_id: Option<String>,
 }
 
 impl ReplayEvalReport {
@@ -20,32 +25,71 @@ impl ReplayEvalReport {
     }
 
     fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "events": self.events,
             "ok": self.is_ok(),
             "error_count": self.errors.len(),
             "errors": self.errors,
-        })
+        });
+        if let Some(source_artifact) = &self.source_artifact {
+            value["source_artifact"] = json!(source_artifact);
+        }
+        if let Some(input_fingerprint) = &self.input_fingerprint {
+            value["input_fingerprint"] = json!(input_fingerprint);
+        }
+        if let Some(project_id) = &self.project_id {
+            value["project_id"] = json!(project_id);
+        }
+        if let Some(dataset_id) = &self.dataset_id {
+            value["dataset_id"] = json!(dataset_id);
+        }
+        if let Some(trace_id) = &self.trace_id {
+            value["trace_id"] = json!(trace_id);
+        }
+        value
     }
 }
 
 fn main() {
-    let Some(path) = env::args().nth(1) else {
-        eprintln!("usage: replay_eval <GW_REPLAY_TAPE.jsonl>");
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.len() != 1 && args.len() != 4 {
+        eprintln!("usage: replay_eval <GW_REPLAY_TAPE.jsonl> [project_id dataset_id trace_id]");
         process::exit(2);
-    };
-    let content = match fs::read_to_string(&path) {
+    }
+    let path = &args[0];
+    let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => {
             eprintln!("failed to read replay tape '{path}': {err}");
             process::exit(2);
         }
     };
-    let report = validate_tape(&content);
+    let binding = if args.len() == 4 {
+        Some((args[1].as_str(), args[2].as_str(), args[3].as_str()))
+    } else {
+        None
+    };
+    let report = validate_tape_with_source(&content, path, binding);
     println!("{}", report.to_json());
     if !report.is_ok() {
         process::exit(1);
     }
+}
+
+fn validate_tape_with_source(
+    content: &str,
+    path: &str,
+    binding: Option<(&str, &str, &str)>,
+) -> ReplayEvalReport {
+    let mut report = validate_tape(content);
+    report.source_artifact = Some(format!("replay:{}", normalize_path(path)));
+    report.input_fingerprint = Some(stable_fingerprint(content.as_bytes()));
+    if let Some((project_id, dataset_id, trace_id)) = binding {
+        report.project_id = Some(project_id.to_string());
+        report.dataset_id = Some(dataset_id.to_string());
+        report.trace_id = Some(trace_id.to_string());
+    }
+    report
 }
 
 fn validate_tape(content: &str) -> ReplayEvalReport {
@@ -69,6 +113,19 @@ fn validate_tape(content: &str) -> ReplayEvalReport {
         validate_event_contract(&event, line_no, &mut report.errors);
     }
     report
+}
+
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn stable_fingerprint(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 fn validate_no_redacted_keys(value: &Value, line_no: usize, path: &str, errors: &mut Vec<String>) {
@@ -323,6 +380,27 @@ mod tests {
         let report = validate_tape(tape);
         assert_eq!(report.errors, Vec::<String>::new());
         assert_eq!(report.events, 3);
+    }
+
+    #[test]
+    fn report_can_bind_source_artifact_and_dataset_trace() {
+        let tape = r#"{"kind":"broker_handoff","spatial_dim":"D2","coordinate_codec":"debug_f64_2","component_registry_version":1,"partition_schema":{"kind":"grid2d","cols":2,"rows":2},"path":"local","entity":"ship","authority_epoch":3,"durable_gen":8}"#;
+        let report = validate_tape_with_source(
+            tape,
+            r".local\trace.jsonl",
+            Some(("arena", "dataset-v1", "trace-1")),
+        );
+        let value = report.to_json();
+
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["source_artifact"], json!("replay:.local/trace.jsonl"));
+        assert_eq!(value["project_id"], json!("arena"));
+        assert_eq!(value["dataset_id"], json!("dataset-v1"));
+        assert_eq!(value["trace_id"], json!("trace-1"));
+        assert!(value["input_fingerprint"]
+            .as_str()
+            .unwrap()
+            .starts_with("fnv1a64:"));
     }
 
     #[test]

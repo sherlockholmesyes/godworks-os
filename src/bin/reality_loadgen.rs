@@ -371,6 +371,60 @@ fn count_entities_at_pos_x(frame: &Value, prefix: &str, count: u64, expected_x: 
         .count() as u64
 }
 
+async fn poll_entities_at_pos_x(
+    host: &str,
+    port: u16,
+    request_prefix: &str,
+    entity_prefix: &str,
+    count: u64,
+    expected_x: f64,
+    timeout: Duration,
+) -> (u64, Option<String>) {
+    let started = Instant::now();
+    let mut attempt = 0;
+    let mut best = 0;
+    let mut last_error = None;
+    let mut saw_response = false;
+
+    loop {
+        attempt += 1;
+        match query_entities_with_query(
+            host,
+            port,
+            &format!("{request_prefix}-{attempt}"),
+            json!({"type":"sphere","center":[0.0,0.0],"radius":100.0}),
+        )
+        .await
+        {
+            Ok(frame) => {
+                saw_response = true;
+                let current = count_entities_at_pos_x(&frame, entity_prefix, count, expected_x);
+                best = best.max(current);
+                if best >= count {
+                    return (best, None);
+                }
+            }
+            Err(e) => {
+                last_error = Some(e.to_string());
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if saw_response {
+        (best, None)
+    } else {
+        (
+            best,
+            Some(last_error.unwrap_or_else(|| "EntityQueryResponse not received".to_string())),
+        )
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let host = env::var("GW_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -622,22 +676,19 @@ async fn main() {
         )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        match query_entities_with_query(
+        let (post_handoff_count, post_handoff_error) = poll_entities_at_pos_x(
             &host,
             port_e,
             "rlg-handoff-pos",
-            json!({"type":"sphere","center":[0.0,0.0],"radius":100.0}),
+            "rlg-body-",
+            entities,
+            e_probe_x,
+            Duration::from_secs(3),
         )
-        .await
-        {
-            Ok(frame) => {
-                handoff_pos_ok = count_entities_at_pos_x(&frame, "rlg-body-", entities, e_probe_x);
-            }
-            Err(e) => {
-                handoff_pos_query_error = format!("handoff_query_error:{e}");
-            }
+        .await;
+        handoff_pos_ok = post_handoff_count;
+        if let Some(e) = post_handoff_error {
+            handoff_pos_query_error = format!("handoff_query_error:{e}");
         }
 
         send_json(
@@ -646,23 +697,46 @@ async fn main() {
         )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        stale_pos_rejected_exact =
-            exact_rejections.count_entities_with_rejects("pos", "rlg-body-", entities);
 
-        match query_entities_with_query(
-            &host,
-            port_e,
-            "rlg-stale-pos",
-            json!({"type":"sphere","center":[0.0,0.0],"radius":100.0}),
-        )
-        .await
-        {
-            Ok(frame) => {
-                stale_pos_overwrite_blocked =
-                    count_entities_at_pos_x(&frame, "rlg-body-", entities, e_probe_x);
+        let stale_started = Instant::now();
+        let mut stale_attempt = 0;
+        let mut saw_stale_query_response = false;
+        let mut last_stale_query_error = None;
+        loop {
+            stale_attempt += 1;
+            stale_pos_rejected_exact =
+                exact_rejections.count_entities_with_rejects("pos", "rlg-body-", entities);
+            match query_entities_with_query(
+                &host,
+                port_e,
+                &format!("rlg-stale-pos-{stale_attempt}"),
+                json!({"type":"sphere","center":[0.0,0.0],"radius":100.0}),
+            )
+            .await
+            {
+                Ok(frame) => {
+                    saw_stale_query_response = true;
+                    stale_pos_overwrite_blocked = stale_pos_overwrite_blocked.max(
+                        count_entities_at_pos_x(&frame, "rlg-body-", entities, e_probe_x),
+                    );
+                    if stale_pos_rejected_exact >= entities
+                        && stale_pos_overwrite_blocked >= entities
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last_stale_query_error = Some(e.to_string());
+                }
             }
-            Err(e) => {
+
+            if stale_started.elapsed() >= Duration::from_secs(3) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if !saw_stale_query_response {
+            if let Some(e) = last_stale_query_error {
                 handoff_pos_query_error = format!("stale_query_error:{e}");
             }
         }
