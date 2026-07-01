@@ -739,6 +739,27 @@ pub struct SnapshotManifest {
     pub fields: JsonFields,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotManifestContract {
+    pub request_id: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub broker_id: Option<String>,
+    pub wal_offset: u64,
+    pub entity_count: u64,
+    pub pending_mesh: u64,
+    pub authority_hash: Option<String>,
+    pub in_flight: Vec<SnapshotInFlightHandoff>,
+    pub t_server: Option<u64>,
+    pub spatial_schema: SpatialSchema,
+    pub partition_map: VersionedPartitionMap,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotInFlightHandoff {
+    pub entity: String,
+    pub target: String,
+}
+
 impl SnapshotManifest {
     pub fn request_id(&self) -> Option<&str> {
         self.fields.str("request_id")
@@ -792,6 +813,10 @@ impl SnapshotManifest {
         self.fields.str("authority_hash")
     }
 
+    pub fn t_server(&self) -> Option<u64> {
+        self.fields.u64("t_server")
+    }
+
     pub fn spatial_schema(&self) -> Option<SpatialSchema> {
         parse_spatial_schema_contract(self.fields.get("spatial_schema")?)
     }
@@ -807,6 +832,28 @@ impl SnapshotManifest {
         Some(map)
     }
 
+    pub fn contract(&self) -> Option<SnapshotManifestContract> {
+        if !self.has_current_versions() {
+            return None;
+        }
+        Some(SnapshotManifestContract {
+            request_id: non_empty_snapshot_string(self.request_id()),
+            snapshot_id: non_empty_snapshot_string(self.snapshot_id()),
+            broker_id: non_empty_snapshot_string(self.broker_id()),
+            wal_offset: self.wal_offset()?,
+            entity_count: self.entity_count()?,
+            pending_mesh: self.pending_mesh()?,
+            authority_hash: parse_snapshot_authority_hash(self.authority_hash())?,
+            in_flight: parse_snapshot_in_flight(
+                self.fields.get("in_flight")?,
+                self.pending_mesh()?,
+            )?,
+            t_server: self.t_server(),
+            spatial_schema: self.spatial_schema()?,
+            partition_map: self.partition_map()?,
+        })
+    }
+
     pub fn has_current_versions(&self) -> bool {
         self.snapshot_manifest_version() == Some(SNAPSHOT_MANIFEST_VERSION)
             && self.snapshot_schema_version() == Some(SNAPSHOT_SCHEMA_VERSION)
@@ -814,6 +861,47 @@ impl SnapshotManifest {
             && self.coordinate_codec_version() == Some(COORDINATE_CODEC_VERSION)
             && self.component_registry_version() == Some(STANDARD_COMPONENT_REGISTRY_VERSION)
     }
+}
+
+fn non_empty_snapshot_string(value: Option<&str>) -> Option<String> {
+    value.filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+fn parse_snapshot_authority_hash(value: Option<&str>) -> Option<Option<String>> {
+    match value {
+        Some(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(Some(s.to_string()))
+        }
+        Some(_) => None,
+        None => Some(None),
+    }
+}
+
+fn parse_snapshot_in_flight(
+    value: &Value,
+    pending_mesh: u64,
+) -> Option<Vec<SnapshotInFlightHandoff>> {
+    let items = value.as_array()?;
+    if items.len() as u64 != pending_mesh {
+        return None;
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let obj = item.as_object()?;
+        if obj.get("type").and_then(Value::as_str)? != "MeshHandoff" {
+            return None;
+        }
+        let entity = obj.get("entity").and_then(Value::as_str)?;
+        let target = obj.get("target").and_then(Value::as_str)?;
+        if entity.is_empty() || target.is_empty() {
+            return None;
+        }
+        out.push(SnapshotInFlightHandoff {
+            entity: entity.to_string(),
+            target: target.to_string(),
+        });
+    }
+    Some(out)
 }
 
 pub fn parse_spatial_schema_contract(value: &Value) -> Option<SpatialSchema> {
