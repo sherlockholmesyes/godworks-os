@@ -16,6 +16,8 @@ const ARENA = parseArena(process.env.GW_ARENA || `${WORLD[1] - WORLD[0]},${WORLD
 const OBS_TOKEN = process.env.GW_OBS_TOKEN || "obs-token";
 const CLIENT_TOKEN = process.env.GW_CLIENT_TOKEN || "spawn-token";
 const BROWSER_TOKEN = process.env.GW_BROWSER_TOKEN || "browser-token";
+const configuredPlayerMass = parseFloat(process.env.GW_PLAYER_START_MASS || "12");
+const PLAYER_START_MASS = Number.isFinite(configuredPlayerMass) ? Math.max(6, configuredPlayerMass) : 12;
 
 let snapshot = [];
 let clientSnapshot = [];
@@ -143,7 +145,8 @@ const clientSock = connectPeer("agar-browser-client", "CLIENT", ["role.client"],
       e: f.entity,
       p: Array.isArray(c.pos) ? c.pos : existing && existing.p,
       m: Number.isFinite(Number(c.mass)) ? Number(c.mass) : (existing && existing.m || 1),
-      type: typeof c.type === "string" ? c.type : (existing && existing.type || "entity")
+      type: typeof c.type === "string" ? c.type : (existing && existing.type || "entity"),
+      o: f.owner || f.region || (existing && existing.o) || "client"
     };
     clientMassTable.set(f.entity, next.m);
     clientSnapshot = clientSnapshot.filter(v => v.e !== f.entity).concat([next]);
@@ -185,7 +188,7 @@ async function join(){const r=await fetch('/join',{method:'POST'});const j=await
 join().catch(()=>{});
 addEventListener('mousemove',e=>{mx=e.clientX;my=e.clientY;});
 btn.onclick=()=>fetch('/herd',{method:'POST'}).catch(()=>{});
-async function poll(){try{snap=await (await fetch('/state')).json();}catch(e){}setTimeout(poll,60);}poll();
+async function poll(){try{snap=await (await fetch('/client-state')).json();}catch(e){}setTimeout(poll,60);}poll();
 setInterval(()=>{if(!myId)return;const target=[cam[0]+(mx-cv.width/2)/scale,cam[1]+(my-cv.height/2)/scale];fetch('/input',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:myId,target})}).catch(()=>{});},60);
 function drawGrid(){
   const [x0,x1,y0,y1]=WORLD;
@@ -195,7 +198,7 @@ function drawGrid(){
   function line(a,b,s){cx.strokeStyle=s;cx.beginPath();cx.moveTo(sx(a),sy(a));cx.lineTo(sx(b),sy(b));cx.stroke();}
 }
 function sx(p){return cv.width/2+(p[0]-cam[0])*scale} function sy(p){return cv.height/2+(p[1]-cam[1])*scale}
-function draw(){cx.clearRect(0,0,cv.width,cv.height);const me=snap.find(v=>v.e===myId);if(me&&me.p)cam=me.p;scale=Math.min(cv.width,cv.height)/Math.max(WORLD[1]-WORLD[0],WORLD[3]-WORLD[2])*1.15;drawGrid();const owners={};for(const c of snap){if(!c.p)continue;owners[c.o]=(owners[c.o]||0)+1;const r=Math.max(2,Math.sqrt(Math.max(1,c.m))*scale*0.7);cx.globalAlpha=c.e===myId?1:(c.m<=1.1?0.45:0.9);cx.fillStyle=c.e===myId?'#fff':col(c.o);cx.beginPath();cx.arc(sx(c.p),sy(c.p),r,0,7);cx.fill();}cx.globalAlpha=1;hud.textContent='Godworks agar.io reality demo\\nentities: '+snap.length+'  player: '+(myId||'-')+'\\n'+Object.keys(owners).sort().map(k=>k+': '+owners[k]).join('\\n');requestAnimationFrame(draw);}draw();
+function draw(){cx.clearRect(0,0,cv.width,cv.height);const me=snap.find(v=>v.e===myId);if(me&&me.p)cam=me.p;scale=Math.min(cv.width,cv.height)/Math.max(WORLD[1]-WORLD[0],WORLD[3]-WORLD[2])*1.15;drawGrid();const owners={};for(const c of snap){if(!c.p)continue;const owner=c.o||'client';owners[owner]=(owners[owner]||0)+1;const r=Math.max(2,Math.sqrt(Math.max(1,c.m))*scale*0.7);cx.globalAlpha=c.e===myId?1:(c.m<=1.1?0.45:0.9);cx.fillStyle=c.e===myId?'#fff':col(owner);cx.beginPath();cx.arc(sx(c.p),sy(c.p),r,0,7);cx.fill();}cx.globalAlpha=1;hud.textContent='Godworks agar.io reality demo\\nsource: CLIENT stream\\nentities: '+snap.length+'  player: '+(myId||'-')+'\\n'+Object.keys(owners).sort().map(k=>k+': '+owners[k]).join('\\n');requestAnimationFrame(draw);}draw();
 </script></body></html>`;
 }
 
@@ -210,7 +213,7 @@ function readBody(req, cb) {
 http.createServer((req, res) => {
   const parsed = new URL(req.url, "http://localhost");
   const path = parsed.pathname;
-  if (path === "/state") {
+  if (path === "/state" || path === "/broker-state") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(snapshot));
   } else if (path === "/client-state") {
@@ -224,7 +227,7 @@ http.createServer((req, res) => {
         ? [Math.max(WORLD[0], Math.min(WORLD[1], requestedPos[0])), Math.max(WORLD[2], Math.min(WORLD[3], requestedPos[1]))]
         : [(WORLD[0] + WORLD[1]) / 2 + (Math.random() - 0.5) * 4, (WORLD[2] + WORLD[3]) / 2 + (Math.random() - 0.5) * 4];
       send(writeSock, { op: "CreateEntity", request_id: `join-${id}`, entity: id, region: regionForPos(pos), components: {
-        pos, vel: [0, 0], mass: 6, type: "player"
+        pos, vel: [0, 0], mass: PLAYER_START_MASS, type: "player"
       }});
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ id, world: WORLD, pos }));

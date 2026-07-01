@@ -10,6 +10,7 @@ the current Godworks broker wire directly:
 - live player input through `CommandRequest`;
 - live state read through both a non-privileged `CLIENT` stream and a
   token-bound `OBS` inspector connection;
+- visible browser rendering from the non-privileged `CLIENT` stream;
 - an adversarial reality gate that drives a player across seams and verifies
   ownership/conservation from live state.
 
@@ -45,6 +46,7 @@ Security shape:
   and gate;
 - the non-privileged `CLIENT` connection is used as a product-path stream and is
   checked against inspector truth;
+- the browser canvas renders `/client-state`, not the inspector snapshot;
 - the gate intentionally checks that client-role peers cannot create entities,
   query inspector state, claim mesh privilege, or create platform authority
   components.
@@ -66,14 +68,16 @@ move, cross partition seams, keep every entity owned by a real worker, reject
 privilege self-assignment, compare client-stream truth against inspector truth,
 and avoid duplicate entity ids in observed frames.
 
+This is the current Agar Reality Gate v1. It is now bound to the System Laws
+index as a runtime ruler, but it is not yet the full release gate. The remaining
+promotion work is tracked in `docs/ops/live-game-reality-gates.md`: pixel/canvas
+proof, `godworks-client-sdk` cache proof, replay tape validation, WAL restore
+agreement, and longer soak coverage.
+
 ## Local Reference Clone
 
-The full MIT reference clone, when restored by the development workflow, lives
-outside this repo at:
-
-```text
-C:\Users\elean\Downloads\AGI\scratchpad\agar_clone
-```
+The full MIT reference clone, when restored by the development workflow, should
+live outside this repository in a local scratchpad.
 
 Do not vendor that full source tree into this repository unless there is a
 separate product reason.
