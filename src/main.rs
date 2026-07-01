@@ -2829,6 +2829,14 @@ fn partition_schema_contract_value(schema: PartitionSchema) -> Value {
                 "rows": rows
             })
         }
+        PartitionSchema::Grid3D { cols, rows, layers } => {
+            json!({
+                "kind": "grid3d",
+                "cols": cols,
+                "rows": rows,
+                "layers": layers
+            })
+        }
         PartitionSchema::Strip1D { boundary_count } => {
             json!({
                 "kind": "strip1d",

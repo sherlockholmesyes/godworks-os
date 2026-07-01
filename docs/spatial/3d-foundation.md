@@ -21,6 +21,12 @@ with a 3D implementation. The immediate work is to prevent protocol names,
 component schemas, snapshots, WAL records, SDK assumptions, and replay data from
 locking in a 2D-only shape.
 
+The first executable rail is `client_probes/godot/godot_3d_contract_probe.gd`
+over `tests/fixtures/client_bridge/godot-3d-contract.json`. It validates D3
+metadata (`debug_f64_3`, `grid3d`) and the future 3D physics-island component
+names inside a real Godot 4.3 process, without moving the runtime broker or
+worker stack to 3D.
+
 ## Required Contract Axes
 
 Every new spatial-facing subsystem should have a clear answer for these axes:
@@ -115,6 +121,11 @@ Future-ready schema concepts:
 - `PartitionSchema::Grid2D`;
 - `PartitionSchema::Grid3D`;
 - layered or planetary partition schemas later.
+
+`PartitionSchema::Grid3D` and the matching `PartitionMapSpec::Grid3D` are typed
+contracts now. They are parseable, serializable, and validated by core/protocol
+tests, but they are not runtime-authoritative until the 3D partition activation
+contract exists.
 
 3D queries do not need to be active in broker dispatch until a 3D partition map
 exists. They should be parseable and covered by golden fixtures before they are

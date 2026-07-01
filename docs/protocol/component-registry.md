@@ -56,7 +56,12 @@ The `pos` and `vel` names stay canonical for the current JSON wire. Their
 `core.pos2` / `core.vel2` aliases give SDKs and future binary codecs a clearer
 name without changing identity.
 
-The 3D names are separate components, not aliases of the current 2D fields.
+The 3D names are separate components, not aliases of the current 2D fields. The
+first executable consumer is
+`tests/fixtures/client_bridge/godot-3d-contract.json` plus
+`client_probes/godot/godot_3d_contract_probe.gd`, which requires these names in
+a real Godot 3D scene contract without changing the current 2D runtime wire
+shape.
 
 ## Runtime Contract
 
