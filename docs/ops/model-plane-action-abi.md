@@ -55,12 +55,20 @@ cargo run --bin model_feature_block -- agar-live-gate \
 Replay input produces `IngressRejectCost` and `HandoffPressure` blocks.
 `reality_loadgen` output produces `Outcome` and `HandoffPressure` blocks.
 `agar-live-gate` output produces validated `Outcome`, `EntityDensity`, optional
-`WorkerLoad`, and optional `HandoffPressure` blocks from the live Agar gate
-summaries without copying raw WAL paths, component bodies, payloads, or tokens
-into model-plane data. The builder rejects source replay artifacts that still
-contain raw redacted keys such as `auth_token`, `payload`, `components`, or
-`updates`, failed Agar gates (`ok:false`), and non-finite numeric metrics before
-they can enter a dataset.
+`WorkerLoad`, and optional `HandoffPressure` blocks from live Agar gate
+summaries. This includes the MIT-clone playable seam gate: a real player joins
+the stock clone, sends normal clone movement commands, crosses a dynamic shard
+block in the `:8091` monitor, keeps moving after the crossing, and optionally
+matches the `:8092` broker mirror. Those summaries can feed future per-project
+load/micro-balancer datasets as redacted facts such as entity density, worker
+load, shard-block changes, post-seam movement, command count, and mirror-match
+status.
+
+The builder does not copy raw WAL paths, component bodies, payloads, or tokens
+into model-plane data. It rejects source replay artifacts that still contain raw
+redacted keys such as `auth_token`, `payload`, `components`, or `updates`,
+failed Agar gates (`ok:false`), and non-finite numeric metrics before they can
+enter a dataset.
 
 Allowed action kinds are proposal-only:
 

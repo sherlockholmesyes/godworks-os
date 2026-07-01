@@ -69,6 +69,35 @@ $env:GW_SOAK_MS = "30000"
 $env:GW_SOAK_COMMAND_MS = "1500"
 ```
 
+## MIT Clone Adapter Gate
+
+The public-clean MIT clone adapter lives under `examples/agar_mit_clone`. It
+reuses `owenashurst/agar.io-clone` locally instead of vendoring or rewriting the
+game.
+
+Commands:
+
+```powershell
+.\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -RunGate
+.\examples\agar_mit_clone\run_mit_clone_adapter.ps1 -MirrorBroker -BuildBroker -RunPlayableSeamGate
+```
+
+`-RunGate` proves the stock game is playable on `:3000`, the dynamic `:8091`
+monitor sees live entities/players, the 4x4 worker-zone geometry is non-uniform
+under load, and the optional `:8092` broker mirror/WAL are alive.
+
+`-RunPlayableSeamGate` adds a stricter playable-path proof: it joins a real
+stock-clone player, sends normal MIT clone movement commands, requires that
+player to cross at least one dynamic `:8091` worker-zone boundary, and requires
+continued movement after crossing. With `-MirrorBroker`, it also checks the
+probe against the `:8092` Godworks mirror state.
+
+Boundary: this MIT clone gate is not yet a Godworks broker-authoritative command
+path. Movement commands still enter the stock clone through its normal Socket.IO
+protocol. The stronger follow-up gate is a broker `CommandRequest` bridge for a
+controlled clone player, with pre/post-handoff command ACKs from the current
+Godworks owner.
+
 ## Godot Gates
 
 Godot is the engine-facing proof path:

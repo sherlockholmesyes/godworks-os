@@ -431,7 +431,7 @@ fn parse_metric(fields: &BTreeMap<String, String>, key: &str) -> Result<f64, Str
 }
 
 fn agar_gate_family(artifact: &Value) -> &'static str {
-    if artifact.get("monitor").is_some() {
+    if artifact.get("monitor").is_some() || artifact.get("playableSeam").is_some() {
         "mit_clone_adapter"
     } else {
         "godworks_agar_v2"
@@ -515,6 +515,7 @@ fn agar_handoff_block(
 ) -> Option<ModelFeatureBlock> {
     let has_handoff_metrics = artifact.get("observed_owner_changes").is_some()
         || artifact.get("player_owner_count").is_some()
+        || artifact.get("playableSeam").is_some()
         || artifact
             .get("brokerView")
             .and_then(Value::as_object)
@@ -535,6 +536,15 @@ fn agar_handoff_block(
         (&["player_max_displacement"][..], "player_max_displacement"),
         (&["client_truth_matches"][..], "client_truth_matches"),
         (&["client_truth_mismatches"][..], "client_truth_mismatches"),
+        (&["playableSeam", "blockChanges"][..], "shard_block_changes"),
+        (&["playableSeam", "path"][..], "player_path"),
+        (&["playableSeam", "postSeamPath"][..], "post_seam_path"),
+        (&["playableSeam", "commandCount"][..], "command_count"),
+        (&["playableSeam", "serverFrames"][..], "server_frames"),
+        (
+            &["playableSeam", "maxMissingStreak"][..],
+            "probe_max_missing_streak",
+        ),
         (
             &["probe_max_missing_before_handoff_streak"][..],
             "probe_max_missing_before_handoff_streak",
@@ -551,10 +561,28 @@ fn agar_handoff_block(
             &["command_after_handoff_ok"][..],
             "command_after_handoff_ok",
         ),
+        (
+            &["playableSeam", "brokerMirrorMatched"][..],
+            "broker_mirror_matched",
+        ),
     ] {
         if let Some(value) = json_bool_at(artifact, path) {
             block = block.with_metric(metric, if value { 1.0 } else { 0.0 });
         }
+    }
+    if let Some(first_block) = artifact
+        .get("playableSeam")
+        .and_then(|seam| seam.get("firstBlock"))
+        .and_then(Value::as_str)
+    {
+        block = block.with_dimension("first_block", first_block);
+    }
+    if let Some(final_block) = artifact
+        .get("playableSeam")
+        .and_then(|seam| seam.get("finalBlock"))
+        .and_then(Value::as_str)
+    {
+        block = block.with_dimension("final_block", final_block);
     }
     if let Some(owners) = artifact
         .get("brokerView")
@@ -809,6 +837,45 @@ mod tests {
         assert_eq!(blocks[0].metrics["security_checks"], 2.0);
         assert_eq!(blocks[1].metrics["live_entities"], 180.0);
         assert_eq!(blocks[2].metrics["command_after_handoff_ok"], 1.0);
+        for block in blocks {
+            assert_eq!(block.validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn agar_live_gate_builder_emits_valid_playable_seam_blocks() {
+        let output = r#"{
+          "ok": true,
+          "game": "http://127.0.0.1:3000",
+          "monitorUrl": "http://127.0.0.1:8091/state",
+          "brokerViewUrl": "http://127.0.0.1:8092/state",
+          "playableSeam": {
+            "probeName": "gw_seam_test",
+            "socketId": "sock-1",
+            "firstBlock": "W1_2",
+            "finalBlock": "W2_2",
+            "blockChanges": 1,
+            "path": 675.0,
+            "postSeamPath": 37.5,
+            "commandCount": 41,
+            "serverFrames": 111,
+            "maxMissingStreak": 1,
+            "brokerMirrorMatched": true,
+            "brokerMirrorOwner": "mit-Z2_2"
+          }
+        }"#;
+        let blocks = build_agar_live_gate_feature_blocks(output, &cfg()).unwrap();
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].kind, ModelFeatureBlockKind::Outcome);
+        assert_eq!(blocks[1].kind, ModelFeatureBlockKind::HandoffPressure);
+        assert_eq!(blocks[0].dimensions["gate_family"], "mit_clone_adapter");
+        assert_eq!(blocks[1].dimensions["first_block"], "W1_2");
+        assert_eq!(blocks[1].dimensions["final_block"], "W2_2");
+        assert_eq!(blocks[1].metrics["shard_block_changes"], 1.0);
+        assert_eq!(blocks[1].metrics["player_path"], 675.0);
+        assert_eq!(blocks[1].metrics["post_seam_path"], 37.5);
+        assert_eq!(blocks[1].metrics["broker_mirror_matched"], 1.0);
         for block in blocks {
             assert_eq!(block.validate(), Ok(()));
         }

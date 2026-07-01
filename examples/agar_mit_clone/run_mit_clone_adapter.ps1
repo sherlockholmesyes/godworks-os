@@ -2,6 +2,7 @@ param(
   [switch]$BuildBroker,
   [switch]$MirrorBroker,
   [switch]$RunGate,
+  [switch]$RunPlayableSeamGate,
   [switch]$SkipGame,
   [switch]$StopExisting,
   [switch]$SkipNpmInstall,
@@ -137,7 +138,7 @@ function Ensure-StockClone {
 
 function Copy-CloneTools {
   if (-not (Test-Path -LiteralPath $CloneRoot)) { return }
-  foreach ($name in @("_gw_spectator_tap.js", "_gw_bots.js", "gw_shard_monitor.js", "gw_agar_mirror_worker.js")) {
+  foreach ($name in @("_gw_spectator_tap.js", "_gw_bots.js", "gw_shard_monitor.js", "gw_agar_mirror_worker.js", "gw_agar_playable_seam_gate.js")) {
     Copy-Item -LiteralPath (Join-Path $ToolsDir $name) -Destination (Join-Path $CloneRoot $name) -Force
   }
 }
@@ -248,4 +249,22 @@ if ($RunGate) {
   }
   & $NodeExe (Join-Path $ToolsDir "gw_agar_live_gate.js")
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+if ($RunPlayableSeamGate) {
+  Start-Sleep -Seconds 3
+  $env:GW_AGAR_GAME_URL = "http://127.0.0.1:3000/"
+  $env:GW_AGAR_MONITOR_URL = "http://127.0.0.1:$PortMonitor/state"
+  if ($MirrorBroker) {
+    $env:GW_AGAR_BROKER_VIEW_URL = "http://127.0.0.1:$PortView/state"
+  } else {
+    Remove-Item Env:\GW_AGAR_BROKER_VIEW_URL -ErrorAction SilentlyContinue
+  }
+  Push-Location $CloneRoot
+  try {
+    & $NodeExe "gw_agar_playable_seam_gate.js"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  } finally {
+    Pop-Location
+  }
 }
