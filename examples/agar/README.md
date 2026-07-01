@@ -14,7 +14,9 @@ the current Godworks broker wire directly:
   non-privileged `CLIENT` stream;
 - visible browser rendering from the non-privileged `CLIENT` stream;
 - an adversarial reality gate that drives a player across seams and verifies
-  ownership/conservation from live state.
+  ownership/conservation from live state;
+- a multi-player soak gate that keeps several player probes moving across the
+  worker grid while command acknowledgements and client truth stay live.
 
 ## Run
 
@@ -70,7 +72,10 @@ move, cross partition seams, keep every entity owned by a real worker, reject
 privilege self-assignment, compare client-stream truth against inspector truth,
 avoid duplicate entity ids in observed frames, render a non-blank moving canvas
 sourced from `/client-state`, and build a live Rust client SDK cache from the
-same broker stream. `-GateOnly` also runs the broker with
+same broker stream. It then runs a multi-player soak: several protected player
+probes repeatedly receive `CommandRequest` input, cross ownership seams, and
+continue receiving post-handoff command acknowledgements while `/client-state`
+matches inspector truth. `-GateOnly` also runs the broker with
 `GW_REPLAY_TAPE` and validates the resulting live tape with `replay_eval`, so
 the gate fails if runtime breadcrumbs leak secrets, lose spatial contract
 metadata, or contradict protocol operation semantics. After the live cluster is
@@ -83,10 +88,18 @@ last live broker/client cut captured before shutdown. Worker IDs are normalized
 to their region names in this restore-only check because no zone workers are
 reconnected during the restored broker query.
 
-This is the current Agar Reality Gate v1. It is now bound to the System Laws
-index as a runtime ruler, but it is not yet the full release gate. The remaining
-promotion work is tracked in `docs/ops/live-game-reality-gates.md`: longer
-multi-client soak coverage and engine-native Godot gates.
+This is the current Agar Reality Gate v2. It is bound to the System Laws index
+as a runtime ruler. The remaining product promotion work is tracked in
+`docs/ops/live-game-reality-gates.md`: engine-native Godot gates and longer
+external soak/stress profiles.
+
+Soak knobs:
+
+```powershell
+$env:GW_SOAK_PLAYERS = "4"
+$env:GW_SOAK_MS = "30000"
+$env:GW_SOAK_COMMAND_MS = "1500"
+```
 
 The pixel gate launches Chrome/Edge through the Chrome DevTools Protocol without
 Playwright/Puppeteer. If the browser is not in a standard location, set:
